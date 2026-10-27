@@ -8,6 +8,7 @@
  */
 import fs from 'node:fs';
 import { calculate, type ItemInput, type TaxMode } from '../src/lib/calc.ts';
+import { roundDiv } from '../src/lib/money.ts';
 import { buildCii } from '../src/einvoice/cii.ts';
 import { renderPdf } from '../src/einvoice/pdf.ts';
 import { exemptionText, paymentTermsText, type DocumentData } from '../src/einvoice/model.ts';
@@ -34,17 +35,25 @@ const items: ItemInput[] = [
 
 function make(number: string, mode: TaxMode, extra: Partial<DocumentData> = {}): DocumentData {
   const t = calculate(items, mode);
-  const base = { typeCode: '380' as const, dueDate: '2026-11-10', gross: t.gross, issueDate: '2026-10-27', ...extra };
-  return {
-    version: 1, kind: 'invoice', number, validUntil: null,
+  const d = {
+    version: 1, kind: 'invoice', number, typeCode: '380', validUntil: null, issueDate: '2026-10-27', dueDate: '2026-11-10',
     serviceDate: '2026-10-20', serviceFrom: null, serviceTo: null,
     subject: 'Projekt Werkhalle', intro: 'vielen Dank für Ihren Auftrag. Wir berechnen Ihnen folgende Leistungen:',
     outro: 'Bei Fragen sind wir gerne für Sie da.', buyerReference: '', orderReference: 'PO-4711',
     precedingInvoice: null, taxMode: mode, exemptionReason: exemptionText(mode, 'Steuerfrei gemäß § 4 Nr. 21 UStG'),
-    currency: 'EUR', seller, buyer, items: t.items, taxes: t.taxes, net: t.net, tax: t.tax,
-    draft: false, ...base, paymentTerms: paymentTermsText(base),
+    currency: 'EUR', seller, buyer, items: t.items, taxes: t.taxes, net: t.net, tax: t.tax, gross: t.gross,
+    prepayments: [], skonto: null, draft: false, paymentTerms: '',
+    ...extra,
   } as DocumentData;
+  d.prepaid = (d.prepayments ?? []).reduce((s, p) => s + p.gross, 0);
+  d.due = d.gross - d.prepaid;
+  if (d.skonto) d.skonto = { ...d.skonto, amount: roundDiv(d.due * d.skonto.percent, 10000) };
+  d.paymentTerms = paymentTermsText({ ...d, due: d.due });
+  return d;
 }
+
+const partial = { number: 'RE-2026-0007', issueDate: '2026-09-15', net: 25000, tax: 4750, gross: 29750 };
+const partial2 = { number: 'RE-2026-0008', issueDate: '2026-10-01', net: 10000, tax: 1900, gross: 11900 };
 
 const samples: Record<string, DocumentData> = {
   standard: make('RE-2026-0001', 'standard'),
@@ -53,6 +62,11 @@ const samples: Record<string, DocumentData> = {
   steuerfrei: make('RE-2026-0004', 'exempt'),
   zeitraum: make('RE-2026-0005', 'standard', { serviceDate: null, serviceFrom: '2026-10-01', serviceTo: '2026-10-31', buyer: { ...buyer, leitwegId: '991-12345-67' } } as any),
   storno: make('RE-2026-0006', 'standard', { typeCode: '381', dueDate: null, precedingInvoice: { number: 'RE-2026-0001', issueDate: '2026-10-27' } } as any),
+  teilrechnung_875: make('RE-2026-0007', 'standard', { typeCode: '875', subject: '1. Abschlag Werkhalle' }),
+  teilschluss_876: make('RE-2026-0009', 'standard', { typeCode: '876', prepayments: [partial] }),
+  schluss_877: make('RE-2026-0010', 'standard', { typeCode: '877', prepayments: [partial, partial2], buyer: { ...buyer, leitwegId: '991-12345-67' } } as any),
+  skonto: make('RE-2026-0011', 'standard', { skonto: { percent: 200, days: 10, date: '2026-11-06', amount: 0 } }),
+  skonto_schluss: make('RE-2026-0012', 'standard', { typeCode: '877', prepayments: [partial2], skonto: { percent: 300, days: 7, date: '2026-11-03', amount: 0 } }),
 };
 
 fs.mkdirSync('samples', { recursive: true });
@@ -60,6 +74,8 @@ for (const [name, data] of Object.entries(samples)) {
   fs.writeFileSync(`samples/${name}.xml`, buildCii(data, 'xrechnung'));
   fs.writeFileSync(`samples/${name}.pdf`, await renderPdf(data, { zugferdXml: buildCii(data, 'en16931') }));
 }
+const logo = { data: fs.readFileSync('test/logo.png'), mime: 'image/png' };
+fs.writeFileSync('samples/mit_logo.pdf', await renderPdf(samples.schluss_877, { zugferdXml: buildCii(samples.schluss_877, 'en16931'), logo }));
 const quote = { ...samples.standard, kind: 'quote' as const, number: 'AN-2026-0001', validUntil: '2026-11-26' };
 fs.writeFileSync('samples/angebot.pdf', await renderPdf(quote));
 fs.writeFileSync('samples/entwurf.pdf', await renderPdf({ ...samples.standard, draft: true }));

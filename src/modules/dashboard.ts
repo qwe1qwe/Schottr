@@ -19,11 +19,14 @@ export const dashboardModule: Module = {
       const d = today();
       const year = d.slice(0, 4);
       const stat = async (sql: string, ...p: (string | number)[]) => (await one<{ n: number; s: number }>(sql, t.id, ...p)) ?? { n: 0, s: 0 };
-      const open = await stat("SELECT COUNT(*) n, COALESCE(SUM(gross_total), 0) s FROM documents WHERE tenant_id = ? AND kind = 'invoice' AND status = 'open'");
-      const overdue = await stat("SELECT COUNT(*) n, COALESCE(SUM(gross_total), 0) s FROM documents WHERE tenant_id = ? AND kind = 'invoice' AND status = 'open' AND due_date < ?", d);
+      const open = await stat("SELECT COUNT(*) n, COALESCE(SUM(gross_total - prepaid_total), 0) s FROM documents WHERE tenant_id = ? AND kind = 'invoice' AND status = 'open'");
+      const overdue = await stat("SELECT COUNT(*) n, COALESCE(SUM(gross_total - prepaid_total), 0) s FROM documents WHERE tenant_id = ? AND kind = 'invoice' AND status = 'open' AND due_date < ?", d);
       const quotes = await stat("SELECT COUNT(*) n, COALESCE(SUM(gross_total), 0) s FROM documents WHERE tenant_id = ? AND kind = 'quote' AND status IN ('draft', 'sent')");
       const revenue = await stat(
-        `SELECT COUNT(*) n, COALESCE(SUM(CASE WHEN type_code = '381' THEN -net_total ELSE net_total END), 0) s
+        // Schlussrechnungen ohne die bereits als Teilrechnung erfassten Beträge (sonst doppelt)
+        `SELECT COUNT(*) n, COALESCE(SUM(CASE WHEN type_code = '381' THEN -net_total ELSE net_total -
+           (SELECT COALESCE(SUM(p.net_total), 0) FROM document_prepayments x JOIN documents p ON p.id = x.prepaid_id WHERE x.document_id = documents.id)
+         END), 0) s
          FROM documents WHERE tenant_id = ? AND kind = 'invoice' AND finalized_at IS NOT NULL AND substr(issue_date, 1, 4) = ?`,
         year,
       );

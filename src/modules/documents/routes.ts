@@ -8,14 +8,15 @@ import { attachment, idParam, notFound, readForm, redirectWith, str, tenantOf, u
 import { badge, csrfField, empty, page } from '../../views/layout.ts';
 import { buildCii } from '../../einvoice/cii.ts';
 import { renderPdf } from '../../einvoice/pdf.ts';
-import { buildDocumentData, checkInvoice, xrechnungWarnings, type DocumentData } from '../../einvoice/model.ts';
+import { buildDocumentData, checkInvoice, xrechnungWarnings, dueAmount, INVOICE_TYPES, SELECTABLE_TYPES, FINAL_TYPES, type DocumentData } from '../../einvoice/model.ts';
 import { articleOptions } from '../articles.ts';
 import { dunningSection } from '../dunning.ts';
 import { audit } from '../../lib/audit.ts';
+import { getLogo } from '../../lib/logo.ts';
 import { contactLabel, contactOptions, getContact } from '../contacts.ts';
 import {
   createDraft, defaultTaxMode, deleteDraft, docToInput, duplicate, getDoc, getDocById, getItems, invoiceFromQuote,
-  parseDraft, updateDraft, type Doc, type DraftInput, type Kind,
+  parseDraft, updateDraft, getPrepayments, getPrepaymentIds, eligiblePrepayments, type Doc, type DraftInput, type Kind,
 } from './repo.ts';
 import { KIND, TAX_MODES, displayStatus, documentForm, documentTable } from './views.ts';
 import type { App, Ctx, Module, Tenant } from '../../types.ts';
@@ -49,6 +50,10 @@ async function newDraft(t: Tenant, kind: Kind, contactId: number): Promise<Draft
     order_reference: '',
     tax_mode: defaultTaxMode(t),
     exemption_reason: '',
+    type_code: '380',
+    skonto_percent: kind === 'invoice' ? t.skonto_percent : 0,
+    skonto_days: kind === 'invoice' ? t.skonto_days : 0,
+    prepayment_ids: [],
     items: [],
   };
 }
@@ -63,11 +68,12 @@ async function dataFor(t: Tenant, doc: Doc): Promise<DocumentData> {
     number: doc.number ?? 'Entwurf',
     draft: doc.kind === 'invoice',
     precedingInvoice: preceding?.number ? { number: preceding.number, issueDate: preceding.issue_date } : null,
+    prepayments: await getPrepayments(doc.id),
   });
 }
 
 function fileBase(d: DocumentData): string {
-  const prefix = d.kind === 'quote' ? 'Angebot' : d.typeCode === '381' ? 'Storno' : 'Rechnung';
+  const prefix = d.kind === 'quote' ? 'Angebot' : d.typeCode === '381' ? 'Storno' : INVOICE_TYPES[d.typeCode] ?? 'Rechnung';
   return `${prefix}_${d.number}`.replace(/[^\w.\-äöüÄÖÜß]+/g, '_');
 }
 
@@ -82,9 +88,11 @@ async function finalize(t: Tenant, doc: Doc): Promise<void> {
   const items = await getItems(doc.id);
   const preceding = doc.corrects_id ? await getDocById(t.id, doc.corrects_id) : undefined;
   const precedingInvoice = preceding?.number ? { number: preceding.number, issueDate: preceding.issue_date } : null;
+  const prepayments = await getPrepayments(doc.id);
+  const logo = await getLogo(t.id);
 
   // erst prüfen, dann Nummer ziehen
-  const problems = checkInvoice(buildDocumentData({ tenant: t, contact, doc, items, number: 'x', draft: false, precedingInvoice }));
+  const problems = checkInvoice(buildDocumentData({ tenant: t, contact, doc, items, number: 'x', draft: false, precedingInvoice, prepayments }));
   if (problems.length) throw new UserError(problems.join(' '));
 
   await tx(async () => {
@@ -93,16 +101,16 @@ async function finalize(t: Tenant, doc: Doc): Promise<void> {
     if (!locked || locked.finalized_at) throw new UserError('Diese Rechnung ist bereits festgeschrieben.');
 
     const number = await nextNumber(t.id, 'invoice', t.invoice_number_format, doc.issue_date);
-    const data = buildDocumentData({ tenant: t, contact, doc, items, number, draft: false, precedingInvoice });
+    const data = buildDocumentData({ tenant: t, contact, doc, items, number, draft: false, precedingInvoice, prepayments });
     const xrechnung = xrechnungWarnings(data).length ? null : buildCii(data, 'xrechnung');
-    const pdf = await renderPdf(data, { zugferdXml: buildCii(data, 'en16931') });
+    const pdf = await renderPdf(data, { zugferdXml: buildCii(data, 'en16931'), logo });
 
     const now = nowIso();
     await run(
       `UPDATE documents SET number = ?, status = ?, snapshot = ?, xml = ?, pdf = ?, finalized_at = ?,
-        net_total = ?, tax_total = ?, gross_total = ?, updated_at = ? WHERE id = ?`,
-      number, doc.type_code === '381' ? 'settled' : 'open', JSON.stringify(data), xrechnung, pdf, now,
-      data.net, data.tax, data.gross, now, doc.id,
+        net_total = ?, tax_total = ?, gross_total = ?, prepaid_total = ?, updated_at = ? WHERE id = ?`,
+      number, doc.type_code === '381' ? 'settled' : (data.due ?? data.gross) <= 0 ? 'paid' : 'open', JSON.stringify(data), xrechnung, pdf, now,
+      data.net, data.tax, data.gross, data.prepaid ?? 0, now, doc.id,
     );
     if (doc.corrects_id) {
       await run("UPDATE documents SET status = 'cancelled', updated_at = ? WHERE id = ? AND tenant_id = ?", now, doc.corrects_id, t.id);
@@ -129,6 +137,8 @@ function itemsTable(d: DocumentData): SafeHtml {
     <dt>Netto</dt><dd>${formatMoney(d.net)}</dd>
     ${d.taxes.filter((g) => g.category === 'S').map((g) => html`<dt>USt. ${formatRate(g.rate)}</dt><dd>${formatMoney(g.tax)}</dd>`)}
     <dt class="strong">Gesamt</dt><dd class="strong">${formatMoney(d.gross)}</dd>
+    ${(d.prepayments ?? []).map((p) => html`<dt>abzgl. Teilrechnung ${p.number}</dt><dd>${formatMoney(-p.gross)}</dd>`)}
+    ${d.prepayments?.length ? html`<dt class="strong">Noch zu zahlen</dt><dd class="strong">${formatMoney(dueAmount(d))}</dd>` : ''}
   </dl>
   ${d.exemptionReason ? html`<p class="small exemption">${d.exemptionReason}</p>` : ''}
   </section>`;
@@ -191,7 +201,7 @@ function register(app: App, kind: Kind) {
     return page(c, {
       title: kind === 'quote' ? 'Neues Angebot' : 'Neue Rechnung',
       back: { href: base, label: k.many },
-      body: documentForm(c, kind, base, draft, await contactOptions(t.id), await articleOptions(t.id)),
+      body: documentForm(c, kind, base, draft, await contactOptions(t.id), await articleOptions(t.id), kind === 'invoice' ? await eligiblePrepayments(t.id) : []),
     });
   });
 
@@ -254,6 +264,7 @@ function register(app: App, kind: Kind) {
     if (data.serviceDate) meta.push(['Leistungsdatum', formatDate(data.serviceDate)]);
     if (data.serviceFrom && data.serviceTo) meta.push(['Leistungszeitraum', `${formatDate(data.serviceFrom)} – ${formatDate(data.serviceTo)}`]);
     if (kind === 'invoice' && doc.due_date && doc.type_code !== '381') meta.push(['Fällig am', formatDate(doc.due_date)]);
+    if (data.skonto) meta.push(['Skonto', `${formatRate(data.skonto.percent)} bis ${formatDate(data.skonto.date)} (${formatMoney(data.skonto.amount)})`]);
     if (doc.paid_at) meta.push(['Bezahlt am', formatDate(doc.paid_at)]);
     if (data.orderReference) meta.push(['Bestellnummer', data.orderReference]);
     if (data.buyerReference) meta.push(['Käuferreferenz', data.buyerReference]);
@@ -262,7 +273,7 @@ function register(app: App, kind: Kind) {
 
     const titleText = kind === 'quote'
       ? `Angebot ${doc.number}`
-      : doc.number ? `${doc.type_code === '381' ? 'Stornorechnung' : 'Rechnung'} ${doc.number}` : 'Rechnungsentwurf';
+      : `${INVOICE_TYPES[doc.type_code as keyof typeof INVOICE_TYPES] ?? 'Rechnung'} ${doc.number ?? '(Entwurf)'}`;
 
     return page(c, {
       title: titleText,
@@ -310,7 +321,12 @@ function register(app: App, kind: Kind) {
     return page(c, {
       title: kind === 'quote' ? `Angebot ${doc.number} bearbeiten` : 'Rechnungsentwurf bearbeiten',
       back: { href: `${base}/${doc.id}`, label: 'Zurück' },
-      body: documentForm(c, kind, `${base}/${doc.id}`, docToInput(doc, await getItems(doc.id)), await contactOptions(t.id, doc.contact_id), await articleOptions(t.id)),
+      body: documentForm(
+        c, kind, `${base}/${doc.id}`,
+        { ...docToInput(doc, await getItems(doc.id)), prepayment_ids: await getPrepaymentIds(doc.id) },
+        await contactOptions(t.id, doc.contact_id), await articleOptions(t.id),
+        kind === 'invoice' ? await eligiblePrepayments(t.id, doc.id) : [],
+      ),
     });
   });
 
@@ -318,7 +334,7 @@ function register(app: App, kind: Kind) {
     const t = tenantOf(c);
     const doc = await getDoc(t.id, kind, idParam(c)) ?? notFound();
     try {
-      await updateDraft(doc, await parseDraft(await readForm(c), kind, t.id));
+      await updateDraft(t, doc, await parseDraft(await readForm(c), kind, t.id));
       return redirectWith(c, `${base}/${doc.id}`, 'ok', 'Gespeichert.');
     } catch (err) {
       if (err instanceof UserError) return redirectWith(c, `${base}/${doc.id}/edit`, 'error', err.message);
@@ -349,7 +365,7 @@ function register(app: App, kind: Kind) {
       const row = await one<{ pdf: Uint8Array }>('SELECT pdf FROM documents WHERE id = ?', doc.id);
       pdf = row?.pdf ?? null;
     }
-    pdf ??= await renderPdf(data);
+    pdf ??= await renderPdf(data, { logo: await getLogo(t.id) });
     return c.body(Buffer.from(pdf), 200, {
       'Content-Type': 'application/pdf',
       'Content-Disposition': attachment(`${fileBase(data)}.pdf`, true),
@@ -416,6 +432,9 @@ function register(app: App, kind: Kind) {
         service_date: original.serviceDate,
         service_from: original.serviceFrom,
         service_to: original.serviceTo,
+        skonto_percent: 0,
+        skonto_days: 0,
+        prepayment_ids: [],
       };
       const id = await createDraft(t, 'invoice', input, userOf(c).id, { type_code: '381', corrects_id: doc.id });
       try {

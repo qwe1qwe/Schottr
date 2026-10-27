@@ -5,6 +5,7 @@ import { UserError, list, str, type Form } from '../../lib/http.ts';
 import { parseDecimal } from '../../lib/money.ts';
 import { isUnit } from '../../lib/units.ts';
 import { nextNumber } from '../../lib/numbering.ts';
+import { FINAL_TYPES, SELECTABLE_TYPES, type Prepayment } from '../../einvoice/model.ts';
 import type { Tenant } from '../../types.ts';
 import { getContact } from '../contacts.ts';
 
@@ -35,6 +36,9 @@ export interface Doc {
   net_total: number;
   tax_total: number;
   gross_total: number;
+  prepaid_total: number;
+  skonto_percent: number;
+  skonto_days: number;
   source_quote_id: number | null;
   corrects_id: number | null;
   snapshot: string | null;
@@ -59,7 +63,7 @@ export interface Item {
 }
 
 const DOC_COLUMNS =
-  'id, tenant_id, kind, type_code, number, status, contact_id, issue_date, valid_until, due_date, service_date, service_from, service_to, subject, intro, outro, buyer_reference, order_reference, tax_mode, exemption_reason, currency, net_total, tax_total, gross_total, source_quote_id, corrects_id, snapshot, finalized_at, paid_at, created_at, updated_at';
+  'id, tenant_id, kind, type_code, number, status, contact_id, issue_date, valid_until, due_date, service_date, service_from, service_to, subject, intro, outro, buyer_reference, order_reference, tax_mode, exemption_reason, currency, net_total, tax_total, gross_total, prepaid_total, skonto_percent, skonto_days, source_quote_id, corrects_id, snapshot, finalized_at, paid_at, created_at, updated_at';
 
 export async function getDoc(tenantId: number, kind: Kind, id: number): Promise<Doc | undefined> {
   return await one<Doc>(`SELECT ${DOC_COLUMNS} FROM documents WHERE tenant_id = ? AND kind = ? AND id = ?`, tenantId, kind, id);
@@ -99,7 +103,41 @@ export interface DraftInput {
   order_reference: string;
   tax_mode: TaxMode;
   exemption_reason: string;
+  /** BT-3 – nur Rechnungen */
+  type_code: string;
+  skonto_percent: number;
+  skonto_days: number;
+  /** abzuziehende Teilrechnungen (nur 876/877) */
+  prepayment_ids: number[];
   items: ItemInput[];
+}
+
+/** Festgeschriebene Teil(schluss)rechnungen eines Kunden, die noch nicht in einer anderen Schlussrechnung abgezogen wurden */
+export async function eligiblePrepayments(tenantId: number, excludeDocId = 0) {
+  return all<{ id: number; contact_id: number; number: string; type_code: string; issue_date: string; net_total: number; tax_total: number; gross_total: number; contact_label: string }>(
+    `SELECT d.id, d.contact_id, d.number, d.type_code, d.issue_date, d.net_total, d.tax_total, d.gross_total,
+            COALESCE(NULLIF(c.company, ''), c.name) AS contact_label
+     FROM documents d JOIN contacts c ON c.id = d.contact_id
+     WHERE d.tenant_id = ? AND d.kind = 'invoice' AND d.finalized_at IS NOT NULL AND d.type_code IN ('875', '876')
+       AND d.status <> 'cancelled' AND d.id <> ?
+       AND NOT EXISTS (SELECT 1 FROM document_prepayments p JOIN documents f ON f.id = p.document_id
+                       WHERE p.prepaid_id = d.id AND f.finalized_at IS NOT NULL AND f.status <> 'cancelled' AND f.id <> ?)
+     ORDER BY d.issue_date, d.id`,
+    tenantId, excludeDocId, excludeDocId,
+  );
+}
+
+export async function getPrepayments(docId: number): Promise<Prepayment[]> {
+  const rows = await all(
+    `SELECT d.number, d.issue_date, d.net_total, d.tax_total, d.gross_total FROM document_prepayments p
+     JOIN documents d ON d.id = p.prepaid_id WHERE p.document_id = ? ORDER BY d.issue_date, d.id`,
+    docId,
+  );
+  return rows.map((r) => ({ number: r.number, issueDate: r.issue_date, net: r.net_total, tax: r.tax_total, gross: r.gross_total }));
+}
+
+export async function getPrepaymentIds(docId: number): Promise<number[]> {
+  return (await all<{ prepaid_id: number }>('SELECT prepaid_id FROM document_prepayments WHERE document_id = ?', docId)).map((r) => r.prepaid_id);
 }
 
 const optDate = (v: string) => (v === '' ? null : v);
@@ -126,8 +164,29 @@ export async function parseDraft(form: Form, kind: Kind, tenantId: number): Prom
     tax_mode: (['standard', 'small_business', 'reverse_charge', 'exempt'].includes(str(form, 'tax_mode'))
       ? str(form, 'tax_mode') : 'standard') as TaxMode,
     exemption_reason: str(form, 'exemption_reason', 300),
+    type_code: '380',
+    skonto_percent: 0,
+    skonto_days: 0,
+    prepayment_ids: [],
     items: [],
   };
+  if (kind === 'invoice') {
+    const type = str(form, 'type_code') || '380';
+    if (!(SELECTABLE_TYPES as string[]).includes(type)) errors.push('Ungültige Rechnungsart.');
+    else d.type_code = type;
+    const percent = parseDecimal(str(form, 'skonto_percent') || '0', 2);
+    const days = Number(str(form, 'skonto_days') || '0');
+    if (percent === null || percent < 0 || percent > 2000) errors.push('Skonto: Prozentsatz zwischen 0 und 20 angeben.');
+    else if (!Number.isInteger(days) || days < 0 || days > 365) errors.push('Skonto: ungültige Anzahl Tage.');
+    else if ((percent > 0) !== (days > 0)) errors.push('Skonto: bitte Prozentsatz und Tage angeben (oder beides leer lassen).');
+    else {
+      d.skonto_percent = percent;
+      d.skonto_days = days;
+    }
+    if ((FINAL_TYPES as string[]).includes(d.type_code)) {
+      d.prepayment_ids = [...new Set(list(form, 'prepayment_ids').map(Number).filter((n) => Number.isInteger(n) && n > 0))];
+    }
+  }
   if (kind === 'invoice') {
     if (str(form, 'service_mode') === 'period') {
       d.service_from = optDate(str(form, 'service_from'));
@@ -178,6 +237,22 @@ export async function parseDraft(form: Form, kind: Kind, tenantId: number): Prom
   return d;
 }
 
+/** Abzuziehende Teilrechnungen speichern; liefert die Summe (brutto). */
+async function writePrepayments(t: Tenant, docId: number, input: DraftInput): Promise<number> {
+  await run('DELETE FROM document_prepayments WHERE document_id = ?', docId);
+  if (!input.prepayment_ids.length) return 0;
+  const eligible = await eligiblePrepayments(t.id, docId);
+  let total = 0;
+  for (const id of input.prepayment_ids) {
+    const p = eligible.find((e) => e.id === id);
+    if (!p) throw new UserError('Eine ausgewählte Teilrechnung kann nicht abgezogen werden (bereits verwendet oder storniert).');
+    if (p.contact_id !== input.contact_id) throw new UserError(`Teilrechnung ${p.number} gehört zu einem anderen Kunden.`);
+    await run('INSERT INTO document_prepayments (document_id, prepaid_id) VALUES (?, ?)', docId, id);
+    total += p.gross_total;
+  }
+  return total;
+}
+
 async function writeItems(docId: number, input: DraftInput) {
   const totals = calculate(input.items, input.tax_mode);
   await run('DELETE FROM document_items WHERE document_id = ?', docId);
@@ -200,31 +275,38 @@ export async function createDraft(t: Tenant, kind: Kind, input: DraftInput, user
     const res = await run(
       `INSERT INTO documents (tenant_id, kind, type_code, number, status, contact_id, issue_date, valid_until, due_date,
         service_date, service_from, service_to, subject, intro, outro, buyer_reference, order_reference, tax_mode,
-        exemption_reason, source_quote_id, corrects_id, created_by, created_at, updated_at)
-       VALUES (?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      t.id, kind, extra.type_code ?? '380', number, input.contact_id, input.issue_date, input.valid_until, input.due_date,
+        exemption_reason, skonto_percent, skonto_days, source_quote_id, corrects_id, created_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      t.id, kind, extra.type_code ?? (kind === 'invoice' ? input.type_code : '380'), number, input.contact_id, input.issue_date, input.valid_until, input.due_date,
       input.service_date, input.service_from, input.service_to, input.subject, input.intro, input.outro,
       input.buyer_reference, input.order_reference, input.tax_mode, input.exemption_reason,
-      extra.source_quote_id ?? null, extra.corrects_id ?? null, userId, now, now,
+      input.skonto_percent, input.skonto_days, extra.source_quote_id ?? null, extra.corrects_id ?? null, userId, now, now,
     );
     const id = Number(res.insertId);
     const totals = await writeItems(id, input);
-    await run('UPDATE documents SET net_total = ?, tax_total = ?, gross_total = ? WHERE id = ?', totals.net, totals.tax, totals.gross, id);
+    const prepaid = await writePrepayments(t, id, input);
+    await run('UPDATE documents SET net_total = ?, tax_total = ?, gross_total = ?, prepaid_total = ? WHERE id = ?', totals.net, totals.tax, totals.gross, prepaid, id);
     return id;
   });
 }
 
-export async function updateDraft(doc: Doc, input: DraftInput) {
+export async function updateDraft(t: Tenant, doc: Doc, input: DraftInput) {
   if (doc.finalized_at) throw new UserError('Festgeschriebene Rechnungen können nicht mehr geändert werden.');
+  // Stornorechnungen behalten ihre Art
+  const typeCode = doc.kind === 'invoice' && doc.type_code !== '381' ? input.type_code : doc.type_code;
+  if (typeCode === '381') input.prepayment_ids = [];
   await tx(async () => {
     const totals = await writeItems(doc.id, input);
+    const prepaid = await writePrepayments(t, doc.id, input);
     await run(
       `UPDATE documents SET contact_id = ?, issue_date = ?, valid_until = ?, due_date = ?, service_date = ?, service_from = ?,
         service_to = ?, subject = ?, intro = ?, outro = ?, buyer_reference = ?, order_reference = ?, tax_mode = ?,
-        exemption_reason = ?, net_total = ?, tax_total = ?, gross_total = ?, updated_at = ? WHERE id = ?`,
+        exemption_reason = ?, type_code = ?, skonto_percent = ?, skonto_days = ?, net_total = ?, tax_total = ?, gross_total = ?,
+        prepaid_total = ?, updated_at = ? WHERE id = ?`,
       input.contact_id, input.issue_date, input.valid_until, input.due_date, input.service_date, input.service_from,
       input.service_to, input.subject, input.intro, input.outro, input.buyer_reference, input.order_reference,
-      input.tax_mode, input.exemption_reason, totals.net, totals.tax, totals.gross, nowIso(), doc.id,
+      input.tax_mode, input.exemption_reason, typeCode, input.skonto_percent, input.skonto_days,
+      totals.net, totals.tax, totals.gross, prepaid, nowIso(), doc.id,
     );
   });
 }
@@ -245,6 +327,10 @@ export function docToInput(doc: Doc, items: Item[]): DraftInput {
     order_reference: doc.order_reference,
     tax_mode: doc.tax_mode,
     exemption_reason: doc.exemption_reason,
+    type_code: doc.type_code,
+    skonto_percent: doc.skonto_percent,
+    skonto_days: doc.skonto_days,
+    prepayment_ids: [],
     items: itemsToInput(items),
   };
 }
@@ -264,6 +350,8 @@ export async function invoiceFromQuote(t: Tenant, quote: Doc, userId: number): P
     service_to: null,
     intro: t.invoice_intro,
     outro: t.invoice_outro,
+    skonto_percent: t.skonto_percent,
+    skonto_days: t.skonto_days,
     buyer_reference: contact?.leitweg_id ?? '',
     order_reference: quote.order_reference,
   };

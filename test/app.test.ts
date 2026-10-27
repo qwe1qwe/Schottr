@@ -1,5 +1,6 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import mysql from 'mysql2/promise';
 import { openDatabase, closeDatabase, one, all, run } from '../src/db/index.ts';
 import { createApp } from '../src/app.ts';
@@ -295,4 +296,86 @@ test('Übergreifende Administration', opts, async () => {
   assert.equal((await req('/register')).status, 200);
   ({ cookie, csrf } = tinaSession);
   await req('/admin/system', { form: {} });
+});
+
+test('Teil-/Schlussrechnung, Skonto, Logo und Export', opts, async () => {
+  const first = (await one<{ id: number }>("SELECT id FROM tenants WHERE name = 'Test GmbH'"))!;
+  await req('/tenant/switch', { form: { tenant_id: String(first.id) } });
+  const contact = (await one<{ id: number }>("SELECT id FROM contacts WHERE company = 'Kunde AG'"))!;
+  const invoice = async (type: string, price: string, extra: Record<string, string | string[]> = {}) => {
+    const res = await req('/invoices', {
+      form: {
+        contact_id: String(contact.id), type_code: type, issue_date: '2026-11-02', due_date: '2026-11-16', service_mode: 'date',
+        service_date: '2026-11-01', 'item_title[]': `Leistung ${type}`, 'item_description[]': '', 'item_quantity[]': '1',
+        'item_unit[]': 'LS', 'item_price[]': price, 'item_vat[]': '1900', ...extra,
+      },
+    });
+    const id = location(res).split('/').pop()!;
+    assert.match(id, /^\d+$/, `Rechnung ${type} angelegt`);
+    return id;
+  };
+
+  // Teilrechnung 875 festschreiben
+  const partialId = await invoice('875', '1000');
+  await req(`/invoices/${partialId}/finalize`, { form: {} });
+  const partial = (await one('SELECT * FROM documents WHERE id = ?', Number(partialId)))!;
+  assert.equal(partial.type_code, '875');
+  assert.equal(partial.gross_total, 119000);
+
+  // Schlussrechnung 877 mit Abzug + 2 % Skonto / 10 Tage
+  const finalId = await invoice('877', '3000', { 'prepayment_ids[]': partialId, skonto_percent: '2', skonto_days: '10' });
+  await req(`/invoices/${finalId}/finalize`, { form: {} });
+  const fin = (await one('SELECT * FROM documents WHERE id = ?', Number(finalId)))!;
+  assert.equal(fin.status, 'open');
+  assert.equal(fin.gross_total, 357000);
+  assert.equal(fin.prepaid_total, 119000);
+  const xml = await (await req(`/invoices/${finalId}/xrechnung.xml`)).text();
+  assert.match(xml, /<ram:TypeCode>877<\/ram:TypeCode>/);
+  assert.match(xml, /<ram:TotalPrepaidAmount>1190.00<\/ram:TotalPrepaidAmount><ram:DuePayableAmount>2380.00<\/ram:DuePayableAmount>/);
+  assert.match(xml, /#SKONTO#TAGE=10#PROZENT=2.00#\n/);
+  assert.match(xml, new RegExp(`<ram:InvoiceReferencedDocument><ram:IssuerAssignedID>${partial.number}<`));
+
+  // eine bereits abgezogene Teilrechnung kann nicht ein zweites Mal abgezogen werden
+  const res = await req('/invoices', {
+    form: {
+      contact_id: String(contact.id), type_code: '877', issue_date: '2026-11-03', due_date: '2026-11-17', service_mode: 'date',
+      service_date: '2026-11-01', 'item_title[]': 'x', 'item_description[]': '', 'item_quantity[]': '1', 'item_unit[]': 'LS',
+      'item_price[]': '10', 'item_vat[]': '1900', 'prepayment_ids[]': partialId,
+    },
+  });
+  assert.equal(location(res), '/invoices/new');
+
+  // Logo hochladen (Multipart)
+  const fd = new FormData();
+  fd.append('_csrf', csrf);
+  fd.append('logo', new Blob([fs.readFileSync('test/logo.png')], { type: 'image/png' }), 'logo.png');
+  const up = await app.request('/settings/logo', { method: 'POST', headers: { cookie }, body: fd });
+  assert.equal(up.status, 303);
+  assert.ok(await one('SELECT 1 FROM tenant_logos WHERE tenant_id = ?', first.id));
+  assert.equal((await req('/settings/logo')).headers.get('content-type'), 'image/png');
+
+  // Exporte
+  await req('/settings', {
+    form: {
+      name: 'Test GmbH', contact_name: 'Tina Test', street: 'Weg 1', zip: '12345', city: 'Teststadt', country: 'DE',
+      email: 'tina@example.com', phone: '0301234567', website: '', tax_number: '12/345/67890', vat_id: 'DE123456789',
+      managing_directors: 'Tina Test', register_court: '', register_number: '', bank_name: 'Bank',
+      iban: 'DE02120300000000202051', bic: '', quote_number_format: 'AN-{YYYY}-{NNNN}',
+      invoice_number_format: 'RE-{YYYY}-{NNNN}', customer_number_format: 'K{NNNNN}', payment_days: '14',
+      quote_valid_days: '30', quote_intro: '', quote_outro: '', invoice_intro: 'Hallo', invoice_outro: '',
+      datev_consultant: '1234567', datev_client: '12345', datev_skr: '03', datev_account_length: '4',
+      datev_debtor_mode: 'collective', datev_debtor_account: '10000', datev_accounts: '',
+    },
+  });
+  const datev = Buffer.from(await (await req('/export/datev?from=2026-11-01&to=2026-11-30')).arrayBuffer()).toString('latin1');
+  const lines = datev.trim().split('\r\n');
+  assert.match(lines[0], /^"EXTF";700;21;"Buchungsstapel";13;/);
+  assert.match(lines[0], /;1234567;12345;20260101;4;20261101;20261130;/);
+  // 875: 1190 S, 877: 3570 S, Verrechnung 875: 1190 H
+  assert.deepEqual(lines.slice(2).map((l) => l.split(';').slice(0, 2).join(' ')), ['1190,00 "S"', '3570,00 "S"', '1190,00 "H"']);
+  const journal = await (await req('/export/journal?from=2026-11-01&to=2026-11-30')).text();
+  assert.match(journal, /Schlussrechnung/);
+  const zip = Buffer.from(await (await req('/export/zip?from=2026-11-01&to=2026-11-30')).arrayBuffer());
+  assert.equal(zip.readUInt32LE(0), 0x04034b50);
+  assert.match(zip.toString('latin1'), /_Schlussrechnung\.pdf/);
 });

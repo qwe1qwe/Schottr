@@ -5,7 +5,7 @@ import { formatDate } from '../lib/dates.ts';
 import { formatAmount, formatMoney, formatQuantity, formatRate } from '../lib/money.ts';
 import { unitShort } from '../lib/units.ts';
 import { formatIban } from '../lib/validate.ts';
-import type { DocumentData } from './model.ts';
+import { INVOICE_TYPES, dueAmount, type DocumentData } from './model.ts';
 
 const FONT_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '../../assets/fonts');
 const FONTS = {
@@ -31,6 +31,8 @@ const ACCENT = '#2b5d4f';
 export interface PdfOptions {
   /** XML für ZUGFeRD einbetten → PDF/A-3b */
   zugferdXml?: string;
+  /** Firmenlogo (PNG/JPEG) */
+  logo?: { data: Buffer; mime: string } | null;
 }
 
 const xmlEsc = (v: string) =>
@@ -38,8 +40,7 @@ const xmlEsc = (v: string) =>
 
 function title(d: DocumentData): string {
   if (d.kind === 'quote') return 'Angebot';
-  if (d.typeCode === '381') return 'Stornorechnung';
-  return 'Rechnung';
+  return INVOICE_TYPES[d.typeCode] ?? 'Rechnung';
 }
 
 /** ZUGFeRD/Factur-X XMP-Erweiterung (Pflicht für PDF/A-3 mit eingebetteter Rechnung). */
@@ -113,6 +114,7 @@ export interface LetterOptions {
   issueDate: string;
   draft?: boolean;
   zugferdXml?: string;
+  logo?: { data: Buffer; mime: string } | null;
 }
 
 export interface Letter {
@@ -172,9 +174,16 @@ export function startLetter(o: LetterOptions): Letter {
   }
 
   const header = () => {
-    doc.font('B').fontSize(15).fillColor(INK).text(s.name, LEFT, mm(16), { width: WIDTH, align: 'right' });
-    doc.font('R').fontSize(8).fillColor(MUTED)
-      .text([s.street, [s.zip, s.city].join(' ')].filter(Boolean).join(' · '), LEFT, doc.y + 1, { width: WIDTH, align: 'right' });
+    if (o.logo) {
+      // Logo oben rechts (max. 60 × 22 mm), darunter die Kurzadresse
+      doc.image(o.logo.data, RIGHT - mm(60), mm(10), { fit: [mm(60), mm(22)], align: 'right', valign: 'bottom' });
+      doc.font('R').fontSize(8).fillColor(MUTED)
+        .text([s.name, s.street, [s.zip, s.city].join(' ')].filter(Boolean).join(' · '), LEFT, mm(34), { width: WIDTH, align: 'right' });
+    } else {
+      doc.font('B').fontSize(15).fillColor(INK).text(s.name, LEFT, mm(16), { width: WIDTH, align: 'right' });
+      doc.font('R').fontSize(8).fillColor(MUTED)
+        .text([s.street, [s.zip, s.city].join(' ')].filter(Boolean).join(' · '), LEFT, doc.y + 1, { width: WIDTH, align: 'right' });
+    }
     // Falz- und Lochmarken (DIN 5008)
     doc.save().lineWidth(0.4).strokeColor(RULE);
     for (const y of [mm(105), mm(210)]) doc.moveTo(mm(4), y).lineTo(mm(8), y).stroke();
@@ -257,6 +266,17 @@ export function startLetter(o: LetterOptions): Letter {
   return { doc, y, newPage, paragraphs, finish };
 }
 
+/** Prüft, ob PDFKit das Bild einbetten kann (z. B. keine interlaced PNGs). */
+export function canEmbedImage(data: Buffer): boolean {
+  try {
+    const doc = new PDFDocument({ autoFirstPage: false });
+    (doc as unknown as { openImage(src: Buffer): unknown }).openImage(data);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Bankverbindung als Zahlungshinweis */
 export function bankLine(s: LetterSeller, reference: string): string {
   return `Bankverbindung: ${s.bankName ? s.bankName + ', ' : ''}IBAN ${formatIban(s.iban)}${s.bic ? ', BIC ' + s.bic : ''} · Verwendungszweck: ${reference}`;
@@ -317,6 +337,7 @@ export function renderPdf(d: DocumentData, opts: PdfOptions = {}): Promise<Buffe
     issueDate: d.issueDate,
     draft: d.draft,
     zugferdXml: opts.zugferdXml,
+    logo: opts.logo,
   });
   const { doc } = letter;
   let y = letter.y;
@@ -382,7 +403,16 @@ export function renderPdf(d: DocumentData, opts: PdfOptions = {}): Promise<Buffe
   for (const t of d.taxes) {
     if (t.category === 'S') sumRows.push([`zzgl. ${formatRate(t.rate)} USt. auf ${formatMoney(t.basis)}`, formatMoney(t.tax), false]);
   }
-  sumRows.push([d.kind === 'quote' ? 'Angebotssumme' : d.typeCode === '381' ? 'Gutschriftsbetrag' : 'Rechnungsbetrag', formatMoney(d.gross), true]);
+  const prepayments = d.prepayments ?? [];
+  sumRows.push([
+    d.kind === 'quote' ? 'Angebotssumme' : d.typeCode === '381' ? 'Gutschriftsbetrag' : prepayments.length ? 'Gesamtbetrag der Leistung' : 'Rechnungsbetrag',
+    formatMoney(d.gross), true,
+  ]);
+  // § 14 Abs. 5 UStG: vereinnahmte Teilentgelte und die darauf entfallende Steuer ausweisen
+  for (const p of prepayments) {
+    sumRows.push([`abzgl. ${p.number} vom ${formatDate(p.issueDate)}\n(netto ${formatMoney(p.net)}, USt. ${formatMoney(p.tax)})`, formatMoney(-p.gross), false]);
+  }
+  if (prepayments.length) sumRows.push(['Noch zu zahlen', formatMoney(dueAmount(d)), true]);
   y = sumBlock(letter, y, sumRows);
 
   /* ---------- Hinweise ---------- */

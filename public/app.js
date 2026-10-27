@@ -188,5 +188,29 @@
     });
   }
 
+  // Teil-/Schlussrechnungen: abzuziehende Teilrechnungen nur bei 876/877 und nur des gewählten Kunden zeigen
+  const typeSelect = form.querySelector('[data-type-code]');
+  const prepaySection = form.querySelector('[data-prepayments]');
+  if (prepaySection) {
+    const syncPrepayments = () => {
+      const isFinal = typeSelect && ['876', '877'].includes(typeSelect.value);
+      prepaySection.hidden = !isFinal;
+      const contactId = contact ? contact.value : '';
+      let visible = 0;
+      prepaySection.querySelectorAll('li[data-contact]').forEach((li) => {
+        const show = li.dataset.contact === contactId;
+        li.hidden = !show;
+        const box = li.querySelector('input[type="checkbox"]');
+        if (!show || !isFinal) box.checked = false;
+        if (show) visible++;
+      });
+      const emptyNote = prepaySection.querySelector('[data-prepayments-empty]');
+      if (emptyNote) emptyNote.hidden = visible > 0;
+    };
+    typeSelect?.addEventListener('change', syncPrepayments);
+    contact?.addEventListener('change', syncPrepayments);
+    syncPrepayments();
+  }
+
   recalc();
 })();

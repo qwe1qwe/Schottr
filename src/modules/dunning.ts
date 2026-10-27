@@ -4,7 +4,8 @@ import { addDays, daysBetween, formatDate, isIsoDate, today } from '../lib/dates
 import { formatAmount, formatMoney, parseDecimal } from '../lib/money.ts';
 import { attachment, idParam, notFound, readForm, redirectWith, str, tenantOf, userOf } from '../lib/http.ts';
 import { badge, csrfField, empty, page } from '../views/layout.ts';
-import { sellerFromTenant, type DocumentData } from '../einvoice/model.ts';
+import { sellerFromTenant, dueAmount, INVOICE_TYPES, type DocumentData } from '../einvoice/model.ts';
+import { getLogo } from '../lib/logo.ts';
 import { bankLine, startLetter, sumBlock, LETTER_LEFT } from '../einvoice/pdf.ts';
 import type { App, Ctx, Module, Tenant } from '../types.ts';
 
@@ -48,13 +49,13 @@ interface DunnableInvoice {
 /** Offene, überfällige Rechnungen inkl. letzter Mahnstufe */
 async function overdueInvoices(tenantId: number): Promise<DunnableInvoice[]> {
   return all<DunnableInvoice>(
-    `SELECT d.id, d.number, d.issue_date, d.due_date, d.gross_total, d.snapshot, d.contact_id,
+    `SELECT d.id, d.number, d.issue_date, d.due_date, d.gross_total - d.prepaid_total AS gross_total, d.snapshot, d.contact_id,
             COALESCE(NULLIF(c.company, ''), c.name) AS contact_label,
             x.level AS last_level, x.deadline AS last_deadline, x.issue_date AS last_date
      FROM documents d
      JOIN contacts c ON c.id = d.contact_id
      LEFT JOIN dunnings x ON x.invoice_id = d.id AND x.level = (SELECT MAX(level) FROM dunnings y WHERE y.invoice_id = d.id)
-     WHERE d.tenant_id = ? AND d.kind = 'invoice' AND d.type_code = '380' AND d.status = 'open' AND d.due_date < ?
+     WHERE d.tenant_id = ? AND d.kind = 'invoice' AND d.type_code <> '381' AND d.status = 'open' AND d.due_date < ?
      ORDER BY d.due_date`,
     tenantId, today(),
   );
@@ -77,6 +78,7 @@ interface FinalInvoice {
   issue_date: string;
   due_date: string;
   gross_total: number;
+  prepaid_total: number;
   snapshot: string;
 }
 
@@ -88,7 +90,7 @@ async function getInvoice(tenantId: number, id: number) {
 }
 
 function canDun(inv: { status: string; type_code: string }, dunnings: Dunning[]): boolean {
-  return inv.status === 'open' && inv.type_code === '380' && dunnings.length < MAX_LEVEL;
+  return inv.status === 'open' && inv.type_code !== '381' && dunnings.length < MAX_LEVEL;
 }
 
 function feeFor(t: Tenant, level: number): number {
@@ -113,7 +115,8 @@ export async function renderDunningPdf(t: Tenant, dunning: Dunning, invoice: { s
   const inv = JSON.parse(invoice.snapshot) as DocumentData;
   const seller = sellerFromTenant(t);
   const fees = previous.filter((p) => p.level < dunning.level);
-  const total = inv.gross + fees.reduce((s, p) => s + p.fee, 0) + dunning.fee;
+  const open = dueAmount(inv);
+  const total = open + fees.reduce((s, p) => s + p.fee, 0) + dunning.fee;
   const title = levelLabel(dunning.level);
 
   const info: [string, string][] = [
@@ -125,6 +128,7 @@ export async function renderDunningPdf(t: Tenant, dunning: Dunning, invoice: { s
   if (seller.contactName) info.push(['Ansprechpartner', seller.contactName]);
 
   const letter = startLetter({
+    logo: await getLogo(t.id),
     seller,
     recipient: inv.buyer,
     info,
@@ -136,7 +140,7 @@ export async function renderDunningPdf(t: Tenant, dunning: Dunning, invoice: { s
   let y = letter.paragraphs(letter.y, [{ text: 'Sehr geehrte Damen und Herren,' }, { text: dunning.text }]);
 
   const rows: [string, string, boolean][] = [
-    [`Rechnung ${inv.number}, fällig seit ${formatDate(inv.dueDate ?? inv.issueDate)}`, formatMoney(inv.gross), false],
+    [`${INVOICE_TYPES[inv.typeCode] ?? 'Rechnung'} ${inv.number}, fällig seit ${formatDate(inv.dueDate ?? inv.issueDate)}`, formatMoney(open), false],
   ];
   for (const p of fees) if (p.fee) rows.push([`Mahngebühr ${levelLabel(p.level)} vom ${formatDate(p.issue_date)}`, formatMoney(p.fee), false]);
   if (dunning.fee) rows.push([`Mahngebühr ${title}`, formatMoney(dunning.fee), false]);
@@ -157,7 +161,7 @@ export async function renderDunningPdf(t: Tenant, dunning: Dunning, invoice: { s
 
 /** Abschnitt „Mahnungen“ auf der Rechnungsseite */
 export async function dunningSection(c: Ctx, t: Tenant, inv: { id: number; status: string; type_code: string; due_date: string | null; finalized_at: string | null }): Promise<SafeHtml> {
-  if (!inv.finalized_at || inv.type_code !== '380') return html``;
+  if (!inv.finalized_at || inv.type_code === '381') return html``;
   const list = await getDunnings(inv.id);
   const overdue = inv.status === 'open' && !!inv.due_date && inv.due_date < today();
   if (!list.length && !overdue) return html``;
@@ -261,7 +265,7 @@ function register(app: App) {
           <label class="span-3">Text <textarea name="text" rows="7">${defaultText(level, inv, list)}</textarea>
             <small class="muted">Anrede, Aufstellung der Beträge, Bankverbindung und Grußformel werden automatisch ergänzt.</small></label>
         </div>
-        <p class="muted small">Rechnungsbetrag ${formatMoney(inv.gross_total)}${previousFees ? ` · bisherige Mahngebühren ${formatMoney(previousFees)}` : ''}</p>
+        <p class="muted small">Offener Rechnungsbetrag ${formatMoney(inv.gross_total - inv.prepaid_total)}${previousFees ? ` · bisherige Mahngebühren ${formatMoney(previousFees)}` : ''}</p>
         <div class="form-actions"><button class="btn primary">${levelLabel(level)} erstellen</button></div>
       </form>`,
     });

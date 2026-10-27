@@ -114,6 +114,13 @@ DB_PASSWORD=geheim npm start
   - **Festschreiben**: vergibt die fortlaufende Rechnungsnummer und friert alle Daten ein (Snapshot). Dabei werden das ZUGFeRD-PDF und die XRechnung-XML einmalig erzeugt und gespeichert.
   - **Bezahlt / offen**, **Überfällig** (automatisch), **Stornieren** (erzeugt eine Stornorechnung, Typ 381, mit Bezug auf das Original).
 - **Mahnwesen**: Die Seite *Mahnwesen* listet überfällige Rechnungen und schlägt die nächste Stufe vor, sobald Fälligkeit bzw. Mahnfrist plus Kulanz abgelaufen sind. Es gibt drei Stufen: Zahlungserinnerung, 1. Mahnung und 2. (letzte) Mahnung. Gebühren, Frist und Kulanz stellst du in den Einstellungen ein und kannst sie je Mahnung anpassen. Das Mahn-PDF zeigt Rechnungsbetrag, Gebühren und offenen Gesamtbetrag. Mahngebühren werden ohne Umsatzsteuer ausgewiesen.
+- **Rechnungsarten (BT-3)**: Rechnung (380), Teilrechnung (875), Teilschlussrechnung (876), Schlussrechnung (877) sowie die Stornorechnung (381), die über „Stornieren“ entsteht. Teilschluss- und Schlussrechnungen ziehen festgeschriebene Teilrechnungen desselben Kunden ab. Netto, Steuer und Brutto jeder abgezogenen Teilrechnung werden ausgewiesen (§ 14 Abs. 5 UStG), im XML als `TotalPrepaidAmount`, Rechnungsbezug (BG-3) und Hinweis. Jede Teilrechnung kann nur einmal abgezogen werden.
+- **Skonto**: Prozent und Tage je Rechnung, mit Vorgabe in den Einstellungen. Im PDF steht ein Klartext mit Betrag und Frist, in der E-Rechnung das von XRechnung geforderte Format `#SKONTO#TAGE=10#PROZENT=2.00#` (BR-DE-18).
+- **Logo**: PNG (auch transparent) oder JPEG unter Einstellungen hochladen. Es erscheint oben rechts auf Angeboten, Rechnungen und Mahnungen; die PDFs bleiben PDF/A-3-konform.
+- **Export** (Menüpunkt *Export*, Zeitraum frei wählbar):
+  - **DATEV-Buchungsstapel** (EXTF 700): je Rechnung und Steuersatz eine Buchung Debitor an Erlöskonto, Sammeldebitor oder Debitor je Kunde, SKR03/04. Erlöskonten lassen sich in den Einstellungen anpassen. Schlussrechnungen buchen die abgezogenen Teilrechnungen zurück, damit kein Umsatz doppelt erscheint.
+  - **Rechnungsausgangsbuch** als CSV für Excel (Netto/USt je Steuersatz, Zahlbetrag, Status).
+  - **ZIP** mit allen ZUGFeRD-PDFs und XRechnung-Dateien des Zeitraums plus Rechnungsausgangsbuch.
 - **Steuerarten**: Regelbesteuerung, Kleinunternehmer (§ 19 UStG), Reverse Charge (§ 13b UStG) und steuerfrei mit Begründung. Die gesetzlich nötigen Hinweistexte kommen automatisch auf PDF und XML.
 
 ## Deutsche Vorgaben

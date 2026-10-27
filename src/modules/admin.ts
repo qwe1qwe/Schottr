@@ -37,6 +37,10 @@ const ACTIONS: Record<string, string> = {
   'member.accept': 'Einladung angenommen',
   'member.remove': 'Benutzer entfernt',
   'member.create': 'Konto angelegt',
+  'settings.logo': 'Logo geändert',
+  'export.datev': 'DATEV-Export',
+  'export.journal': 'Export Rechnungsausgangsbuch',
+  'export.zip': 'Export Belege (ZIP)',
 };
 const actionLabel = (a: string) => ACTIONS[a] ?? a.replace(/^admin\./, 'Admin: ');
 

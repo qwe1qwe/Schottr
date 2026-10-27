@@ -287,4 +287,56 @@ export const migrations: { version: number; statements: string[] }[] = [
       ) ${TABLE}`,
     ],
   },
+  {
+    version: 4,
+    statements: [
+      // Logo je Mandant (eigene Tabelle, damit es nicht bei jeder Anfrage mitgeladen wird)
+      `CREATE TABLE tenant_logos (
+        tenant_id INT PRIMARY KEY,
+        data MEDIUMBLOB NOT NULL,
+        mime VARCHAR(30) NOT NULL,
+        updated_at DATETIME(3) NOT NULL,
+        CONSTRAINT logos_tenant FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+      ) ${TABLE}`,
+
+      // Skonto-Vorgabe und DATEV-Einstellungen
+      `ALTER TABLE tenants
+        ADD COLUMN skonto_percent INT NOT NULL DEFAULT 0,
+        ADD COLUMN skonto_days INT NOT NULL DEFAULT 0,
+        ADD COLUMN datev_consultant VARCHAR(7) NOT NULL DEFAULT '',
+        ADD COLUMN datev_client VARCHAR(5) NOT NULL DEFAULT '',
+        ADD COLUMN datev_skr CHAR(2) NOT NULL DEFAULT '03',
+        ADD COLUMN datev_account_length TINYINT NOT NULL DEFAULT 4,
+        ADD COLUMN datev_debtor_mode ENUM('collective', 'individual') NOT NULL DEFAULT 'collective',
+        ADD COLUMN datev_debtor_account INT NOT NULL DEFAULT 10000,
+        ADD COLUMN datev_accounts VARCHAR(200) NOT NULL DEFAULT ''`,
+
+      // Skonto, Vorauszahlungen (Teil-/Schlussrechnungen)
+      `ALTER TABLE documents
+        ADD COLUMN skonto_percent INT NOT NULL DEFAULT 0,
+        ADD COLUMN skonto_days INT NOT NULL DEFAULT 0,
+        ADD COLUMN prepaid_total BIGINT NOT NULL DEFAULT 0`,
+      `CREATE TABLE document_prepayments (
+        document_id INT NOT NULL,
+        prepaid_id INT NOT NULL,
+        PRIMARY KEY (document_id, prepaid_id),
+        KEY prepayments_prepaid (prepaid_id),
+        CONSTRAINT prepayments_document FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE,
+        CONSTRAINT prepayments_prepaid FOREIGN KEY (prepaid_id) REFERENCES documents(id)
+      ) ${TABLE}`,
+
+      // GoBD-Sperre um die neuen Felder erweitern
+      `DROP TRIGGER documents_immutable`,
+      `CREATE TRIGGER documents_immutable BEFORE UPDATE ON documents FOR EACH ROW
+       IF OLD.finalized_at IS NOT NULL AND (
+         ${['number', 'contact_id', 'issue_date', 'net_total', 'tax_total', 'gross_total', 'prepaid_total', 'skonto_percent', 'skonto_days', 'snapshot', 'xml', 'pdf', 'finalized_at', 'type_code', 'tax_mode'].map(changed).join(' OR ')}
+       ) THEN ${forbid('Festgeschriebene Rechnungen koennen nicht geaendert werden')}; END IF`,
+      `CREATE TRIGGER prepayments_immutable_delete BEFORE DELETE ON document_prepayments FOR EACH ROW
+       IF (SELECT finalized_at FROM documents WHERE id = OLD.document_id) IS NOT NULL
+       THEN ${forbid('Festgeschriebene Rechnungen koennen nicht geaendert werden')}; END IF`,
+      `CREATE TRIGGER prepayments_immutable_insert BEFORE INSERT ON document_prepayments FOR EACH ROW
+       IF (SELECT finalized_at FROM documents WHERE id = NEW.document_id) IS NOT NULL
+       THEN ${forbid('Festgeschriebene Rechnungen koennen nicht geaendert werden')}; END IF`,
+    ],
+  },
 ];

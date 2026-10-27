@@ -4,6 +4,7 @@ import { formatAmount, formatMoney } from '../../lib/money.ts';
 import { UNITS } from '../../lib/units.ts';
 import { VAT_RATES, type TaxMode } from '../../lib/calc.ts';
 import { badge, csrfField } from '../../views/layout.ts';
+import { INVOICE_TYPES, SELECTABLE_TYPES } from '../../einvoice/model.ts';
 import type { Ctx } from '../../types.ts';
 import type { Contact } from '../contacts.ts';
 import type { Article } from '../articles.ts';
@@ -38,7 +39,7 @@ export function documentTable(rows: any[], kind: Kind, showContact = true): Safe
     </tr></thead>
     <tbody>${rows.map(
       (d) => html`<tr class="rowlink" data-href="${base}/${d.id}">
-        <td class="mono"><a href="${base}/${d.id}">${d.number ?? 'Entwurf'}</a>${d.type_code === '381' ? html` <span class="tag">Storno</span>` : ''}</td>
+        <td class="mono"><a href="${base}/${d.id}">${d.number ?? 'Entwurf'}</a>${d.type_code === '381' ? html` <span class="tag">Storno</span>` : ['875', '876', '877'].includes(d.type_code) ? html` <span class="tag info">${INVOICE_TYPES[d.type_code as '875']}</span>` : ''}</td>
         <td>${formatDate(d.issue_date)}</td>
         ${showContact ? html`<td>${d.contact_label ?? ''}</td>` : ''}
         <td class="truncate">${d.subject}</td>
@@ -73,7 +74,11 @@ function itemRow(it?: DraftInput['items'][number]): SafeHtml {
   </tr>`;
 }
 
-export function documentForm(c: Ctx, kind: Kind, action: string, d: DraftInput, contacts: Contact[], articles: Article[] = []): SafeHtml {
+type PrepaymentOption = { id: number; contact_id: number; number: string; type_code: string; issue_date: string; net_total: number; tax_total: number; gross_total: number };
+
+export function documentForm(
+  c: Ctx, kind: Kind, action: string, d: DraftInput, contacts: Contact[], articles: Article[] = [], prepayments: PrepaymentOption[] = [],
+): SafeHtml {
   const periodMode = !!(d.service_from || d.service_to);
   return html`
   <form method="post" action="${action}" class="doc-form" data-doc-form>
@@ -91,7 +96,17 @@ export function documentForm(c: Ctx, kind: Kind, action: string, d: DraftInput, 
         <label class="span-2">Betreff <input name="subject" value="${d.subject}" maxlength="200" placeholder="z. B. Projekt oder Auftrag"></label>
         ${kind === 'quote'
           ? html`<label>Gültig bis <input type="date" name="valid_until" value="${d.valid_until ?? ''}"></label>`
-          : html`<label>Fällig am <input type="date" name="due_date" value="${d.due_date ?? ''}"></label>`}
+          : html`<label>Fällig am (netto) <input type="date" name="due_date" value="${d.due_date ?? ''}"></label>`}
+        ${kind === 'invoice'
+          ? html`
+            ${d.type_code === '381'
+              ? html`<label>Rechnungsart <input value="Stornorechnung (381)" disabled></label>`
+              : html`<label>Rechnungsart
+                  <select name="type_code" data-type-code>${SELECTABLE_TYPES.map((tc) => html`<option value="${tc}"${selected(tc, d.type_code)}>${INVOICE_TYPES[tc]} (${tc})</option>`)}</select>
+                </label>`}
+            <label>Skonto % <input name="skonto_percent" class="num" inputmode="decimal" value="${d.skonto_percent ? formatAmount(d.skonto_percent).replace(/,00$/, '') : ''}" placeholder="z. B. 2"></label>
+            <label>Skonto bei Zahlung binnen … Tagen <input name="skonto_days" type="number" min="0" max="365" value="${d.skonto_days || ''}" placeholder="z. B. 10"></label>`
+          : ''}
       </div>
       ${kind === 'invoice'
         ? html`<div class="grid-3 service" data-service>
@@ -120,6 +135,21 @@ export function documentForm(c: Ctx, kind: Kind, action: string, d: DraftInput, 
         </div>
       </details>
     </section>
+
+    ${kind === 'invoice' && d.type_code !== '381'
+      ? html`<section class="card" data-prepayments>
+          <h2>Abzuziehende Teilrechnungen</h2>
+          <p class="muted small">Bei Teilschluss- und Schlussrechnungen werden bereits gestellte Teilrechnungen mit ihren Steuerbeträgen ausgewiesen und abgezogen (§ 14 Abs. 5 UStG).</p>
+          ${prepayments.length
+            ? html`<ul class="plain prepayment-list">${prepayments.map((p) => html`<li data-contact="${p.contact_id}">
+                <label class="check"><input type="checkbox" name="prepayment_ids[]" value="${p.id}"${d.prepayment_ids.includes(p.id) ? raw(' checked') : ''}>
+                  <span><strong>${INVOICE_TYPES[p.type_code as keyof typeof INVOICE_TYPES]} ${p.number}</strong> vom ${formatDate(p.issue_date)}
+                  <span class="muted">· netto ${formatMoney(p.net_total)} · USt. ${formatMoney(p.tax_total)} · brutto ${formatMoney(p.gross_total)}</span></span>
+                </label></li>`)}</ul>
+              <p class="muted small" data-prepayments-empty hidden>Für diesen Kunden gibt es keine offenen Teilrechnungen.</p>`
+            : html`<p class="muted small">Es gibt noch keine festgeschriebenen Teilrechnungen, die abgezogen werden könnten.</p>`}
+        </section>`
+      : ''}
 
     <section class="card">
       <label>Einleitungstext <textarea name="intro" rows="2">${d.intro}</textarea></label>

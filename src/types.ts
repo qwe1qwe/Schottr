@@ -44,6 +44,15 @@ export interface Tenant {
   dunning_deadline_days: number;
   dunning_interval_days: number;
   disabled: number;
+  skonto_percent: number;
+  skonto_days: number;
+  datev_consultant: string;
+  datev_client: string;
+  datev_skr: string;
+  datev_account_length: number;
+  datev_debtor_mode: 'collective' | 'individual';
+  datev_debtor_account: number;
+  datev_accounts: string;
 }
 
 export type Role = 'owner' | 'member';

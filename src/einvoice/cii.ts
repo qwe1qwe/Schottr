@@ -1,6 +1,6 @@
 import { bpToDecimal, centsToDecimal, milliToDecimal } from '../lib/money.ts';
 import { toCiiDate } from '../lib/dates.ts';
-import type { DocumentData, Party } from './model.ts';
+import { dueAmount, skontoCode, type DocumentData, type Party } from './model.ts';
 
 /**
  * UN/CEFACT Cross Industry Invoice (CII D16B) nach EN 16931.
@@ -82,6 +82,11 @@ export function buildCii(d: DocumentData, profile: CiiProfile): string {
       txt('ram:SubjectCode', 'REG'),
     ]),
     d.exemptionReason ? el('ram:IncludedNote', [txt('ram:Content', d.exemptionReason), txt('ram:SubjectCode', 'TXD')]) : '',
+    d.prepayments?.length
+      ? el('ram:IncludedNote', txt('ram:Content', `Abgezogene Teilrechnungen: ${d.prepayments
+          .map((p) => `${p.number} vom ${p.issueDate.split('-').reverse().join('.')} (netto ${centsToDecimal(p.net)}, USt ${centsToDecimal(p.tax)}, brutto ${centsToDecimal(p.gross)} EUR)`)
+          .join('; ')}. Summe ${centsToDecimal(d.prepaid ?? 0)} EUR.`))
+      : '',
   ];
 
   const lines = d.items.map((it) =>
@@ -181,7 +186,8 @@ export function buildCii(d: DocumentData, profile: CiiProfile): string {
         taxes,
         period,
         el('ram:SpecifiedTradePaymentTerms', [
-          txt('ram:Description', d.paymentTerms),
+          // Skonto strukturiert nach XRechnung BR-DE-18 (#SKONTO#TAGE=…#PROZENT=…#), danach Freitext
+          txt('ram:Description', d.skonto ? `${skontoCode(d.skonto)}\n${d.paymentTerms}` : d.paymentTerms),
           d.dueDate && !isCredit ? el('ram:DueDateDateTime', date102(d.dueDate)) : '',
         ]),
         el('ram:SpecifiedTradeSettlementHeaderMonetarySummation', [
@@ -189,14 +195,17 @@ export function buildCii(d: DocumentData, profile: CiiProfile): string {
           txt('ram:TaxBasisTotalAmount', amount(d.net)),
           txt('ram:TaxTotalAmount', amount(d.tax), { currencyID: d.currency }),
           txt('ram:GrandTotalAmount', amount(d.gross)),
-          txt('ram:DuePayableAmount', amount(d.gross)),
+          d.prepaid ? txt('ram:TotalPrepaidAmount', amount(d.prepaid)) : '',
+          txt('ram:DuePayableAmount', amount(dueAmount(d))),
         ]),
-        d.precedingInvoice
+        // BG-3: Bezug auf die vorausgegangene Rechnung. CII erlaubt nur EINEN Bezug – bei mehreren
+        // abgezogenen Teilrechnungen die letzte; alle stehen zusätzlich im Hinweis (BT-22).
+        ((ref) => ref
           ? el('ram:InvoiceReferencedDocument', [
-              txt('ram:IssuerAssignedID', d.precedingInvoice.number),
-              el('ram:FormattedIssueDateTime', el('qdt:DateTimeString', esc(toCiiDate(d.precedingInvoice.issueDate)), { format: '102' })),
+              txt('ram:IssuerAssignedID', ref.number),
+              el('ram:FormattedIssueDateTime', el('qdt:DateTimeString', esc(toCiiDate(ref.issueDate)), { format: '102' })),
             ])
-          : '',
+          : '')(d.precedingInvoice ?? d.prepayments?.at(-1) ?? null),
       ]),
     ]),
   ], {

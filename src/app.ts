@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { getCookie } from 'hono/cookie';
 import { secureHeaders } from 'hono/secure-headers';
+import { bodyLimit } from 'hono/body-limit';
 import { HTTPException } from 'hono/http-exception';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { all, one } from './db/index.ts';
@@ -34,6 +35,9 @@ export function createApp() {
       referrerPolicy: 'same-origin',
     }),
   );
+
+  // Uploads (z. B. Logo) und Formulare begrenzen
+  app.use(bodyLimit({ maxSize: 5 * 1024 * 1024, onError: (c) => c.text('Anfrage zu groß', 413) }));
 
   app.use('/static/*', serveStatic({ root: './public', rewriteRequestPath: (p) => p.replace(/^\/static/, '') }));
   app.use('/fonts/*', serveStatic({ root: './assets' }));
