@@ -1,0 +1,48 @@
+# Schottr + MariaDB
+# Vorher: cp .env.example .env  und die Passwörter setzen.
+services:
+  db:
+    image: mariadb:11.4          # LTS-Version, Support bis 2029
+    container_name: schottr-db
+    restart: unless-stopped
+    environment:
+      MARIADB_DATABASE: schottr
+      MARIADB_USER: schottr
+      MARIADB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD in .env setzen}
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:?DB_ROOT_PASSWORD in .env setzen}
+      MARIADB_AUTO_UPGRADE: "1"  # bei neuer Image-Version Systemtabellen automatisch anpassen
+      TZ: Europe/Berlin
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - ./data/mariadb:/var/lib/mysql
+      - ./backup:/backup
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  schottr:
+    build: .
+    image: schottr:latest
+    container_name: schottr
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${SCHOTTR_PORT:-3000}:3000"
+    environment:
+      DB_HOST: db
+      DB_NAME: schottr
+      DB_USER: schottr
+      DB_PASSWORD: ${DB_PASSWORD}
+      # true = jeder darf sich registrieren; false = nur die Ersteinrichtung (empfohlen)
+      SCHOTTR_ALLOW_REGISTRATION: ${SCHOTTR_ALLOW_REGISTRATION:-false}
+      # auto = Secure-Cookie, wenn der Reverse-Proxy X-Forwarded-Proto: https sendet
+      SCHOTTR_SECURE_COOKIES: "auto"
+      SCHOTTR_TRUST_PROXY: "true"
+      TZ: Europe/Berlin
