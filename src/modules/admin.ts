@@ -38,6 +38,8 @@ const ACTIONS: Record<string, string> = {
   'member.remove': 'Benutzer entfernt',
   'member.create': 'Konto angelegt',
   'settings.logo': 'Logo geändert',
+  'proof.upload': 'Nachweis hochgeladen',
+  'proof.delete': 'Nachweis gelöscht',
   'export.datev': 'DATEV-Export',
   'export.journal': 'Export Rechnungsausgangsbuch',
   'export.zip': 'Export Belege (ZIP)',

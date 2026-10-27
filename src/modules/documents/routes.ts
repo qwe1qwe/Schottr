@@ -6,13 +6,15 @@ import { formatMoney, formatQuantity, formatRate, formatAmount } from '../../lib
 import { unitShort } from '../../lib/units.ts';
 import { attachment, idParam, notFound, readForm, redirectWith, str, tenantOf, userOf, UserError } from '../../lib/http.ts';
 import { badge, csrfField, empty, page } from '../../views/layout.ts';
-import { buildCii } from '../../einvoice/cii.ts';
+import { buildCii, type CiiAttachment } from '../../einvoice/cii.ts';
 import { renderPdf } from '../../einvoice/pdf.ts';
 import { buildDocumentData, checkInvoice, xrechnungWarnings, dueAmount, INVOICE_TYPES, SELECTABLE_TYPES, FINAL_TYPES, type DocumentData } from '../../einvoice/model.ts';
 import { articleOptions } from '../articles.ts';
 import { dunningSection } from '../dunning.ts';
 import { audit } from '../../lib/audit.ts';
 import { getLogo } from '../../lib/logo.ts';
+import { appendPdfs } from '../../lib/pdfmerge.ts';
+import { getProofFiles, getProofIds, proofOptions } from '../proofs.ts';
 import { contactLabel, contactOptions, getContact } from '../contacts.ts';
 import {
   createDraft, defaultTaxMode, deleteDraft, docToInput, duplicate, getDoc, getDocById, getItems, invoiceFromQuote,
@@ -54,6 +56,7 @@ async function newDraft(t: Tenant, kind: Kind, contactId: number): Promise<Draft
     skonto_percent: kind === 'invoice' ? t.skonto_percent : 0,
     skonto_days: kind === 'invoice' ? t.skonto_days : 0,
     prepayment_ids: [],
+    proof_ids: [],
     items: [],
   };
 }
@@ -69,7 +72,13 @@ async function dataFor(t: Tenant, doc: Doc): Promise<DocumentData> {
     draft: doc.kind === 'invoice',
     precedingInvoice: preceding?.number ? { number: preceding.number, issueDate: preceding.issue_date } : null,
     prepayments: await getPrepayments(doc.id),
+    proofs: doc.kind === 'invoice' ? (await getProofFiles(doc.id)).map((p) => ({ name: p.name, filename: p.filename })) : [],
   });
+}
+
+/** Nachweise als BG-24-Anhänge für die XRechnung (eindeutige Dateinamen, BR-DE-22) */
+function ciiAttachments(proofs: { id: number; name: string; filename: string; data: Buffer }[]): CiiAttachment[] {
+  return proofs.map((p, i) => ({ id: `NW-${i + 1}`, name: p.name, filename: `${String(i + 1).padStart(2, '0')}_${p.filename}`, data: p.data }));
 }
 
 function fileBase(d: DocumentData): string {
@@ -90,6 +99,8 @@ async function finalize(t: Tenant, doc: Doc): Promise<void> {
   const precedingInvoice = preceding?.number ? { number: preceding.number, issueDate: preceding.issue_date } : null;
   const prepayments = await getPrepayments(doc.id);
   const logo = await getLogo(t.id);
+  const proofFiles = await getProofFiles(doc.id);
+  const proofs = proofFiles.map((p) => ({ name: p.name, filename: p.filename }));
 
   // erst prüfen, dann Nummer ziehen
   const problems = checkInvoice(buildDocumentData({ tenant: t, contact, doc, items, number: 'x', draft: false, precedingInvoice, prepayments }));
@@ -101,9 +112,10 @@ async function finalize(t: Tenant, doc: Doc): Promise<void> {
     if (!locked || locked.finalized_at) throw new UserError('Diese Rechnung ist bereits festgeschrieben.');
 
     const number = await nextNumber(t.id, 'invoice', t.invoice_number_format, doc.issue_date);
-    const data = buildDocumentData({ tenant: t, contact, doc, items, number, draft: false, precedingInvoice, prepayments });
-    const xrechnung = xrechnungWarnings(data).length ? null : buildCii(data, 'xrechnung');
-    const pdf = await renderPdf(data, { zugferdXml: buildCii(data, 'en16931'), logo });
+    const data = buildDocumentData({ tenant: t, contact, doc, items, number, draft: false, precedingInvoice, prepayments, proofs });
+    const xrechnung = xrechnungWarnings(data).length ? null : buildCii(data, 'xrechnung', ciiAttachments(proofFiles));
+    // Nachweise hinten an das ZUGFeRD-PDF anhängen
+    const pdf = await appendPdfs(await renderPdf(data, { zugferdXml: buildCii(data, 'en16931'), logo }), proofFiles.map((p) => p.data));
 
     const now = nowIso();
     await run(
@@ -201,7 +213,10 @@ function register(app: App, kind: Kind) {
     return page(c, {
       title: kind === 'quote' ? 'Neues Angebot' : 'Neue Rechnung',
       back: { href: base, label: k.many },
-      body: documentForm(c, kind, base, draft, await contactOptions(t.id), await articleOptions(t.id), kind === 'invoice' ? await eligiblePrepayments(t.id) : []),
+      body: documentForm(
+        c, kind, base, draft, await contactOptions(t.id), await articleOptions(t.id),
+        kind === 'invoice' ? await eligiblePrepayments(t.id) : [], kind === 'invoice' ? await proofOptions(t.id) : [],
+      ),
     });
   });
 
@@ -293,6 +308,10 @@ function register(app: App, kind: Kind) {
       ${data.intro ? html`<p class="prose">${nl2br(data.intro)}</p>` : ''}
       ${data.items.length ? itemsTable(data) : html`<p class="muted">Noch keine Positionen.</p>`}
       ${data.outro ? html`<p class="prose">${nl2br(data.outro)}</p>` : ''}
+      ${data.proofs?.length
+        ? html`<section><h2 class="section-title">Angehängte Nachweise <span class="count">${data.proofs.length}</span></h2>
+            <ul class="plain">${data.proofs.map((p) => html`<li>${p.name} <span class="muted small">· ${p.filename}</span></li>`)}</ul></section>`
+        : ''}
       ${dunnings}
       ${related.length
         ? html`<section><h2 class="section-title">Verknüpfte Belege</h2>
@@ -323,9 +342,10 @@ function register(app: App, kind: Kind) {
       back: { href: `${base}/${doc.id}`, label: 'Zurück' },
       body: documentForm(
         c, kind, `${base}/${doc.id}`,
-        { ...docToInput(doc, await getItems(doc.id)), prepayment_ids: await getPrepaymentIds(doc.id) },
+        { ...docToInput(doc, await getItems(doc.id)), prepayment_ids: await getPrepaymentIds(doc.id), proof_ids: await getProofIds(doc.id) },
         await contactOptions(t.id, doc.contact_id), await articleOptions(t.id),
         kind === 'invoice' ? await eligiblePrepayments(t.id, doc.id) : [],
+        kind === 'invoice' ? await proofOptions(t.id, await getProofIds(doc.id)) : [],
       ),
     });
   });
@@ -365,7 +385,10 @@ function register(app: App, kind: Kind) {
       const row = await one<{ pdf: Uint8Array }>('SELECT pdf FROM documents WHERE id = ?', doc.id);
       pdf = row?.pdf ?? null;
     }
-    pdf ??= await renderPdf(data, { logo: await getLogo(t.id) });
+    if (!pdf) {
+      pdf = await renderPdf(data, { logo: await getLogo(t.id) });
+      if (kind === 'invoice') pdf = await appendPdfs(Buffer.from(pdf), (await getProofFiles(doc.id)).map((p) => p.data));
+    }
     return c.body(Buffer.from(pdf), 200, {
       'Content-Type': 'application/pdf',
       'Content-Disposition': attachment(`${fileBase(data)}.pdf`, true),
@@ -435,6 +458,7 @@ function register(app: App, kind: Kind) {
         skonto_percent: 0,
         skonto_days: 0,
         prepayment_ids: [],
+        proof_ids: [],
       };
       const id = await createDraft(t, 'invoice', input, userOf(c).id, { type_code: '381', corrects_id: doc.id });
       try {

@@ -5,6 +5,7 @@ import { UserError, list, str, type Form } from '../../lib/http.ts';
 import { parseDecimal } from '../../lib/money.ts';
 import { isUnit } from '../../lib/units.ts';
 import { nextNumber } from '../../lib/numbering.ts';
+import { writeProofLinks } from '../proofs.ts';
 import { FINAL_TYPES, SELECTABLE_TYPES, type Prepayment } from '../../einvoice/model.ts';
 import type { Tenant } from '../../types.ts';
 import { getContact } from '../contacts.ts';
@@ -109,6 +110,8 @@ export interface DraftInput {
   skonto_days: number;
   /** abzuziehende Teilrechnungen (nur 876/877) */
   prepayment_ids: number[];
+  /** angehängte Nachweisdokumentationen (nur Rechnungen) */
+  proof_ids: number[];
   items: ItemInput[];
 }
 
@@ -168,9 +171,11 @@ export async function parseDraft(form: Form, kind: Kind, tenantId: number): Prom
     skonto_percent: 0,
     skonto_days: 0,
     prepayment_ids: [],
+    proof_ids: [],
     items: [],
   };
   if (kind === 'invoice') {
+    d.proof_ids = [...new Set(list(form, 'proof_ids').map(Number).filter((n) => Number.isInteger(n) && n > 0))];
     const type = str(form, 'type_code') || '380';
     if (!(SELECTABLE_TYPES as string[]).includes(type)) errors.push('Ungültige Rechnungsart.');
     else d.type_code = type;
@@ -285,6 +290,7 @@ export async function createDraft(t: Tenant, kind: Kind, input: DraftInput, user
     const id = Number(res.insertId);
     const totals = await writeItems(id, input);
     const prepaid = await writePrepayments(t, id, input);
+    await writeProofLinks(t.id, id, input.proof_ids);
     await run('UPDATE documents SET net_total = ?, tax_total = ?, gross_total = ?, prepaid_total = ? WHERE id = ?', totals.net, totals.tax, totals.gross, prepaid, id);
     return id;
   });
@@ -298,6 +304,7 @@ export async function updateDraft(t: Tenant, doc: Doc, input: DraftInput) {
   await tx(async () => {
     const totals = await writeItems(doc.id, input);
     const prepaid = await writePrepayments(t, doc.id, input);
+    await writeProofLinks(t.id, doc.id, typeCode === '381' ? [] : input.proof_ids);
     await run(
       `UPDATE documents SET contact_id = ?, issue_date = ?, valid_until = ?, due_date = ?, service_date = ?, service_from = ?,
         service_to = ?, subject = ?, intro = ?, outro = ?, buyer_reference = ?, order_reference = ?, tax_mode = ?,
@@ -331,6 +338,7 @@ export function docToInput(doc: Doc, items: Item[]): DraftInput {
     skonto_percent: doc.skonto_percent,
     skonto_days: doc.skonto_days,
     prepayment_ids: [],
+    proof_ids: [],
     items: itemsToInput(items),
   };
 }

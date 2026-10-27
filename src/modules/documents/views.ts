@@ -8,6 +8,7 @@ import { INVOICE_TYPES, SELECTABLE_TYPES } from '../../einvoice/model.ts';
 import type { Ctx } from '../../types.ts';
 import type { Contact } from '../contacts.ts';
 import type { Article } from '../articles.ts';
+import { proofPicker, type Proof } from '../proofs.ts';
 import type { DraftInput, Kind } from './repo.ts';
 
 export const KIND = {
@@ -78,6 +79,7 @@ type PrepaymentOption = { id: number; contact_id: number; number: string; type_c
 
 export function documentForm(
   c: Ctx, kind: Kind, action: string, d: DraftInput, contacts: Contact[], articles: Article[] = [], prepayments: PrepaymentOption[] = [],
+  proofs: Proof[] = [],
 ): SafeHtml {
   const periodMode = !!(d.service_from || d.service_to);
   return html`
@@ -180,6 +182,8 @@ export function documentForm(
         </dl>
       </div>
     </section>
+
+    ${kind === 'invoice' && d.type_code !== '381' ? proofPicker(proofs, d.proof_ids) : ''}
 
     <section class="card">
       <label>Schlusstext <textarea name="outro" rows="2">${d.outro}</textarea></label>

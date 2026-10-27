@@ -110,6 +110,8 @@ export interface DocumentData {
   /** Zahlbetrag = gross − prepaid */
   due?: number;
   skonto?: Skonto | null;
+  /** angehängte Nachweisdokumentationen (Bezeichnung + Dateiname) */
+  proofs?: { name: string; filename: string }[];
   paymentTerms: string;
   draft: boolean;
 }
@@ -201,6 +203,7 @@ export function buildDocumentData(opts: {
   draft: boolean;
   precedingInvoice?: { number: string; issueDate: string } | null;
   prepayments?: Prepayment[];
+  proofs?: { name: string; filename: string }[];
 }): DocumentData {
   const { tenant, contact, doc, items } = opts;
   const totals = calculate(
@@ -249,6 +252,7 @@ export function buildDocumentData(opts: {
     prepayments,
     prepaid,
     skonto,
+    proofs: opts.proofs ?? [],
     paymentTerms: paymentTermsText(base),
     draft: opts.draft,
   };

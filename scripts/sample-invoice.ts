@@ -11,6 +11,7 @@ import { calculate, type ItemInput, type TaxMode } from '../src/lib/calc.ts';
 import { roundDiv } from '../src/lib/money.ts';
 import { buildCii } from '../src/einvoice/cii.ts';
 import { renderPdf } from '../src/einvoice/pdf.ts';
+import { appendPdfs } from '../src/lib/pdfmerge.ts';
 import { exemptionText, paymentTermsText, type DocumentData } from '../src/einvoice/model.ts';
 
 const seller = {
@@ -73,6 +74,13 @@ fs.mkdirSync('samples', { recursive: true });
 for (const [name, data] of Object.entries(samples)) {
   fs.writeFileSync(`samples/${name}.xml`, buildCii(data, 'xrechnung'));
   fs.writeFileSync(`samples/${name}.pdf`, await renderPdf(data, { zugferdXml: buildCii(data, 'en16931') }));
+}
+// Rechnung mit Nachweis: Seiten angehängt (PDF) + BG-24-Anhang (XRechnung)
+{
+  const proofPdf = await renderPdf({ ...samples.standard, kind: 'quote', number: 'Aufmaß', subject: 'Aufmaß Bauabschnitt 1' } as DocumentData);
+  const d = { ...samples.standard, number: 'RE-2026-0013', proofs: [{ name: 'Aufmaß Bauabschnitt 1', filename: 'aufmass.pdf' }] };
+  fs.writeFileSync('samples/mit_nachweis.xml', buildCii(d, 'xrechnung', [{ id: 'NW-1', name: 'Aufmaß Bauabschnitt 1', filename: '01_aufmass.pdf', data: proofPdf }]));
+  fs.writeFileSync('samples/mit_nachweis.pdf', await appendPdfs(await renderPdf(d, { zugferdXml: buildCii(d, 'en16931') }), [proofPdf]));
 }
 const logo = { data: fs.readFileSync('test/logo.png'), mime: 'image/png' };
 fs.writeFileSync('samples/mit_logo.pdf', await renderPdf(samples.schluss_877, { zugferdXml: buildCii(samples.schluss_877, 'en16931'), logo }));

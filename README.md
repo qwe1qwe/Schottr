@@ -5,7 +5,7 @@ Mit Login, Mandanten, Adressen, Angeboten und Rechnungen als **ZUGFeRD** (PDF/A-
 
 - **Node.js ≥ 22.18** (empfohlen: 24 LTS). TypeScript läuft direkt über Nodes Type Stripping, es gibt keinen Build-Schritt.
 - **MariaDB** (≥ 10.11, im Docker-Setup 11.4 LTS) über den Treiber `mysql2`
-- **Wenige Abhängigkeiten**, alle kommerziell nutzbar: Hono (MIT), mysql2 (MIT), PDFKit (MIT), Zod (MIT), IBM Plex Sans (OFL)
+- **Wenige Abhängigkeiten**, alle kommerziell nutzbar: Hono (MIT), mysql2 (MIT), PDFKit (MIT), pdf-lib (MIT), Zod (MIT), IBM Plex Sans (OFL)
 - Serverseitig gerenderte Oberfläche ohne Frontend-Framework. Das kleine `public/app.js` dient nur dem Positionseditor.
 
 ## Schnellstart mit Docker (empfohlen)
@@ -116,6 +116,10 @@ DB_PASSWORD=geheim npm start
 - **Mahnwesen**: Die Seite *Mahnwesen* listet überfällige Rechnungen und schlägt die nächste Stufe vor, sobald Fälligkeit bzw. Mahnfrist plus Kulanz abgelaufen sind. Es gibt drei Stufen: Zahlungserinnerung, 1. Mahnung und 2. (letzte) Mahnung. Gebühren, Frist und Kulanz stellst du in den Einstellungen ein und kannst sie je Mahnung anpassen. Das Mahn-PDF zeigt Rechnungsbetrag, Gebühren und offenen Gesamtbetrag. Mahngebühren werden ohne Umsatzsteuer ausgewiesen.
 - **Rechnungsarten (BT-3)**: Rechnung (380), Teilrechnung (875), Teilschlussrechnung (876), Schlussrechnung (877) sowie die Stornorechnung (381), die über „Stornieren“ entsteht. Teilschluss- und Schlussrechnungen ziehen festgeschriebene Teilrechnungen desselben Kunden ab. Netto, Steuer und Brutto jeder abgezogenen Teilrechnung werden ausgewiesen (§ 14 Abs. 5 UStG), im XML als `TotalPrepaidAmount`, Rechnungsbezug (BG-3) und Hinweis. Jede Teilrechnung kann nur einmal abgezogen werden.
 - **Skonto**: Prozent und Tage je Rechnung, mit Vorgabe in den Einstellungen. Im PDF steht ein Klartext mit Betrag und Frist, in der E-Rechnung das von XRechnung geforderte Format `#SKONTO#TAGE=10#PROZENT=2.00#` (BR-DE-18).
+- **Nachweise** (Menüpunkt *Nachweise*): Nachweisdokumentationen wie Aufmaß, Stundenzettel oder Abnahmeprotokoll zentral als PDF hochladen, benennen, umbenennen und archivieren. Beim Schreiben einer Rechnung wählst du aus, welche angehängt werden:
+  - **im PDF:** Die Seiten werden hinten an das ZUGFeRD-PDF angehängt, die Rechnung nennt sie unter „Anlagen“.
+  - **in der XRechnung:** Sie gehen als rechnungsbegründende Unterlagen (BG-24, Typ 916) mit eingebetteter PDF mit.
+  - **Hinweis:** PDFs mit nicht eingebetteten Schriften werden beim Hochladen als „nicht PDF/A“ markiert; mit ihnen ist das Rechnungs-PDF nicht mehr streng PDF/A-3. Verwendete Nachweise lassen sich nur archivieren, nicht löschen.
 - **Logo**: PNG (auch transparent) oder JPEG unter Einstellungen hochladen. Es erscheint oben rechts auf Angeboten, Rechnungen und Mahnungen; die PDFs bleiben PDF/A-3-konform.
 - **Export** (Menüpunkt *Export*, Zeitraum frei wählbar):
   - **DATEV-Buchungsstapel** (EXTF 700): je Rechnung und Steuersatz eine Buchung Debitor an Erlöskonto, Sammeldebitor oder Debitor je Kunde, SKR03/04. Erlöskonten lassen sich in den Einstellungen anpassen. Schlussrechnungen buchen die abgezogenen Teilrechnungen zurück, damit kein Umsatz doppelt erscheint.

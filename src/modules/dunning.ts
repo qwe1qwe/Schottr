@@ -6,7 +6,7 @@ import { attachment, idParam, notFound, readForm, redirectWith, str, tenantOf, u
 import { badge, csrfField, empty, page } from '../views/layout.ts';
 import { sellerFromTenant, dueAmount, INVOICE_TYPES, type DocumentData } from '../einvoice/model.ts';
 import { getLogo } from '../lib/logo.ts';
-import { bankLine, startLetter, sumBlock, LETTER_LEFT } from '../einvoice/pdf.ts';
+import { startLetter, sumBlock, LETTER_LEFT } from '../einvoice/pdf.ts';
 import type { App, Ctx, Module, Tenant } from '../types.ts';
 
 /**
@@ -151,7 +151,6 @@ export async function renderDunningPdf(t: Tenant, dunning: Dunning, invoice: { s
   const paras: { text: string; font?: string; color?: string }[] = [
     { text: `Bitte überweisen Sie ${formatMoney(total)} bis spätestens ${formatDate(dunning.deadline)}.`, font: 'B' },
   ];
-  if (seller.iban) paras.push({ text: bankLine(seller, inv.number), color: '#6b6a66' });
   if (fees.length || dunning.fee) paras.push({ text: 'Mahngebühren sind nicht umsatzsteuerpflichtig.', color: '#6b6a66' });
   paras.push({ text: 'Sollten Sie die Zahlung zwischenzeitlich veranlasst haben, betrachten Sie dieses Schreiben bitte als gegenstandslos.' });
   paras.push({ text: `Mit freundlichen Grüßen\n${seller.contactName || seller.name}` });

@@ -379,3 +379,51 @@ test('Teil-/Schlussrechnung, Skonto, Logo und Export', opts, async () => {
   assert.equal(zip.readUInt32LE(0), 0x04034b50);
   assert.match(zip.toString('latin1'), /_Schlussrechnung\.pdf/);
 });
+
+test('Nachweisdokumentationen', opts, async () => {
+  const first = (await one<{ id: number }>("SELECT id FROM tenants WHERE name = 'Test GmbH'"))!;
+  await req('/tenant/switch', { form: { tenant_id: String(first.id) } });
+  const contact = (await one<{ id: number }>("SELECT id FROM contacts WHERE company = 'Kunde AG'"))!;
+
+  // Nachweis hochladen: ein PDF aus Schottr selbst (Schriften eingebettet)
+  const quote = (await one<{ id: number }>("SELECT id FROM documents WHERE kind = 'quote' LIMIT 1"))!;
+  const pdfBytes = Buffer.from(await (await req(`/quotes/${quote.id}/pdf`)).arrayBuffer());
+  const fd = new FormData();
+  fd.append('_csrf', csrf);
+  fd.append('name', 'Aufmaß Halle 1');
+  fd.append('file', new Blob([pdfBytes], { type: 'application/pdf' }), 'aufmass.pdf');
+  let res = await app.request('/proofs', { method: 'POST', headers: { cookie }, body: fd });
+  assert.equal(res.status, 303);
+  const proof = (await one('SELECT * FROM proof_documents WHERE name = ?', 'Aufmaß Halle 1'))!;
+  assert.equal(proof.pdfa_ok, 1);
+  assert.equal(proof.pages, 1);
+
+  // Keine PDF → abgelehnt
+  const bad = new FormData();
+  bad.append('_csrf', csrf);
+  bad.append('name', 'Kaputt');
+  bad.append('file', new Blob(['hallo'], { type: 'application/pdf' }), 'x.pdf');
+  await app.request('/proofs', { method: 'POST', headers: { cookie }, body: bad });
+  assert.equal(await one('SELECT 1 FROM proof_documents WHERE name = ?', 'Kaputt'), undefined);
+
+  // An Rechnung anhängen und festschreiben
+  res = await req('/invoices', {
+    form: {
+      contact_id: String(contact.id), type_code: '380', issue_date: '2026-11-05', due_date: '2026-11-19', service_mode: 'date',
+      service_date: '2026-11-05', 'item_title[]': 'Mit Nachweis', 'item_description[]': '', 'item_quantity[]': '1',
+      'item_unit[]': 'LS', 'item_price[]': '100', 'item_vat[]': '1900', 'proof_ids[]': String(proof.id),
+    },
+  });
+  const id = location(res).split('/').pop()!;
+  await req(`/invoices/${id}/finalize`, { form: {} });
+  const xml = await (await req(`/invoices/${id}/xrechnung.xml`)).text();
+  assert.match(xml, /<ram:AdditionalReferencedDocument><ram:IssuerAssignedID>NW-1<\/ram:IssuerAssignedID><ram:TypeCode>916<\/ram:TypeCode><ram:Name>Aufmaß Halle 1<\/ram:Name><ram:AttachmentBinaryObject mimeCode="application\/pdf" filename="01_aufmass.pdf">JVBER/);
+  const pdf = Buffer.from(await (await req(`/invoices/${id}/pdf`)).arrayBuffer()).toString('latin1');
+  assert.equal((pdf.match(/\/Type \/Page\b/g) ?? []).length, 2, 'Rechnung + 1 Seite Nachweis');
+  assert.match(pdf, /factur-x\.xml/);
+
+  // Verwendete Nachweise lassen sich nicht löschen, nur archivieren
+  await req(`/proofs/${proof.id}/delete`, { form: {} });
+  assert.ok(await one('SELECT 1 FROM proof_documents WHERE id = ?', proof.id));
+  await assert.rejects(run('DELETE FROM document_proofs WHERE document_id = ?', Number(id)), /Festgeschriebene/);
+});

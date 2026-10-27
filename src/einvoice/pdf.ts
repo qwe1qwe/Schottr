@@ -419,8 +419,8 @@ export function renderPdf(d: DocumentData, opts: PdfOptions = {}): Promise<Buffe
   const paragraphs: { text: string; font?: string; color?: string }[] = [];
   if (d.exemptionReason) paragraphs.push({ text: d.exemptionReason, font: 'B' });
   if (d.kind === 'invoice') paragraphs.push({ text: d.paymentTerms });
-  if (d.kind === 'invoice' && d.typeCode !== '381' && s.iban) paragraphs.push({ text: bankLine(s, d.number), color: MUTED });
   if (d.kind === 'quote' && d.validUntil) paragraphs.push({ text: `Dieses Angebot ist gültig bis ${formatDate(d.validUntil)}.` });
+  if (d.proofs?.length) paragraphs.push({ text: `Anlagen: ${d.proofs.map((p) => p.name).join(', ')}`, color: MUTED });
   if (d.outro) paragraphs.push({ text: d.outro });
   if (d.intro || d.outro) paragraphs.push({ text: 'Mit freundlichen Grüßen\n' + (s.contactName || s.name) });
   letter.paragraphs(y + mm(4), paragraphs);

@@ -289,3 +289,10 @@ body.bare { display: grid; place-items: center; min-height: 100vh; padding: 1rem
 .export-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; }
 .export-grid .card { margin: 0; display: flex; flex-direction: column; gap: .5rem; align-items: flex-start; }
 @media (max-width: 860px) { .export-grid { grid-template-columns: 1fr; } }
+
+/* ---------- Nachweise ---------- */
+.upload-form { align-items: end; }
+.upload-form .form-actions { margin: 0; }
+.rename-form { display: flex; gap: .5rem; align-items: center; }
+.rename-form input { max-width: 22rem; padding: .35rem .5rem; }
+.proof-list li { border-bottom: 1px solid var(--line); }

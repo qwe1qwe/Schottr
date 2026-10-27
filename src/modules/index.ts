@@ -9,6 +9,7 @@ import { dunningModule } from './dunning.ts';
 import { invitationsModule } from './invitations.ts';
 import { adminModule } from './admin.ts';
 import { exportModule } from './export.ts';
+import { proofsModule } from './proofs.ts';
 
 /**
  * Alle aktiven Module. Ein neues Modul (z. B. Zeiterfassung)
@@ -22,6 +23,7 @@ export const modules: Module[] = [
   articlesModule,
   quotesModule,
   invoicesModule,
+  proofsModule,
   dunningModule,
   exportModule,
   invitationsModule,

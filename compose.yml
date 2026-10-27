@@ -15,6 +15,7 @@ services:
     command:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_unicode_ci
+      - --max-allowed-packet=256M   # große Rechnungs-PDFs mit Nachweisen
     volumes:
       - ./data/mariadb:/var/lib/mysql
       - ./backup:/backup

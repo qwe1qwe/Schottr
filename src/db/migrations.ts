@@ -339,4 +339,42 @@ export const migrations: { version: number; statements: string[] }[] = [
        THEN ${forbid('Festgeschriebene Rechnungen koennen nicht geaendert werden')}; END IF`,
     ],
   },
+  {
+    version: 5,
+    statements: [
+      // Nachweisdokumentationen (PDF), zentral je Mandant, an Rechnungen anhängbar
+      `CREATE TABLE proof_documents (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        tenant_id INT NOT NULL,
+        name VARCHAR(200) NOT NULL,
+        filename VARCHAR(200) NOT NULL,
+        data LONGBLOB NOT NULL,
+        size INT NOT NULL,
+        pages INT NOT NULL,
+        pdfa_ok TINYINT(1) NOT NULL DEFAULT 1,
+        archived TINYINT(1) NOT NULL DEFAULT 0,
+        created_by INT NULL,
+        created_at DATETIME(3) NOT NULL,
+        updated_at DATETIME(3) NOT NULL,
+        KEY proofs_tenant (tenant_id, archived),
+        CONSTRAINT proofs_tenant FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
+        CONSTRAINT proofs_user FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
+      ) ${TABLE}`,
+      `CREATE TABLE document_proofs (
+        document_id INT NOT NULL,
+        proof_id INT NOT NULL,
+        \`position\` INT NOT NULL DEFAULT 0,
+        PRIMARY KEY (document_id, proof_id),
+        KEY document_proofs_proof (proof_id),
+        CONSTRAINT document_proofs_document FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE,
+        CONSTRAINT document_proofs_proof FOREIGN KEY (proof_id) REFERENCES proof_documents(id)
+      ) ${TABLE}`,
+      `CREATE TRIGGER document_proofs_immutable_delete BEFORE DELETE ON document_proofs FOR EACH ROW
+       IF (SELECT finalized_at FROM documents WHERE id = OLD.document_id) IS NOT NULL
+       THEN ${forbid('Festgeschriebene Rechnungen koennen nicht geaendert werden')}; END IF`,
+      `CREATE TRIGGER document_proofs_immutable_insert BEFORE INSERT ON document_proofs FOR EACH ROW
+       IF (SELECT finalized_at FROM documents WHERE id = NEW.document_id) IS NOT NULL
+       THEN ${forbid('Festgeschriebene Rechnungen koennen nicht geaendert werden')}; END IF`,
+    ],
+  },
 ];

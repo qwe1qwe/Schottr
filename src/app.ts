@@ -37,7 +37,7 @@ export function createApp() {
   );
 
   // Uploads (z. B. Logo) und Formulare begrenzen
-  app.use(bodyLimit({ maxSize: 5 * 1024 * 1024, onError: (c) => c.text('Anfrage zu groß', 413) }));
+  app.use(bodyLimit({ maxSize: 15 * 1024 * 1024, onError: (c) => c.text('Anfrage zu groß', 413) }));
 
   app.use('/static/*', serveStatic({ root: './public', rewriteRequestPath: (p) => p.replace(/^\/static/, '') }));
   app.use('/fonts/*', serveStatic({ root: './assets' }));

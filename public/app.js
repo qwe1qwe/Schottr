@@ -24,6 +24,74 @@
     if (row) window.location.href = row.getAttribute('data-href');
   });
 
+  /* ---------- Eingaben nach Fehlern erhalten ----------
+   * Beim Absenden werden die Werte (ohne Passwörter/Dateien) im sessionStorage dieses Tabs
+   * gemerkt. Zeigt die Folgeseite eine Fehlermeldung und dasselbe Formular, werden sie
+   * wieder eingesetzt – inkl. aller Positionszeilen. Ohne Fehler wird nichts übernommen. */
+  const STORE = 'schottr:last-form';
+  const SKIP = new Set(['password', 'file', 'submit', 'button', 'reset']);
+
+  document.addEventListener('submit', (e) => {
+    const f = e.target;
+    if (e.defaultPrevented || !(f instanceof HTMLFormElement) || f.method.toLowerCase() !== 'post') return;
+    if (f.enctype === 'multipart/form-data') return;
+    const fields = [];
+    for (const el of f.elements) {
+      if (!el.name || el.name === '_csrf' || SKIP.has(el.type) || el.disabled) continue;
+      if (el.type === 'checkbox' || el.type === 'radio') fields.push([el.name, el.value, el.checked]);
+      else fields.push([el.name, el.value]);
+    }
+    try {
+      sessionStorage.setItem(STORE, JSON.stringify({ action: f.getAttribute('action'), fields, t: Date.now() }));
+    } catch {
+      /* privater Modus o. Ä. – dann eben ohne */
+    }
+  });
+
+  (function restoreAfterError() {
+    let saved = null;
+    try {
+      saved = JSON.parse(sessionStorage.getItem(STORE) || 'null');
+      sessionStorage.removeItem(STORE);
+    } catch {
+      return;
+    }
+    if (!saved || Date.now() - saved.t > 5 * 60_000 || !document.querySelector('.flash-error')) return;
+    const target = [...document.forms].find((f) => f.getAttribute('action') === saved.action);
+    if (!target) return;
+
+    // Positionszeilen in passender Anzahl anlegen
+    const tbody = target.querySelector('[data-items] tbody');
+    const tpl = target.querySelector('[data-item-template]');
+    if (tbody && tpl) {
+      const rows = saved.fields.filter(([n]) => n === 'item_title[]').length;
+      tbody.replaceChildren();
+      for (let i = 0; i < Math.max(rows, 1); i++) tbody.appendChild(tpl.content.firstElementChild.cloneNode(true));
+    }
+
+    const seen = {};
+    for (const [name, value, checked] of saved.fields) {
+      const els = [...target.elements].filter((el) => el.name === name);
+      if (!els.length) continue;
+      if (checked !== undefined) {
+        const el = els.find((x) => x.value === value);
+        if (el) el.checked = checked;
+        continue;
+      }
+      const i = (seen[name] = (seen[name] ?? -1) + 1);
+      if (els[i]) els[i].value = value;
+    }
+    // Artikelnummer-Kennzeichen der Positionen nachziehen
+    target.querySelectorAll('tr.item').forEach((row) => {
+      const art = row.querySelector('[name="item_article[]"]');
+      const tag = row.querySelector('.art-no');
+      if (art && tag) {
+        tag.hidden = !art.value;
+        tag.querySelector('span').textContent = art.value;
+      }
+    });
+  })();
+
   /* ---------- Beleg-Formular ---------- */
   const form = document.querySelector('[data-doc-form]');
   if (!form) return;

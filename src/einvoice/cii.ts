@@ -65,7 +65,15 @@ function taxRegistrations(p: Party): string {
   ].join('');
 }
 
-export function buildCii(d: DocumentData, profile: CiiProfile): string {
+/** Rechnungsbegründende Unterlagen (BG-24) mit eingebetteter Datei (BT-125) */
+export interface CiiAttachment {
+  id: string;
+  name: string;
+  filename: string;
+  data: Buffer;
+}
+
+export function buildCii(d: DocumentData, profile: CiiProfile, attachments: CiiAttachment[] = []): string {
   const s = d.seller;
   const b = d.buyer;
   const isCredit = d.typeCode === '381';
@@ -170,6 +178,13 @@ export function buildCii(d: DocumentData, profile: CiiProfile): string {
         seller,
         buyer,
         d.orderReference ? el('ram:BuyerOrderReferencedDocument', txt('ram:IssuerAssignedID', d.orderReference)) : '',
+        attachments.map((a) =>
+          el('ram:AdditionalReferencedDocument', [
+            txt('ram:IssuerAssignedID', a.id),
+            txt('ram:TypeCode', '916'), // rechnungsbegründende Unterlage
+            txt('ram:Name', a.name),
+            `<ram:AttachmentBinaryObject mimeCode="application/pdf" filename="${esc(a.filename)}">${a.data.toString('base64')}</ram:AttachmentBinaryObject>`,
+          ])),
       ]),
       el('ram:ApplicableHeaderTradeDelivery',
         d.serviceDate
