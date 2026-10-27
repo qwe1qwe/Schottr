@@ -552,8 +552,9 @@ test('Übersicht: Top-Kunden, Kleinunternehmergrenze und Monatsfilter', opts, as
   try {
     page = await (await req('/')).text();
     assert.match(page, /Kleinunternehmergrenze/);
-    assert.match(page, /von 100\.000,00.€/);
-    assert.match(page, /von 25\.000,00.€/);
+    assert.match(page, /meter-mark-label at-25">25\.000 € · Grenze für \d{4}</);
+    assert.match(page, /aria-valuemax="10000000"/);
+    assert.match(page, /bis 25\.000 €|25\.000 € überschritten/);
   } finally {
     await run('UPDATE tenants SET small_business = 0 WHERE id = ?', first.id);
   }

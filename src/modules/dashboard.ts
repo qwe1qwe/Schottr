@@ -117,20 +117,23 @@ async function smallBusinessLimits(tenantId: number, year: number) {
   const prev = await yearRevenue(tenantId, year - 1);
   const cur = await yearRevenue(tenantId, year);
   const prevOver = prev.s > KU_PREV_YEAR_LIMIT;
+  const next = year + 1;
+  // Zustand: unter 80 % der 25.000-€-Grenze ok, darüber Warnung, über 25.000 € Folgejahr betroffen, über 100.000 € sofort
+  const state = cur.s > KU_CURRENT_YEAR_LIMIT ? 'danger' : cur.s > KU_PREV_YEAR_LIMIT ? 'over' : cur.s >= KU_PREV_YEAR_LIMIT * 0.8 ? 'warn' : 'ok';
+  const status =
+    state === 'danger'
+      ? html`<strong>100.000 € überschritten:</strong> Ab dem Umsatz, mit dem die Grenze überschritten wurde, gilt die Regelbesteuerung.`
+      : state === 'over'
+        ? html`<strong>25.000 € überschritten:</strong> ${next} ist die Kleinunternehmerregelung nicht mehr möglich. Bis zur Höchstgrenze von 100.000 € bleibt ${year} noch ${formatMoney(KU_CURRENT_YEAR_LIMIT - cur.s)}.`
+        : html`Noch <strong>${formatMoney(KU_PREV_YEAR_LIMIT - cur.s)}</strong> bis 25.000 € – bleibst du darunter, kannst du ${next} weiter Kleinunternehmer sein.`;
   return html`<section class="card ku">
     <h2>Kleinunternehmergrenze <span class="muted small">§ 19 UStG</span></h2>
     ${meter(cur.s, KU_CURRENT_YEAR_LIMIT, {
-      label: html`${year} bisher – Höchstgrenze im laufenden Jahr`,
-      detail: cur.s > KU_CURRENT_YEAR_LIMIT
-        ? html`<strong class="danger-text">überschritten – ab dem Umsatz, der die Grenze überschreitet, gilt die Regelbesteuerung</strong>`
-        : `noch ${formatMoney(KU_CURRENT_YEAR_LIMIT - cur.s)}`,
+      label: `Umsatz ${year} bisher`,
+      state,
+      marks: [{ value: KU_PREV_YEAR_LIMIT, label: `25.000 € · Grenze für ${next}` }],
     })}
-    ${meter(cur.s, KU_PREV_YEAR_LIMIT, {
-      label: html`${year} bisher – Grenze für ${year + 1}`,
-      detail: cur.s > KU_PREV_YEAR_LIMIT
-        ? html`<strong class="danger-text">überschritten – ${year + 1} keine Kleinunternehmerregelung mehr</strong>`
-        : `noch ${formatMoney(KU_PREV_YEAR_LIMIT - cur.s)}`,
-    })}
+    <p class="small ku-status ku-${state}">${status}</p>
     <p class="small ${prevOver ? 'danger-text' : 'muted'}">Vorjahr ${year - 1}: ${formatMoney(prev.s)}
       ${prevOver ? ` – über ${formatMoney(KU_PREV_YEAR_LIMIT)}, die Kleinunternehmerregelung ist ${year} nicht anwendbar.` : ` – innerhalb der Grenze von ${formatMoney(KU_PREV_YEAR_LIMIT)}.`}</p>
     <p class="muted small">Berechnet aus den festgeschriebenen Rechnungen in Schottr. Maßgeblich ist dein gesamter Umsatz – Umsätze außerhalb von Schottr zählen mit.</p>

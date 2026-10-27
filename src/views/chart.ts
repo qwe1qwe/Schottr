@@ -151,16 +151,39 @@ export function pieChart(slices: PieSlice[], opts: { caption: string; sub?: stri
   </figure>`;
 }
 
-/* ---------------- Fortschrittsbalken (Grenzwerte) ---------------- */
+/* ---------------- Fortschrittsbalken mit Grenzmarken ---------------- */
 
-export function meter(value: number, limit: number, opts: { label: SafeHtml | string; detail?: SafeHtml | string }): SafeHtml {
-  const ratio = limit > 0 ? value / limit : 0;
-  const state = ratio >= 1 ? 'over' : ratio >= 0.8 ? 'warn' : 'ok';
-  // 20 Stufen à 5 % – Breite über Klassen, da die CSP keine Inline-Styles erlaubt
-  const step = Math.min(20, Math.max(value > 0 ? 1 : 0, Math.round(ratio * 20)));
-  return html`<div class="meter meter-${state}">
-    <div class="meter-head"><span>${opts.label}</span><strong class="num">${pct(Math.round(ratio * 1000) / 10)}</strong></div>
-    <div class="meter-track" role="meter" aria-valuemin="0" aria-valuemax="${limit}" aria-valuenow="${Math.max(0, value)}"><span class="meter-fill w${step}"></span></div>
-    <div class="meter-foot num">${formatMoney(value)} von ${formatMoney(limit)}${opts.detail ? html` · ${opts.detail}` : ''}</div>
+export interface MeterMark {
+  value: number;
+  label: string;
+}
+
+/**
+ * Balken von 0 bis max mit senkrechten Marken (z. B. 25.000 € innerhalb von 100.000 €).
+ * Gezeichnet als SVG mit Prozent-Koordinaten (keine Inline-Styles wegen CSP). Der Teil
+ * jenseits der ersten Marke wird abgesetzt eingefärbt, damit das Überschreiten auffällt.
+ * Die Beschriftungen der Marken stehen unter dem Balken an ihrer Position (auf 5 % gerundet,
+ * da die Position über CSS-Klassen gesetzt wird).
+ */
+export function meter(value: number, max: number, opts: { label: SafeHtml | string; marks?: MeterMark[]; state: 'ok' | 'warn' | 'over' | 'danger' }): SafeHtml {
+  const x = (v: number) => Math.min(100, Math.max(0, (v / max) * 100));
+  const marks = (opts.marks ?? []).filter((m) => m.value > 0 && m.value < max);
+  const first = marks[0]?.value ?? max;
+  const v = Math.max(0, value);
+  const fillEnd = x(v);
+  const split = Math.min(fillEnd, x(first));
+  return html`<div class="meter meter-${opts.state}">
+    <div class="meter-head"><span>${opts.label}</span><strong class="num">${formatMoney(value)}</strong></div>
+    <svg class="meter-svg" viewBox="0 0 100 10" preserveAspectRatio="none" role="meter"
+      aria-valuemin="0" aria-valuemax="${max}" aria-valuenow="${v}" aria-label="${formatMoney(value)} von ${formatMoney(max)}">
+      <rect class="meter-track" x="0" y="0" width="100" height="10"></rect>
+      ${split > 0 ? html`<rect class="meter-fill" x="0" y="0" width="${split.toFixed(2)}" height="10"></rect>` : ''}
+      ${fillEnd > split ? html`<rect class="meter-fill beyond" x="${split.toFixed(2)}" y="0" width="${(fillEnd - split).toFixed(2)}" height="10"></rect>` : ''}
+      ${marks.map((m) => html`<line class="meter-mark" x1="${x(m.value)}" y1="-3" x2="${x(m.value)}" y2="13" vector-effect="non-scaling-stroke"></line>`)}
+    </svg>
+    <div class="meter-scale" aria-hidden="true">
+      ${marks.map((m) => html`<span class="meter-mark-label at-${Math.round(x(m.value) / 5) * 5}">${m.label}</span>`)}
+      <span class="meter-max">${formatMoney(max).replace(/,00(?=\s?€)/, '')}</span>
+    </div>
   </div>`;
 }
