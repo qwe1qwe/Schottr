@@ -27,6 +27,25 @@ Weitere Benutzer lädt der Inhaber unter **Einstellungen → Benutzer** ein oder
 Hinter einem Reverse-Proxy (z. B. Nginx Proxy Manager) einfach auf Port 3000 weiterleiten.
 Sendet der Proxy `X-Forwarded-Proto: https`, werden Cookies automatisch als `Secure` gesetzt.
 
+### Fertiges Image vom Server aus nutzen (GitHub Container Registry)
+
+Bei jedem Push auf `main` baut GitHub Actions (`.github/workflows/docker.yml`) erst die Tests und dann das Image für amd64 und arm64. Es landet in der Registry als:
+
+- `ghcr.io/qwe1qwe/schottr:latest` – aktueller Stand von `main`
+- `ghcr.io/qwe1qwe/schottr:1.0.0` – bei einem Git-Tag `v1.0.0`
+- `ghcr.io/qwe1qwe/schottr:sha-abc1234` – jeder Build, zum Zurückrollen
+
+Auf dem Server brauchst du keinen Quellcode, nur den Ordner `deploy/` (`compose.yml`, `.env.example`, `backup.sh`):
+
+```bash
+cp .env.example .env            # Passwörter setzen
+docker compose pull && docker compose up -d
+```
+
+Aktualisieren geht genauso: `docker compose pull && docker compose up -d`. Datenbank-Migrationen laufen beim Start automatisch.
+
+Ist das Paket privat (Standard bei privaten Repos), meldet sich der Server einmalig an. Dafür auf GitHub ein Token (classic) nur mit `read:packages` anlegen und dann `docker login ghcr.io -u qwe1qwe` ausführen. Alternativ das Paket unter *GitHub → Packages → schottr → Package settings* auf „Public“ stellen.
+
 ### Backup & Wiederherstellung
 
 ```bash

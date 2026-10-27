@@ -1,0 +1,49 @@
+# Schottr auf dem Server – nutzt das fertige Image aus der GitHub Container Registry.
+# Auf dem Server werden nur diese Datei und eine .env benötigt (Vorlage: .env.example).
+#
+#   docker compose pull && docker compose up -d     # starten bzw. aktualisieren
+#
+services:
+  db:
+    image: mariadb:11.4
+    container_name: schottr-db
+    restart: unless-stopped
+    environment:
+      MARIADB_DATABASE: schottr
+      MARIADB_USER: schottr
+      MARIADB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD in .env setzen}
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:?DB_ROOT_PASSWORD in .env setzen}
+      MARIADB_AUTO_UPGRADE: "1"
+      TZ: Europe/Berlin
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - ./data/mariadb:/var/lib/mysql
+      - ./backup:/backup
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  schottr:
+    # latest = Stand von main; für feste Versionen z. B. SCHOTTR_TAG=1.0.0 in der .env
+    image: ghcr.io/qwe1qwe/schottr:${SCHOTTR_TAG:-latest}
+    container_name: schottr
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${SCHOTTR_PORT:-3000}:3000"
+    environment:
+      DB_HOST: db
+      DB_NAME: schottr
+      DB_USER: schottr
+      DB_PASSWORD: ${DB_PASSWORD}
+      SCHOTTR_ALLOW_REGISTRATION: ${SCHOTTR_ALLOW_REGISTRATION:-false}
+      SCHOTTR_SECURE_COOKIES: "auto"
+      SCHOTTR_TRUST_PROXY: "true"
+      TZ: Europe/Berlin

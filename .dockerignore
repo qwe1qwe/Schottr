@@ -7,3 +7,5 @@ samples
 test
 scripts
 *.log
+.github
+deploy
