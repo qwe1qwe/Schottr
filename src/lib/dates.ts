@@ -28,3 +28,17 @@ export function isIsoDate(value: unknown): value is string {
 export function toCiiDate(isoDate: string): string {
   return isoDate.replaceAll('-', '');
 }
+
+export const MONTH_NAMES = ['Januar', 'Februar', 'März', 'April', 'Mai', 'Juni', 'Juli', 'August', 'September', 'Oktober', 'November', 'Dezember'];
+
+/** "2026-10" → "Oktober 2026" (oder null bei ungültiger Angabe) */
+export function monthLabel(ym: string): string | null {
+  const m = /^(\d{4})-(0[1-9]|1[0-2])$/.exec(ym);
+  return m ? `${MONTH_NAMES[Number(m[2]) - 1]} ${m[1]}` : null;
+}
+
+/** Letzter Tag eines Monats "2026-02" → "2026-02-28" */
+export function monthEnd(ym: string): string {
+  const [y, m] = ym.split('-').map(Number);
+  return `${ym}-${String(new Date(Date.UTC(y, m, 0)).getUTCDate()).padStart(2, '0')}`;
+}

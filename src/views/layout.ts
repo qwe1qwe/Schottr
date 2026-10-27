@@ -53,7 +53,15 @@ export function page(c: Ctx, opts: PageOptions) {
 <body>
 <div class="shell">
   <aside class="sidebar">
-    <a class="brand" href="/"><span class="brand-mark">S</span><span>Schottr</span></a>
+    <div class="sidebar-top">
+      <a class="brand" href="/"><span class="brand-mark">S</span><span>Schottr</span></a>
+      ${user
+        ? html`<button type="button" class="menu-toggle" data-menu-toggle aria-controls="main-menu" aria-expanded="false" aria-label="Menü öffnen">
+            <span class="menu-icon" aria-hidden="true"><span></span><span></span><span></span></span>
+          </button>`
+        : ''}
+    </div>
+    <div class="sidebar-panel" id="main-menu">
     ${tenant
       ? html`<nav class="nav">
           ${navItems.map(
@@ -79,6 +87,7 @@ export function page(c: Ctx, opts: PageOptions) {
           <form method="post" action="/logout">${csrfField(c)}<button class="link">Abmelden</button></form>
         </div>`
       : ''}
+    </div>
   </aside>
   <main class="main">
     ${opts.back ? html`<a class="back" href="${opts.back.href}">← ${opts.back.label}</a>` : ''}

@@ -66,12 +66,12 @@ function itemRow(it?: DraftInput['items'][number]): SafeHtml {
       <input name="item_title[]" value="${it?.title ?? ''}" placeholder="Bezeichnung" maxlength="300" aria-label="Bezeichnung">
       <textarea name="item_description[]" rows="1" placeholder="Beschreibung (optional)" aria-label="Beschreibung">${it?.description ?? ''}</textarea>
     </td>
-    <td><input name="item_quantity[]" value="${qty}" inputmode="decimal" class="num" aria-label="Menge"></td>
-    <td><select name="item_unit[]" aria-label="Einheit">${UNITS.map((u) => html`<option value="${u.code}"${selected(u.code, it?.unit ?? 'C62')}>${u.short}</option>`)}</select></td>
-    <td><input name="item_price[]" value="${price}" inputmode="decimal" class="num" placeholder="0,00" aria-label="Einzelpreis netto"></td>
-    <td class="vat-col"><select name="item_vat[]" aria-label="USt.">${VAT_RATES.map((r) => html`<option value="${r}"${selected(r, it?.vatRate ?? 1900)}>${r / 100} %</option>`)}</select></td>
-    <td class="right num line-total">–</td>
-    <td><button type="button" class="icon remove" title="Position entfernen" aria-label="Position entfernen">×</button></td>
+    <td data-label="Menge"><input name="item_quantity[]" value="${qty}" inputmode="decimal" class="num" aria-label="Menge"></td>
+    <td data-label="Einheit"><select name="item_unit[]" aria-label="Einheit">${UNITS.map((u) => html`<option value="${u.code}"${selected(u.code, it?.unit ?? 'C62')}>${u.short}</option>`)}</select></td>
+    <td data-label="Einzelpreis €"><input name="item_price[]" value="${price}" inputmode="decimal" class="num" placeholder="0,00" aria-label="Einzelpreis netto"></td>
+    <td class="vat-col" data-label="USt."><select name="item_vat[]" aria-label="USt.">${VAT_RATES.map((r) => html`<option value="${r}"${selected(r, it?.vatRate ?? 1900)}>${r / 100} %</option>`)}</select></td>
+    <td class="right num line-total" data-label="Gesamt €">–</td>
+    <td class="remove-cell"><button type="button" class="icon remove" title="Position entfernen" aria-label="Position entfernen">×</button></td>
   </tr>`;
 }
 

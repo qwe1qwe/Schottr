@@ -98,6 +98,8 @@ DB_PASSWORD=geheim npm start
 
 ## Funktionen
 
+- **Übersicht**: Offene und überfällige Rechnungen, offene Angebote und der Netto-Umsatz eines wählbaren Jahres (Stornos zählen negativ, abgezogene Teilrechnungen nicht doppelt). Ein Säulendiagramm zeigt die festgeschriebenen Rechnungen der letzten 24 Monate; Überfahren (am Handy: einmal Antippen) zeigt Betrag und Anzahl, ein Klick öffnet die Rechnungsliste gefiltert auf diesen Monat. Ein Ringdiagramm zeigt die fünf umsatzstärksten Kunden der letzten 24 Monate plus „Sonstige“ (Klick führt zur Adresse). Bei aktiver Kleinunternehmerregelung zeigt eine Kachel den Stand gegenüber den Grenzen nach § 19 UStG (25.000 € Vorjahr, 100.000 € laufendes Jahr) und warnt ab 80 %.
+- **Am Handy**: Die Navigation sitzt hinter einem Menü-Button und öffnet sich als Vollbild-Liste. Tabellen (Belege, Adressen, Administration, Protokoll …) werden in der schmalen Ansicht zu Karten mit beschrifteten Feldern, der Positionseditor zu untereinander stehenden Eingaben.
 - **Mandanten**: Ein Benutzer kann mehreren Firmen angehören und zwischen ihnen umschalten. Alle Daten sind strikt je Mandant getrennt. Es gibt die Rollen Inhaber und Mitglied.
 - **Administration** (übergreifend, nur für Administratoren, Link unten in der Seitenleiste): Der erste registrierte Benutzer ist automatisch Administrator. Es gibt fünf Bereiche:
   - **Übersicht:** Kennzahlen, Mandanten ohne aktiven Inhaber und die letzten Ereignisse.

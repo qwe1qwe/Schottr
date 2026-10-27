@@ -23,6 +23,90 @@
     });
   }
 
+  /* ---------- Menü am Handy ---------- */
+  const menuToggle = document.querySelector('[data-menu-toggle]');
+  if (menuToggle) {
+    const setMenu = (open) => {
+      document.body.classList.toggle('menu-open', open);
+      menuToggle.setAttribute('aria-expanded', String(open));
+      menuToggle.setAttribute('aria-label', open ? 'Menü schließen' : 'Menü öffnen');
+    };
+    menuToggle.addEventListener('click', () => setMenu(!document.body.classList.contains('menu-open')));
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && document.body.classList.contains('menu-open')) {
+        setMenu(false);
+        menuToggle.focus();
+      }
+    });
+    // Beim Wechsel auf die breite Ansicht nicht im geöffneten Zustand hängen bleiben
+    window.matchMedia('(min-width: 861px)').addEventListener('change', (m) => m.matches && setMenu(false));
+    // Zurück-Navigation aus dem Cache (bfcache) mit geschlossenem Menü
+    window.addEventListener('pageshow', () => setMenu(false));
+  }
+
+  // Aktiven Reiter in waagerecht scrollbaren Reiterleisten sichtbar machen
+  document.querySelectorAll('.tabs').forEach((tabs) => {
+    const active = tabs.querySelector('a.active');
+    if (active && tabs.scrollWidth > tabs.clientWidth) tabs.scrollLeft = active.offsetLeft - tabs.offsetLeft - (tabs.clientWidth - active.offsetWidth) / 2;
+  });
+
+  /* ---------- Tabellen am Handy als Karten ----------
+   * Jede Zelle bekommt die Spaltenüberschrift als data-label; das CSS zeigt sie in der
+   * schmalen Ansicht vor dem Wert an. Die erste Zelle (oder .stack-title) wird zur Kopfzeile. */
+  document.querySelectorAll('table.table:not(.items)').forEach((table) => {
+    const heads = [...table.querySelectorAll('thead th')].map((th) => th.textContent.trim());
+    table.classList.add('stack-mobile');
+    table.querySelectorAll('tbody tr').forEach((tr) => {
+      const cells = [...tr.children];
+      cells.forEach((td, i) => td.setAttribute('data-label', heads[i] ?? ''));
+      if (!tr.querySelector('.stack-title') && cells[0]) cells[0].classList.add('stack-title');
+    });
+  });
+
+  /* ---------- Umsatzdiagramm: Wert des gewählten Monats anzeigen ---------- */
+  document.querySelectorAll('[data-chart]').forEach((chart) => {
+    const readout = chart.querySelector('[data-chart-readout]');
+    const initial = readout?.textContent ?? '';
+    const bars = chart.querySelectorAll('[data-bar]');
+    const show = (bar) => {
+      bars.forEach((b) => b.classList.toggle('selected', b === bar));
+      if (readout) readout.textContent = bar ? bar.getAttribute('data-bar') : initial;
+    };
+    // Touch: erstes Antippen zeigt nur den Wert, zweites öffnet die Rechnungen des Monats.
+    // (Beim Antippen feuern Browser zusätzlich mouseenter/focus – die zählen daher nicht als „gewählt“.)
+    let touch = false;
+    let armed = null;
+    chart.addEventListener('pointerdown', (e) => (touch = e.pointerType !== 'mouse'));
+    bars.forEach((bar) => {
+      bar.addEventListener('mouseenter', () => !touch && show(bar));
+      bar.addEventListener('focus', () => !touch && show(bar));
+      bar.addEventListener('click', (e) => {
+        if (touch && armed !== bar) {
+          e.preventDefault();
+          armed = bar;
+          show(bar);
+        }
+      });
+    });
+    chart.addEventListener('mouseleave', () => show(null));
+  });
+
+  /* ---------- Ringdiagramm: Segment und Legendenzeile gemeinsam hervorheben ---------- */
+  document.querySelectorAll('[data-pie]').forEach((pie) => {
+    const items = pie.querySelectorAll('[data-slice]');
+    const highlight = (id) => {
+      pie.classList.toggle('has-active', id !== null);
+      items.forEach((el) => el.classList.toggle('active', el.getAttribute('data-slice') === id));
+    };
+    items.forEach((el) => {
+      const id = el.getAttribute('data-slice');
+      el.addEventListener('mouseenter', () => highlight(id));
+      el.addEventListener('focusin', () => highlight(id));
+      el.addEventListener('mouseleave', () => highlight(null));
+      el.addEventListener('focusout', () => highlight(null));
+    });
+  });
+
   // Ganze Tabellenzeile klickbar
   document.addEventListener('click', (e) => {
     const target = e.target;
@@ -220,6 +304,23 @@
     });
     form.querySelector('[data-article-insert]')?.addEventListener('click', () => insert(true));
   }
+
+  form.querySelector('[data-add-item]')?.addEventListener('click', () => addRow());
+
+  tbody.addEventListener('click', (e) => {
+    // Artikelbezug einer Position lösen (Werte bleiben als Freitext erhalten)
+    const tag = e.target instanceof Element && e.target.closest('.art-no');
+    if (tag) {
+      tag.hidden = true;
+      tag.closest('tr').querySelector('[name="item_article[]"]').value = '';
+      return;
+    }
+    const btn = e.target instanceof Element && e.target.closest('.remove');
+    if (!btn) return;
+    btn.closest('tr').remove();
+    if (!tbody.querySelector('tr.item')) addRow(false);
+    recalc();
+  });
 
   form.addEventListener('input', (e) => {
     if (e.target instanceof HTMLTextAreaElement) autogrow(e.target);

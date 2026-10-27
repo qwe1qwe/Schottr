@@ -1,7 +1,7 @@
 import { all, one, run, tx, nowIso, fromDbTime } from '../../db/index.ts';
 import { nextNumber } from '../../lib/numbering.ts';
 import { html, nl2br, type SafeHtml } from '../../lib/html.ts';
-import { addDays, formatDate, today } from '../../lib/dates.ts';
+import { addDays, formatDate, monthEnd, monthLabel, today } from '../../lib/dates.ts';
 import { formatMoney, formatQuantity, formatRate, formatAmount } from '../../lib/money.ts';
 import { unitShort } from '../../lib/units.ts';
 import { attachment, idParam, notFound, readForm, redirectWith, str, tenantOf, userOf, UserError } from '../../lib/http.ts';
@@ -139,7 +139,7 @@ function itemsTable(d: DocumentData): SafeHtml {
     <tbody>${d.items.map(
       (it) => html`<tr>
         <td>${it.position}</td>
-        <td>${it.articleNumber ? html`<span class="art-no static">Art.-Nr. ${it.articleNumber}</span><br>` : ''}<strong>${it.title}</strong>${it.description ? html`<div class="muted small">${nl2br(it.description)}</div>` : ''}</td>
+        <td class="stack-title">${it.articleNumber ? html`<span class="art-no static">Art.-Nr. ${it.articleNumber}</span><br>` : ''}<strong>${it.title}</strong>${it.description ? html`<div class="muted small">${nl2br(it.description)}</div>` : ''}</td>
         <td class="right num">${formatQuantity(it.quantity)} ${unitShort(it.unit)}</td>
         <td class="right num">${formatAmount(it.unitPrice)}</td>
         ${showVat ? html`<td class="right num">${formatRate(it.vatRate)}</td>` : ''}
@@ -180,6 +180,13 @@ function register(app: App, kind: Kind) {
       where += ' AND d.status = ?';
       params.push(status);
     }
+    // Monatsfilter (aus dem Diagramm der Übersicht): festgeschriebene Rechnungen eines Monats
+    const monthParam = kind === 'invoice' ? (c.req.query('month') ?? '') : '';
+    const month = monthLabel(monthParam) ? monthParam : '';
+    if (month) {
+      where += ' AND d.finalized_at IS NOT NULL AND d.issue_date >= ? AND d.issue_date <= ?';
+      params.push(`${month}-01`, monthEnd(month));
+    }
     if (q) {
       where += ' AND (d.number LIKE ? OR d.subject LIKE ? OR c.company LIKE ? OR c.name LIKE ?)';
       params.push(like, like, like, like);
@@ -192,19 +199,28 @@ function register(app: App, kind: Kind) {
       ...params,
     );
     const sum = rows.reduce((s, d) => s + (d.type_code === '381' ? -d.gross_total : d.gross_total), 0);
+    const netSum = rows.reduce((s, d) => s + (d.type_code === '381' ? -d.net_total : d.net_total), 0);
+    const link = (st: string) => {
+      const qs = new URLSearchParams();
+      if (st) qs.set('status', st);
+      if (month) qs.set('month', month);
+      return `${base}${qs.size ? `?${qs}` : ''}`;
+    };
     return page(c, {
       title: k.many,
       actions: html`<a class="btn primary" href="${base}/new">${kind === 'quote' ? 'Neues Angebot' : 'Neue Rechnung'}</a>`,
       body: html`
       <form class="toolbar" method="get">
         <div class="tabs">${STATUS_FILTERS[kind].map(
-          (f) => html`<a href="${base}${f.value ? `?status=${f.value}` : ''}" class="${status === f.value ? 'active' : ''}">${f.label}</a>`,
+          (f) => html`<a href="${link(f.value)}" class="${status === f.value ? 'active' : ''}">${f.label}</a>`,
         )}</div>
         ${status ? html`<input type="hidden" name="status" value="${status}">` : ''}
+        ${month ? html`<input type="hidden" name="month" value="${month}">
+          <a class="filter-chip" href="${base}${status ? `?status=${status}` : ''}" title="Monatsfilter entfernen">${monthLabel(month)} <span aria-hidden="true">×</span><span class="sr-only">Filter entfernen</span></a>` : ''}
         <input type="search" name="q" value="${q}" placeholder="Suchen …" aria-label="Suchen">
       </form>
       ${rows.length
-        ? html`${documentTable(rows, kind)}<p class="muted small right">${rows.length} Beleg(e) · Summe ${formatMoney(sum)}</p>`
+        ? html`${documentTable(rows, kind)}<p class="muted small right">${rows.length} Beleg(e) · ${month ? `netto ${formatMoney(netSum)} · brutto ` : 'Summe '}${formatMoney(sum)}</p>`
         : empty(`Keine ${k.many} gefunden.`, html`<a class="btn primary" href="${base}/new">${kind === 'quote' ? 'Angebot schreiben' : 'Rechnung schreiben'}</a>`)}`,
     });
   });

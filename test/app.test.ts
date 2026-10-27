@@ -503,3 +503,72 @@ test('Nachträgliche Bearbeitung festgeschriebener Rechnungen', opts, async () =
   assert.equal((await req(`/invoices/${id}/versions/1/pdf`)).headers.get('content-type'), 'application/pdf');
   assert.match(await (await req(`/invoices/${id}`)).text(), /Frühere Fassungen/);
 });
+
+test('Übersicht: Umsatzjahr wählbar und Diagramm der letzten 24 Monate', opts, async () => {
+  const first = (await one<{ id: number }>("SELECT id FROM tenants WHERE name = 'Test GmbH'"))!;
+  await req('/tenant/switch', { form: { tenant_id: String(first.id) } });
+  const contact = (await one<{ id: number }>("SELECT id FROM contacts WHERE company = 'Kunde AG'"))!;
+  // Rechnung aus dem Vorjahr (liegt sicher innerhalb der letzten 24 Monate)
+  const lastYear = String(new Date().getFullYear() - 1);
+  let res = await req('/invoices', {
+    form: {
+      contact_id: String(contact.id), type_code: '380', issue_date: `${lastYear}-12-15`, due_date: `${lastYear}-12-29`, service_mode: 'date',
+      service_date: `${lastYear}-12-15`, 'item_title[]': 'Vorjahr', 'item_description[]': '', 'item_quantity[]': '1',
+      'item_unit[]': 'LS', 'item_price[]': '1234,56', 'item_vat[]': '1900',
+    },
+  });
+  const id = location(res).split('/').pop()!;
+  await req(`/invoices/${id}/finalize`, { form: {} });
+  assert.ok((await one('SELECT finalized_at FROM documents WHERE id = ?', Number(id)))!.finalized_at);
+
+  const page = await (await req(`/?year=${lastYear}`)).text();
+  assert.match(page, new RegExp(`<option value="${lastYear}" selected>`));
+  assert.match(page, /1\.234,56&nbsp;€|1\.234,56\s€/);
+  assert.equal([...page.matchAll(/class="chart-bar[^"]*" data-bar=/g)].length, 24);
+  assert.match(page, new RegExp(`Dezember ${lastYear}: 1\\.234,56.€ netto · 1 Rechnung`));
+
+  // unbekanntes Jahr → laufendes Jahr
+  const fallback = await (await req('/?year=1999')).text();
+  assert.match(fallback, new RegExp(`<option value="${new Date().getFullYear()}" selected>`));
+  assert.doesNotMatch(fallback, /value="1999"/);
+});
+
+test('Übersicht: Top-Kunden, Kleinunternehmergrenze und Monatsfilter', opts, async () => {
+  const first = (await one<{ id: number }>("SELECT id FROM tenants WHERE name = 'Test GmbH'"))!;
+  await req('/tenant/switch', { form: { tenant_id: String(first.id) } });
+  const contact = (await one<{ id: number }>("SELECT id FROM contacts WHERE company = 'Kunde AG' AND tenant_id = ?", first.id))!;
+
+  // Ringdiagramm mit Link auf die Adresse; ohne Kleinunternehmerregelung keine Grenz-Kachel
+  let page = await (await req('/')).text();
+  assert.match(page, /data-pie/);
+  assert.match(page, new RegExp(`href="/contacts/${contact.id}"`));
+  assert.doesNotMatch(page, /Kleinunternehmergrenze/);
+  // Säulen verlinken auf den Monatsfilter
+  const ym = new Date().toISOString().slice(0, 7);
+  assert.match(page, new RegExp(`href="/invoices\\?month=${ym}"`));
+
+  // mit Kleinunternehmerregelung: Kachel mit beiden Grenzen
+  await run('UPDATE tenants SET small_business = 1 WHERE id = ?', first.id);
+  try {
+    page = await (await req('/')).text();
+    assert.match(page, /Kleinunternehmergrenze/);
+    assert.match(page, /von 100\.000,00.€/);
+    assert.match(page, /von 25\.000,00.€/);
+  } finally {
+    await run('UPDATE tenants SET small_business = 0 WHERE id = ?', first.id);
+  }
+
+  // Monatsfilter: nur festgeschriebene Rechnungen des Monats
+  const lastYear = new Date().getFullYear() - 1;
+  const expected = (await all<{ number: string }>(
+    "SELECT number FROM documents WHERE tenant_id = ? AND kind = 'invoice' AND finalized_at IS NOT NULL AND issue_date BETWEEN ? AND ?",
+    first.id, `${lastYear}-12-01`, `${lastYear}-12-31`,
+  )).map((r) => r.number);
+  assert.ok(expected.length >= 1);
+  const list = await (await req(`/invoices?month=${lastYear}-12`)).text();
+  assert.match(list, new RegExp(`Dezember ${lastYear}`));
+  const shown = [...list.matchAll(/<td class="mono"><a href="\/invoices\/\d+">([^<]+)<\/a>/g)].map((m) => m[1]);
+  assert.deepEqual(shown.sort(), expected.sort());
+  // ungültiger Monat wird ignoriert
+  assert.doesNotMatch(await (await req('/invoices?month=2026-13')).text(), /filter-chip/);
+});

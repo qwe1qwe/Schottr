@@ -572,11 +572,11 @@ function auditTable(rows: any[]): SafeHtml {
     <thead><tr><th>Zeit</th><th>Ereignis</th><th>Benutzer</th><th>Mandant</th><th>Details</th><th>IP</th></tr></thead>
     <tbody>${rows.map((r) => html`<tr>
       <td class="nowrap">${dt(r.created_at)}</td>
-      <td class="${r.action === 'login.failed' ? 'danger-text' : ''}">${actionLabel(r.action)}</td>
+      <td class="stack-title ${r.action === 'login.failed' ? 'danger-text' : ''}">${actionLabel(r.action)}</td>
       <td>${r.user_email}</td>
       <td>${r.tenant_name ?? ''}</td>
       <td class="small truncate">${r.details}</td>
-      <td class="mono small">${r.ip}</td></tr>`)}
+      <td class="mono small hide-mobile">${r.ip}</td></tr>`)}
     </tbody></table></div>`;
 }
 
