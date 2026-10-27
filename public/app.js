@@ -107,6 +107,33 @@
     });
   });
 
+  /* ---------- Kacheln mit Umschalter (z. B. Lieferanten / Verbindlichkeiten) ---------- */
+  document.querySelectorAll('[data-tabs]').forEach((box, n) => {
+    const key = `schottr:tab:${location.pathname}:${n}`;
+    const buttons = box.querySelectorAll('[data-tab]');
+    const select = (name, remember) => {
+      buttons.forEach((b) => b.setAttribute('aria-selected', String(b.dataset.tab === name)));
+      box.querySelectorAll('[data-panel]').forEach((p) => (p.hidden = p.dataset.panel !== name));
+      if (remember) {
+        try {
+          localStorage.setItem(key, name);
+        } catch {
+          /* ohne Speicher */
+        }
+      }
+    };
+    box.classList.add('js-tabs');
+    let start = buttons[0]?.dataset.tab;
+    try {
+      const saved = localStorage.getItem(key);
+      if (saved && box.querySelector(`[data-panel="${saved}"]`)) start = saved;
+    } catch {
+      /* ohne Speicher */
+    }
+    buttons.forEach((b) => b.addEventListener('click', () => select(b.dataset.tab, true)));
+    if (start) select(start, false);
+  });
+
   // Ganze Tabellenzeile klickbar
   document.addEventListener('click', (e) => {
     const target = e.target;
@@ -159,6 +186,15 @@
       for (let i = 0; i < Math.max(rows, 1); i++) tbody.appendChild(tpl.content.firstElementChild.cloneNode(true));
     }
 
+    // Steuerzeilen der Eingangsrechnung ebenso
+    const taxBody = target.querySelector('[data-tax-rows] tbody');
+    const taxTpl = target.querySelector('[data-tax-template]');
+    if (taxBody && taxTpl) {
+      const rows = saved.fields.filter(([n]) => n === 'tax_rate[]').length;
+      taxBody.replaceChildren();
+      for (let i = 0; i < Math.max(rows, 1); i++) taxBody.appendChild(taxTpl.content.firstElementChild.cloneNode(true));
+    }
+
     const seen = {};
     for (const [name, value, checked] of saved.fields) {
       const els = [...target.elements].filter((el) => el.name === name);
@@ -181,6 +217,128 @@
       }
     });
   })();
+
+  /* ---------- Eingangsrechnungen: Upload ---------- */
+  document.querySelectorAll('[data-upload]').forEach((form) => {
+    const input = form.querySelector('[data-upload-input]');
+    const list = form.querySelector('[data-upload-files]');
+    const zone = form.querySelector('.drop-zone');
+    const show = () => {
+      const names = [...(input.files || [])].map((f) => f.name);
+      list.hidden = !names.length;
+      list.textContent = names.length ? `${names.length} Datei(en): ${names.join(', ')}` : '';
+    };
+    input.addEventListener('change', show);
+    ['dragenter', 'dragover'].forEach((t) => zone.addEventListener(t, (e) => {
+      e.preventDefault();
+      zone.classList.add('dragging');
+    }));
+    ['dragleave', 'drop'].forEach((t) => zone.addEventListener(t, () => zone.classList.remove('dragging')));
+    zone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      if (e.dataTransfer?.files?.length) {
+        input.files = e.dataTransfer.files;
+        show();
+      }
+    });
+  });
+
+  /* ---------- Eingangsrechnungen: Erfassung ---------- */
+  const pform = document.querySelector('[data-purchase-form]');
+  if (pform) {
+    const eurFmt = new Intl.NumberFormat('de-DE', { style: 'currency', currency: 'EUR' });
+    const amt = new Intl.NumberFormat('de-DE', { minimumFractionDigits: 2, maximumFractionDigits: 2, useGrouping: false });
+    const cents = (v) => {
+      let s = String(v || '').trim().replace(/\s|€/g, '');
+      if (!s) return null;
+      if (s.includes(',')) s = s.replace(/\./g, '').replace(',', '.');
+      const n = Number(s);
+      return Number.isFinite(n) ? Math.round(n * 100) : NaN;
+    };
+    const rnd = (a, b) => Math.sign(a) * Math.round(Math.abs(a) / b);
+    const fmt = (c) => amt.format(c / 100);
+
+    // Neuer Lieferant nur, wenn keiner gewählt ist; Kostenart des Lieferanten vorschlagen
+    const supplier = pform.querySelector('[data-supplier]');
+    const newSupplier = pform.querySelector('[data-new-supplier]');
+    const category = pform.querySelector('[data-category]');
+    if (supplier && newSupplier) {
+      const sync = (fromUser) => {
+        newSupplier.hidden = !!supplier.value;
+        const cat = supplier.selectedOptions[0]?.dataset.category;
+        if (fromUser && cat && category) category.value = cat;
+      };
+      supplier.addEventListener('change', () => sync(true));
+      sync(false);
+    }
+
+    const rowsBody = pform.querySelector('[data-tax-rows] tbody');
+    const tpl = pform.querySelector('[data-tax-template]');
+    if (rowsBody && tpl) {
+      // Welches Feld zuletzt von Hand geändert wurde, bestimmt die Rechenrichtung
+      const recalcRow = (row, source) => {
+        const rate = Number(row.querySelector('[name="tax_rate[]"]').value);
+        const net = row.querySelector('[name="tax_net[]"]');
+        const tax = row.querySelector('[name="tax_tax[]"]');
+        const gross = row.querySelector('[name="tax_gross[]"]');
+        const n = cents(net.value);
+        const t = cents(tax.value);
+        const g = cents(gross.value);
+        if ([n, t, g].some(Number.isNaN)) return;
+        if (source === 'gross' && g !== null) {
+          const tt = g - rnd(g * 10000, 10000 + rate);
+          tax.value = fmt(tt);
+          net.value = fmt(g - tt);
+        } else if (source === 'tax' && n !== null && t !== null) {
+          gross.value = fmt(n + t);
+        } else if (n !== null && (source === 'net' || source === 'rate')) {
+          const tt = rnd(n * rate, 10000);
+          tax.value = fmt(tt);
+          gross.value = fmt(n + tt);
+        } else if (source === 'rate' && g !== null) {
+          recalcRow(row, 'gross');
+        }
+      };
+      const totals = () => {
+        let n = 0;
+        let t = 0;
+        rowsBody.querySelectorAll('tr.tax-row').forEach((row) => {
+          n += cents(row.querySelector('[name="tax_net[]"]').value) || 0;
+          t += cents(row.querySelector('[name="tax_tax[]"]').value) || 0;
+        });
+        pform.querySelector('[data-sum-net]').textContent = eurFmt.format(n / 100);
+        pform.querySelector('[data-sum-tax]').textContent = eurFmt.format(t / 100);
+        pform.querySelector('[data-sum-gross]').textContent = eurFmt.format((n + t) / 100);
+      };
+      rowsBody.addEventListener('input', (e) => {
+        const name = e.target.name || '';
+        const src = name.includes('gross') ? 'gross' : name.includes('tax_tax') ? 'tax' : name.includes('tax_net') ? 'net' : '';
+        if (src) recalcRow(e.target.closest('tr'), src);
+        totals();
+      });
+      rowsBody.addEventListener('change', (e) => {
+        if (e.target.name === 'tax_rate[]') recalcRow(e.target.closest('tr'), 'rate');
+        totals();
+      });
+      rowsBody.addEventListener('click', (e) => {
+        const btn = e.target instanceof Element && e.target.closest('.remove');
+        if (!btn) return;
+        btn.closest('tr').remove();
+        if (!rowsBody.querySelector('tr.tax-row')) rowsBody.appendChild(tpl.content.firstElementChild.cloneNode(true));
+        totals();
+      });
+      pform.querySelector('[data-add-tax]')?.addEventListener('click', () => {
+        const row = tpl.content.firstElementChild.cloneNode(true);
+        const used = [...rowsBody.querySelectorAll('[name="tax_rate[]"]')].map((s) => s.value);
+        const free = ['1900', '700', '0'].find((r) => !used.includes(r));
+        if (free) row.querySelector('[name="tax_rate[]"]').value = free;
+        rowsBody.appendChild(row);
+        row.querySelector('[name="tax_gross[]"]').focus();
+        totals();
+      });
+      totals();
+    }
+  }
 
   /* ---------- Beleg-Formular ---------- */
   const form = document.querySelector('[data-doc-form]');

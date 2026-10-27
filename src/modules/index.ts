@@ -11,6 +11,7 @@ import { adminModule } from './admin.ts';
 import { exportModule } from './export.ts';
 import { proofsModule } from './proofs.ts';
 import { correctionModule } from './documents/correction.ts';
+import { purchasesModule } from './purchases/routes.ts';
 
 /**
  * Alle aktiven Module. Ein neues Modul (z. B. Zeiterfassung)
@@ -25,6 +26,7 @@ export const modules: Module[] = [
   quotesModule,
   invoicesModule,
   correctionModule,
+  purchasesModule,
   proofsModule,
   dunningModule,
   exportModule,

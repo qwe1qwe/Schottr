@@ -108,7 +108,7 @@ const pct = (v: number) => `${v.toLocaleString('de-DE', { maximumFractionDigits:
  * Ringdiagramm aus Kreisen mit stroke-dasharray (pathLength = 100), daneben eine Legende
  * mit Betrag und Anteil. Überfahren/Fokus eines Segments hebt die Legendenzeile hervor.
  */
-export function pieChart(slices: PieSlice[], opts: { caption: string; sub?: string; emptyText: string; centerLabel: string }): SafeHtml {
+export function pieChart(slices: PieSlice[], opts: { caption: string; sub?: string; emptyText: string; centerLabel: string; bare?: boolean }): SafeHtml {
   const data = slices.filter((s) => s.value > 0);
   const total = data.reduce((a, s) => a + s.value, 0);
   let offset = 0;
@@ -122,8 +122,10 @@ export function pieChart(slices: PieSlice[], opts: { caption: string; sub?: stri
   // kleine Lücke zwischen den Segmenten (nicht bei nur einem Segment)
   const gap = segs.length > 1 ? 0.6 : 0;
 
-  return html`<figure class="card pie" data-pie>
-    <figcaption class="chart-head"><h2>${opts.caption}</h2>${opts.sub ? html`<p class="chart-readout">${opts.sub}</p>` : ''}</figcaption>
+  return html`<figure class="${opts.bare ? 'pie bare' : 'card pie'}" data-pie>
+    ${opts.bare
+      ? (opts.sub ? html`<figcaption class="chart-readout pie-sub">${opts.sub}</figcaption>` : '')
+      : html`<figcaption class="chart-head"><h2>${opts.caption}</h2>${opts.sub ? html`<p class="chart-readout">${opts.sub}</p>` : ''}</figcaption>`}
     ${total <= 0
       ? html`<p class="muted small pie-empty">${opts.emptyText}</p>`
       : html`<div class="pie-body">
@@ -186,4 +188,85 @@ export function meter(value: number, max: number, opts: { label: SafeHtml | stri
       <span class="meter-max">${formatMoney(max).replace(/,00(?=\s?€)/, '')}</span>
     </div>
   </div>`;
+}
+
+/* ---------------- Umsatz und Ausgaben je Monat ---------------- */
+
+export interface ComparePoint {
+  label: string;
+  title: string;
+  revenue: number;
+  cost: number;
+  current?: boolean;
+  /** Monat liegt in der Zukunft – keine Ergebnislinie */
+  future?: boolean;
+  revenueHref?: string;
+  costHref?: string;
+}
+
+/**
+ * Gruppierte Säulen (Umsatz, Ausgaben) je Monat plus Linie für das Ergebnis (Umsatz − Ausgaben).
+ * Gleiche Technik wie barChart: SVG mit festem Koordinatensystem, Beschriftungen in HTML.
+ */
+export function compareChart(points: ComparePoint[], opts: { caption: string; sub: string; emptyText: string; hint?: string; costLabel: string }): SafeHtml {
+  const results = points.map((p) => p.revenue - p.cost);
+  const max = Math.max(0, ...points.flatMap((p) => [p.revenue, p.cost]), ...results);
+  const min = Math.min(0, ...results.filter((_, i) => !points[i].future), ...points.flatMap((p) => [p.revenue, p.cost]));
+  const step = niceStep(max - min || 100_000, 4);
+  const lo = Math.floor(min / step) * step;
+  const hi = Math.max(Math.ceil(max / step) * step, lo + step);
+  const y = (v: number) => H - ((v - lo) / (hi - lo)) * H;
+  const ticks: number[] = [];
+  for (let v = hi; v >= lo - step / 2; v -= step) ticks.push(Math.round(v));
+  const width = points.length * SLOT;
+
+  const revenue = points.reduce((a, p) => a + p.revenue, 0);
+  const cost = points.reduce((a, p) => a + p.cost, 0);
+  const result = revenue - cost;
+  const summary = `Umsatz ${formatMoney(revenue)} − ${opts.costLabel} ${formatMoney(cost)} = Ergebnis ${formatMoney(result)}`;
+  const line = points
+    .map((p, i) => (p.future ? null : `${(i * SLOT + SLOT / 2).toFixed(2)},${y(results[i]).toFixed(2)}`))
+    .filter(Boolean)
+    .join(' ');
+  const bar = (v: number, x: number, w: number) => {
+    const top = Math.min(y(v), y(0));
+    const h = Math.max(Math.abs(y(v) - y(0)), v ? 0.6 : 0);
+    return html`<rect class="bar" x="${x.toFixed(2)}" y="${top.toFixed(2)}" width="${w}" height="${h.toFixed(2)}"></rect>`;
+  };
+
+  return html`<figure class="chart card cmp" data-chart>
+    <figcaption class="chart-head">
+      <div><h2>${opts.caption}</h2><p class="muted small cmp-sub">${opts.sub}</p></div>
+      <p class="chart-readout" data-chart-readout aria-live="polite">${summary}</p>
+    </figcaption>
+    <ul class="cmp-legend small" aria-hidden="true">
+      <li><span class="swatch cmp-rev"></span>Umsatz</li>
+      <li><span class="swatch cmp-cost"></span>${opts.costLabel}</li>
+      <li><span class="swatch cmp-res"></span>Ergebnis</li>
+    </ul>
+    <div class="chart-body">
+      <div class="chart-y" aria-hidden="true">${ticks.map((t) => html`<span>${axisLabel(t)}</span>`)}</div>
+      <div class="chart-plot">
+        <div class="chart-grid" aria-hidden="true">${ticks.map((t) => html`<span class="${t === 0 ? 'zero' : ''}"></span>`)}</div>
+        <svg class="chart-svg" viewBox="0 0 ${width} ${H}" preserveAspectRatio="none" role="list" aria-label="${opts.caption}">
+          ${points.map((p, i) => {
+            const text = `${p.title}: Umsatz ${formatMoney(p.revenue)} · ${opts.costLabel} ${formatMoney(p.cost)} · Ergebnis ${formatMoney(results[i])}`;
+            const x = i * SLOT;
+            const slot = (cls: string, href: string | undefined, shape: SafeHtml, label: string) =>
+              href
+                ? html`<a href="${href}" class="cmp-bar chart-bar ${cls}${p.current ? ' current' : ''}" data-bar="${text}" role="listitem" aria-label="${label}">${shape}</a>`
+                : html`<g class="cmp-bar chart-bar ${cls}${p.current ? ' current' : ''}" data-bar="${text}" tabindex="0" role="listitem" aria-label="${label}">${shape}</g>`;
+            return html`${slot('rev', p.revenueHref, html`<rect class="hit" x="${x}" y="0" width="${SLOT / 2}" height="${H}"></rect>${bar(p.revenue, x + 1.2, 3.6)}`, `${p.title}: Umsatz ${formatMoney(p.revenue)}`)}
+              ${slot('cost', p.costHref, html`<rect class="hit" x="${x + SLOT / 2}" y="0" width="${SLOT / 2}" height="${H}"></rect>${bar(p.cost, x + 5.2, 3.6)}`, `${p.title}: ${opts.costLabel} ${formatMoney(p.cost)}`)}`;
+          })}
+          ${line ? html`<polyline class="cmp-line" points="${line}" vector-effect="non-scaling-stroke"></polyline>` : ''}
+        </svg>
+        ${revenue === 0 && cost === 0 ? html`<p class="chart-empty muted small">${opts.emptyText}</p>` : ''}
+      </div>
+      <span></span>
+      <div class="chart-x m${points.length}" aria-hidden="true">${points.map((p) => html`<span class="${p.current ? 'current' : ''}">${p.label}</span>`)}</div>
+    </div>
+    <p class="cmp-total ${result < 0 ? 'neg' : ''}"><span>Ergebnis</span> <strong class="num">${formatMoney(result)}</strong></p>
+    ${opts.hint ? html`<p class="chart-hint muted small">${opts.hint}</p>` : ''}
+  </figure>`;
 }

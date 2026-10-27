@@ -1,6 +1,9 @@
 import { all } from '../db/index.ts';
 import { audit } from '../lib/audit.ts';
-import { buildDatevCsv, revenueAccounts, type DatevInvoice } from '../lib/datev.ts';
+import { buildDatevCsv, creditorAccount, revenueAccounts, type DatevInvoice, type DatevPurchase } from '../lib/datev.ts';
+import { categoryLabel, expenseAccounts } from '../lib/expenses.ts';
+import { readStoredFile } from '../lib/files.ts';
+import { html as h } from '../lib/html.ts';
 import { formatDate, isIsoDate, today } from '../lib/dates.ts';
 import { html } from '../lib/html.ts';
 import { attachment, tenantOf, userOf } from '../lib/http.ts';
@@ -12,10 +15,11 @@ import type { App, Ctx, Module, Tenant } from '../types.ts';
 
 /**
  * Export für Buchhaltung/Steuerberater:
- *  - DATEV-Buchungsstapel (EXTF 700)
- *  - Rechnungsausgangsbuch (CSV für Excel)
- *  - ZIP mit allen ZUGFeRD-PDFs und XRechnung-Dateien des Zeitraums
- * Grundlage sind ausschließlich festgeschriebene Rechnungen (eingefrorene Daten).
+ *  - DATEV-Buchungsstapel (EXTF 700) mit Ausgangs- und/oder Eingangsrechnungen
+ *  - Rechnungsausgangsbuch und Rechnungseingangsbuch (CSV für Excel)
+ *  - ZIP mit allen ZUGFeRD-PDFs, XRechnung-Dateien und den Belegen der Eingangsrechnungen
+ * Grundlage sind festgeschriebene Rechnungen (eingefrorene Daten) und erfasste
+ * Eingangsrechnungen (ohne noch nicht erfasste Belege).
  */
 
 interface ExportRow {
@@ -46,6 +50,50 @@ async function invoicesIn(t: Tenant, from: string, to: string): Promise<ExportRo
      ORDER BY issue_date, number`,
     t.id, from, to,
   );
+}
+
+interface PurchaseRow {
+  id: number;
+  number: string;
+  issue_date: string;
+  due_date: string | null;
+  status: string;
+  paid_at: string | null;
+  is_credit: number;
+  category: string;
+  currency: string;
+  description: string;
+  net_total: number;
+  tax_total: number;
+  gross_total: number;
+  prepaid_total: number;
+  einvoice_format: string;
+  file_name: string;
+  file_path: string;
+  supplier_name: string;
+  supplier_number: string;
+  supplier_vat: string;
+  taxes: { category: string; rate: number; basis: number; tax: number }[];
+}
+
+async function purchasesIn(t: Tenant, from: string, to: string): Promise<PurchaseRow[]> {
+  const rows = await all<Omit<PurchaseRow, 'taxes'>>(
+    `SELECT p.id, p.number, p.issue_date, p.due_date, p.status, p.paid_at, p.is_credit, p.category, p.currency, p.description,
+            p.net_total, p.tax_total, p.gross_total, p.prepaid_total, p.einvoice_format, p.file_name, p.file_path,
+            COALESCE(NULLIF(c.company, ''), c.name, '') AS supplier_name, COALESCE(c.customer_number, '') AS supplier_number,
+            COALESCE(c.vat_id, '') AS supplier_vat
+     FROM purchase_invoices p LEFT JOIN contacts c ON c.id = p.contact_id
+     WHERE p.tenant_id = ? AND p.status <> 'draft' AND p.issue_date BETWEEN ? AND ?
+     ORDER BY p.issue_date, p.id`,
+    t.id, from, to,
+  );
+  const taxes = rows.length
+    ? await all<{ purchase_id: number; category: string; rate: number; basis: number; tax: number }>(
+        `SELECT purchase_id, category, rate, basis, tax FROM purchase_invoice_taxes WHERE purchase_id IN (${rows.map(() => '?').join(',')}) ORDER BY \`position\``,
+        ...rows.map((r) => r.id),
+      )
+    : [];
+  return rows.map((r) => ({ ...r, taxes: taxes.filter((x) => x.purchase_id === r.id) }));
 }
 
 const csvField = (v: string | number) => {
@@ -82,11 +130,52 @@ function journalCsv(rows: ExportRow[]): string {
 
 const safeName = (s: string) => s.replace(/[^\w.\-]+/g, '_');
 
+/** Rechnungseingangsbuch: alle erfassten Eingangsrechnungen mit Vorsteuer je Satz */
+function purchaseJournalCsv(t: Tenant, rows: PurchaseRow[]): string {
+  const accounts = expenseAccounts(t);
+  const head = [
+    'Rechnungsdatum', 'Lieferant', 'Lieferantennr.', 'USt-IdNr. Lieferant', 'Rechnungsnr.', 'Art', 'Kostenart', 'Aufwandskonto', 'Kreditor',
+    'Netto 19 %', 'Vorsteuer 19 %', 'Netto 7 %', 'Vorsteuer 7 %', 'Netto ohne USt', 'Netto gesamt', 'USt gesamt', 'Brutto', 'Währung',
+    'Fällig am', 'Status', 'Bezahlt am', 'Beschreibung', 'Format', 'Datei',
+  ];
+  const statusLabel: Record<string, string> = { open: 'offen', paid: 'bezahlt' };
+  const lines = rows.map((r) => {
+    const sign = r.is_credit ? -1 : 1;
+    const g = (rate: number) => r.taxes.filter((x) => x.category === 'S' && x.rate === rate);
+    const sum = (list: typeof r.taxes, k: 'basis' | 'tax') => list.reduce((a, x) => a + x[k], 0);
+    const other = r.taxes.filter((x) => !(x.category === 'S' && (x.rate === 1900 || x.rate === 700)));
+    return [
+      formatDate(r.issue_date), r.supplier_name, r.supplier_number, r.supplier_vat, r.number, r.is_credit ? 'Gutschrift' : 'Rechnung',
+      categoryLabel(r.category), accounts[r.category] ?? '', creditorAccount(t, r.supplier_number),
+      num(sign * sum(g(1900), 'basis')), num(sign * sum(g(1900), 'tax')), num(sign * sum(g(700), 'basis')), num(sign * sum(g(700), 'tax')),
+      num(sign * sum(other, 'basis')), num(sign * r.net_total), num(sign * r.tax_total), num(sign * r.gross_total), r.currency,
+      r.due_date ? formatDate(r.due_date) : '', statusLabel[r.status] ?? r.status, r.paid_at ? formatDate(r.paid_at) : '',
+      r.description, r.einvoice_format || (r.file_name ? 'Beleg' : 'ohne Beleg'), r.file_name ? zipPurchaseName(r) : '',
+    ].map(csvField).join(';');
+  });
+  return '﻿' + [head.join(';'), ...lines].join('\r\n') + '\r\n';
+}
+
+/** Dateiname im ZIP: Datum_Lieferant_Nummer.ext */
+function zipPurchaseName(r: Pick<PurchaseRow, 'issue_date' | 'supplier_name' | 'number' | 'id' | 'file_name'>): string {
+  const ext = (/\.(pdf|xml|png|jpe?g)$/i.exec(r.file_name)?.[0] ?? '').toLowerCase();
+  return `Eingangsrechnungen/${safeName(`${r.issue_date}_${r.supplier_name}_${r.number || `ER${r.id}`}`).slice(0, 120)}${ext}`;
+}
+
+/** Welche Rechnungen in den DATEV-Stapel? Ohne Angabe beide. */
+function datevSelection(c: Ctx): { out: boolean; in: boolean } {
+  const out = c.req.query('out');
+  const inn = c.req.query('in');
+  if (out === undefined && inn === undefined) return { out: true, in: true };
+  return { out: out === '1', in: inn === '1' };
+}
+
 function register(app: App) {
   app.get('/export', async (c) => {
     const t = tenantOf(c);
     const { from, to, error } = period(c);
     const rows = await invoicesIn(t, from, to);
+    const purchases = await purchasesIn(t, from, to);
     const sums = rows.reduce(
       (acc, r) => {
         const d = JSON.parse(r.snapshot) as DocumentData;
@@ -97,10 +186,16 @@ function register(app: App) {
       },
       { net: 0, gross: 0 },
     );
+    const pSums = purchases.reduce(
+      (acc, r) => ({ net: acc.net + (r.is_credit ? -1 : 1) * r.net_total, gross: acc.gross + (r.is_credit ? -1 : 1) * r.gross_total }),
+      { net: 0, gross: 0 },
+    );
+    const drafts = (await all<{ n: number }>("SELECT COUNT(*) n FROM purchase_invoices WHERE tenant_id = ? AND status = 'draft'", t.id))[0]?.n ?? 0;
     const datevReady = !!(t.datev_consultant && t.datev_client);
     const sameYear = from.slice(0, 4) === to.slice(0, 4);
     const acc = revenueAccounts(t);
     const q = `from=${from}&to=${to}`;
+    const any = rows.length + purchases.length > 0;
     return page(c, {
       title: 'Export',
       body: html`
@@ -110,30 +205,48 @@ function register(app: App) {
         <label>Bis <input type="date" name="to" value="${to}" required></label>
         <button class="btn">Zeitraum übernehmen</button>
       </form>
-      <p class="muted">${rows.length} festgeschriebene Rechnung(en) im Zeitraum ${formatDate(from)} – ${formatDate(to)}
-        · netto ${formatMoney(sums.net)} · brutto ${formatMoney(sums.gross)}</p>
+      <p class="muted">Zeitraum ${formatDate(from)} – ${formatDate(to)}:
+        ${rows.length} Ausgangsrechnung(en) · netto ${formatMoney(sums.net)} · brutto ${formatMoney(sums.gross)}<br>
+        ${purchases.length} Eingangsrechnung(en) · netto ${formatMoney(pSums.net)} · brutto ${formatMoney(pSums.gross)}</p>
+      ${drafts ? html`<div class="notice"><a href="/purchases?status=draft">${drafts} hochgeladene(r) Beleg(e)</a> sind noch nicht erfasst und fehlen daher im Export.</div>` : ''}
       <div class="export-grid">
         <section class="card">
           <h2>DATEV-Buchungsstapel</h2>
           <p class="muted small">CSV im DATEV-Format (EXTF 700) zum Import beim Steuerberater bzw. in DATEV Unternehmen online.
-            ${t.datev_debtor_mode === 'individual' ? `Debitor je Kunde ab ${t.datev_debtor_account}` : `Sammeldebitor ${t.datev_debtor_account}`} ·
-            SKR${t.datev_skr} · Erlöse 19 % ${acc['19']}, 7 % ${acc['7']}.</p>
+            Ausgangsrechnungen: ${t.datev_debtor_mode === 'individual' ? `Debitor je Kunde ab ${t.datev_debtor_account}` : `Sammeldebitor ${t.datev_debtor_account}`},
+            SKR${t.datev_skr}, Erlöse 19 % ${acc['19']}, 7 % ${acc['7']}.
+            Eingangsrechnungen: ${t.datev_creditor_mode === 'individual' ? `Kreditor je Lieferant ab ${t.datev_creditor_account}` : `Sammelkreditor ${t.datev_creditor_account}`},
+            Aufwandskonto je Kostenart, ${t.small_business ? 'brutto ohne Vorsteuer (Kleinunternehmer)' : 'Vorsteuer per BU-Schlüssel 9/8'}.</p>
           ${!datevReady ? html`<div class="notice">Bitte zuerst Berater- und Mandantennummer unter <a href="/settings">Einstellungen → DATEV-Export</a> eintragen.</div>` : ''}
           ${!sameYear ? html`<div class="notice">Ein DATEV-Stapel darf nur ein Wirtschaftsjahr umfassen – bitte den Zeitraum auf ein Jahr begrenzen.</div>` : ''}
-          ${datevReady && sameYear && rows.length ? html`<a class="btn primary" href="/export/datev?${q}">DATEV-CSV herunterladen</a>` : ''}
+          ${datevReady && sameYear && any
+            ? html`<form method="get" action="/export/datev" class="stack">
+                <input type="hidden" name="from" value="${from}"><input type="hidden" name="to" value="${to}">
+                <div class="export-options">
+                  <label class="check"><input type="checkbox" name="out" value="1"${rows.length ? h` checked` : h` disabled`}> Ausgangsrechnungen (${rows.length})</label>
+                  <label class="check"><input type="checkbox" name="in" value="1"${purchases.length ? h` checked` : h` disabled`}> Eingangsrechnungen (${purchases.length})</label>
+                </div>
+                <button class="btn primary">DATEV-CSV herunterladen</button>
+              </form>`
+            : ''}
         </section>
         <section class="card">
           <h2>Rechnungsausgangsbuch</h2>
           <p class="muted small">Alle Rechnungen des Zeitraums mit Beträgen je Steuersatz – zum Öffnen in Excel.</p>
-          ${rows.length ? html`<a class="btn" href="/export/journal?${q}">CSV herunterladen</a>` : ''}
+          ${rows.length ? html`<a class="btn" href="/export/journal?${q}">CSV herunterladen</a>` : html`<p class="muted small">Keine Rechnungen im Zeitraum.</p>`}
+        </section>
+        <section class="card">
+          <h2>Rechnungseingangsbuch</h2>
+          <p class="muted small">Alle Eingangsrechnungen mit Vorsteuer je Steuersatz, Kostenart, Aufwands- und Kreditorenkonto – zum Öffnen in Excel.</p>
+          ${purchases.length ? html`<a class="btn" href="/export/purchases?${q}">CSV herunterladen</a>` : html`<p class="muted small">Keine Eingangsrechnungen im Zeitraum.</p>`}
         </section>
         <section class="card">
           <h2>Belege als ZIP</h2>
-          <p class="muted small">Alle ZUGFeRD-PDFs und XRechnung-Dateien des Zeitraums plus Rechnungsausgangsbuch – z. B. für den Steuerberater oder die Archivierung.</p>
-          ${rows.length ? html`<a class="btn" href="/export/zip?${q}">ZIP herunterladen</a>` : ''}
+          <p class="muted small">Alle ZUGFeRD-PDFs und XRechnungen der Ausgangsrechnungen sowie die Original-Belege der Eingangsrechnungen, dazu beide Bücher als CSV – für den Steuerberater oder die Archivierung.</p>
+          ${any ? html`<a class="btn" href="/export/zip?${q}">ZIP herunterladen</a>` : ''}
         </section>
       </div>
-      <p class="muted small">Exportiert werden nur festgeschriebene Rechnungen (inkl. Stornorechnungen), maßgeblich ist das Rechnungsdatum.</p>`,
+      <p class="muted small">Ausgangsrechnungen: nur festgeschriebene (inkl. Stornorechnungen). Eingangsrechnungen: alle erfassten (offen und bezahlt). Maßgeblich ist jeweils das Rechnungsdatum.</p>`,
     });
   });
 
@@ -141,7 +254,9 @@ function register(app: App) {
     const t = tenantOf(c);
     const { from, to, error } = period(c);
     if (error || from.slice(0, 4) !== to.slice(0, 4)) return c.redirect(`/export?from=${from}&to=${to}`);
-    const rows = await invoicesIn(t, from, to);
+    const sel = datevSelection(c);
+    if (!sel.out && !sel.in) return c.redirect(`/export?from=${from}&to=${to}`);
+    const rows = sel.out ? await invoicesIn(t, from, to) : [];
     const invoices: DatevInvoice[] = [];
     for (const r of rows) {
       const prepaid = await all<{ snapshot: string }>(
@@ -150,11 +265,16 @@ function register(app: App) {
       );
       invoices.push({ data: JSON.parse(r.snapshot), prepaidSnapshots: prepaid.map((p) => JSON.parse(p.snapshot)) });
     }
-    const csv = buildDatevCsv(t, invoices, from, to, userOf(c).name || userOf(c).email);
-    await audit(c, 'export.datev', `${from} – ${to}, ${rows.length} Rechnungen`);
+    const purchases: DatevPurchase[] = (sel.in ? await purchasesIn(t, from, to) : []).map((p) => ({
+      id: p.id, number: p.number, issueDate: p.issue_date, isCredit: !!p.is_credit, currency: p.currency, category: p.category,
+      supplierName: p.supplier_name, supplierNumber: p.supplier_number, taxes: p.taxes,
+    }));
+    const csv = buildDatevCsv(t, { invoices, purchases }, from, to, userOf(c).name || userOf(c).email);
+    await audit(c, 'export.datev', `${from} – ${to}, ${invoices.length} Ausgangs-, ${purchases.length} Eingangsrechnungen`);
+    const kind = sel.out && sel.in ? '' : sel.out ? '_Ausgang' : '_Eingang';
     return c.body(new Uint8Array(csv), 200, {
       'Content-Type': 'text/csv; charset=windows-1252',
-      'Content-Disposition': attachment(`EXTF_Buchungsstapel_${from}_${to}.csv`),
+      'Content-Disposition': attachment(`EXTF_Buchungsstapel${kind}_${from}_${to}.csv`),
       'Cache-Control': 'private, no-store',
     });
   });
@@ -171,19 +291,42 @@ function register(app: App) {
     });
   });
 
+  app.get('/export/purchases', async (c) => {
+    const t = tenantOf(c);
+    const { from, to } = period(c);
+    const rows = await purchasesIn(t, from, to);
+    await audit(c, 'export.purchases', `${from} – ${to}, ${rows.length} Eingangsrechnungen`);
+    return c.body(purchaseJournalCsv(t, rows), 200, {
+      'Content-Type': 'text/csv; charset=utf-8',
+      'Content-Disposition': attachment(`Rechnungseingangsbuch_${from}_${to}.csv`),
+      'Cache-Control': 'private, no-store',
+    });
+  });
+
   app.get('/export/zip', async (c) => {
     const t = tenantOf(c);
     const { from, to } = period(c);
     const rows = await invoicesIn(t, from, to);
-    const files: { name: string; data: Buffer | string }[] = [{ name: `Rechnungsausgangsbuch_${from}_${to}.csv`, data: journalCsv(rows) }];
+    const purchases = await purchasesIn(t, from, to);
+    const files: { name: string; data: Buffer | string }[] = [];
+    if (rows.length) files.push({ name: `Rechnungsausgangsbuch_${from}_${to}.csv`, data: journalCsv(rows) });
+    if (purchases.length) files.push({ name: `Rechnungseingangsbuch_${from}_${to}.csv`, data: purchaseJournalCsv(t, purchases) });
     for (const r of rows) {
       const blobs = await all<{ pdf: Buffer | null; xml: string | null }>('SELECT pdf, xml FROM documents WHERE id = ?', r.id);
       const d = JSON.parse(r.snapshot) as DocumentData;
-      const base = safeName(`${d.number}_${INVOICE_TYPES[d.typeCode] ?? 'Rechnung'}`);
+      const base = `Ausgangsrechnungen/${safeName(`${d.number}_${INVOICE_TYPES[d.typeCode] ?? 'Rechnung'}`)}`;
       if (blobs[0]?.pdf) files.push({ name: `${base}.pdf`, data: Buffer.from(blobs[0].pdf) });
       if (blobs[0]?.xml) files.push({ name: `${base}_XRechnung.xml`, data: blobs[0].xml });
     }
-    await audit(c, 'export.zip', `${from} – ${to}, ${rows.length} Rechnungen`);
+    const used = new Set<string>();
+    for (const p of purchases) {
+      if (!p.file_path) continue;
+      let name = zipPurchaseName(p);
+      if (used.has(name)) name = name.replace(/(\.\w+)?$/, `_${p.id}$1`);
+      used.add(name);
+      files.push({ name, data: await readStoredFile('verbindlichkeiten', p.file_path) });
+    }
+    await audit(c, 'export.zip', `${from} – ${to}, ${rows.length} Ausgangs-, ${purchases.length} Eingangsrechnungen`);
     return c.body(new Uint8Array(createZip(files)), 200, {
       'Content-Type': 'application/zip',
       'Content-Disposition': attachment(`Belege_${safeName(t.name)}_${from}_${to}.zip`),

@@ -1,11 +1,11 @@
 # Schottr
 
 Schlanke Angebots- und Rechnungssoftware für deutsche Unternehmen.
-Mit Login, Mandanten, Adressen, Angeboten und Rechnungen als **ZUGFeRD** (PDF/A-3 mit eingebetteter XML) und **XRechnung 3.0**.
+Mit Login, Mandanten, Adressen, Angeboten und Rechnungen als **ZUGFeRD** (PDF/A-3 mit eingebetteter XML) und **XRechnung 3.0** – sowie Eingangsrechnungen: E-Rechnungen werden automatisch gelesen, PDFs und Scans mit Vorschau erfasst.
 
 - **Node.js ≥ 22.18** (empfohlen: 24 LTS). TypeScript läuft direkt über Nodes Type Stripping, es gibt keinen Build-Schritt.
 - **MariaDB** (≥ 10.11, im Docker-Setup 11.4 LTS) über den Treiber `mysql2`
-- **Wenige Abhängigkeiten**, alle kommerziell nutzbar: Hono (MIT), mysql2 (MIT), PDFKit (MIT), pdf-lib (MIT), Zod (MIT), IBM Plex Sans (OFL)
+- **Wenige Abhängigkeiten**, alle kommerziell nutzbar: Hono (MIT), mysql2 (MIT), PDFKit (MIT), pdf-lib (MIT), Zod (MIT), fast-xml-parser (MIT), IBM Plex Sans (OFL)
 - Serverseitig gerenderte Oberfläche ohne Frontend-Framework. Das kleine `public/app.js` dient nur dem Positionseditor.
 
 ## Schnellstart mit Docker (empfohlen)
@@ -19,6 +19,10 @@ Danach läuft Schottr auf http://localhost:3000. Compose startet zwei Container:
 
 - `schottr-db` mit **MariaDB 11.4**. Die Daten liegen in `./data/mariadb`.
 - `schottr` mit der App. Sie startet erst, wenn die Datenbank bereit ist, und legt die Tabellen beim ersten Start selbst an.
+
+Dateien (Nachweise, Eingangsrechnungen) liegen nicht in der Datenbank, sondern je Mandant unter `./data/nachweise/<Mandant-ID>/` und `./data/verbindlichkeiten/<Mandant-ID>/`. Beide Ordner sind in `compose.yml` als Volumes eingebunden. Fehlen die Volumes, startet der Container mit einem Hinweis nicht – sonst gingen hochgeladene Dateien beim nächsten Update verloren. Nachweise aus älteren Versionen werden beim ersten Start automatisch aus der Datenbank in die Dateiablage verschoben.
+
+> **Update von 0.6:** In der `compose.yml` auf dem Server beim Dienst `schottr` die beiden Volumes ergänzen (siehe `deploy/compose.yml`), danach `docker compose pull && docker compose up -d`.
 
 Beim ersten Aufruf führt `/register` durch die Ersteinrichtung (Benutzer + erster Mandant).
 Danach ist die Registrierung geschlossen, außer `SCHOTTR_ALLOW_REGISTRATION=true` ist gesetzt.
@@ -49,7 +53,7 @@ Ist das Paket privat (Standard bei privaten Repos), meldet sich der Server einma
 ### Backup & Wiederherstellung
 
 ```bash
-./scripts/backup.sh       # legt backup/schottr-JJJJ-MM-TT_HHMM.sql.gz an
+./scripts/backup.sh       # legt backup/schottr-JJJJ-MM-TT_HHMM.sql.gz und schottr-dateien-….tar.gz an
 ```
 
 Für eine tägliche Sicherung per cron: `0 2 * * *  cd /pfad/zu/schottr && ./scripts/backup.sh`
@@ -58,6 +62,7 @@ So stellst du eine Sicherung wieder her:
 
 ```bash
 gunzip -c backup/DATEI.sql.gz | docker compose exec -T db sh -c 'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" schottr'
+tar -xzf backup/schottr-dateien-DATUM.tar.gz -C data
 ```
 
 Für die gesetzliche Aufbewahrung (8 bzw. 10 Jahre) die Sicherungen zusätzlich außerhalb des Servers ablegen.
@@ -95,10 +100,13 @@ DB_PASSWORD=geheim npm start
 | `SCHOTTR_SECURE_COOKIES` | `auto` | `auto`, `true` oder `false` |
 | `SCHOTTR_SESSION_DAYS` | `14` | Gültigkeit der Anmeldung (gleitend) |
 | `SCHOTTR_TRUST_PROXY` | `true` | `X-Forwarded-For` für die Login-Bremse auswerten |
+| `SCHOTTR_DATA_DIR` | `./data` (Docker: `/app/data`) | Dateiablage für Nachweise und Eingangsrechnungen |
+| `SCHOTTR_ALLOW_EPHEMERAL_FILES` | `false` | Nur zum Testen: im Container ohne Volume starten |
 
 ## Funktionen
 
-- **Übersicht**: Offene und überfällige Rechnungen, offene Angebote und der Netto-Umsatz eines wählbaren Jahres (Stornos zählen negativ, abgezogene Teilrechnungen nicht doppelt). Ein Säulendiagramm zeigt die festgeschriebenen Rechnungen der letzten 24 Monate; Überfahren (am Handy: einmal Antippen) zeigt Betrag und Anzahl, ein Klick öffnet die Rechnungsliste gefiltert auf diesen Monat. Ein Ringdiagramm zeigt die fünf umsatzstärksten Kunden der letzten 24 Monate plus „Sonstige“ (Klick führt zur Adresse). Bei aktiver Kleinunternehmerregelung zeigt eine Kachel den Umsatz des laufenden Jahres als Balken bis zur Höchstgrenze von 100.000 € mit einer Marke bei 25.000 € (Grenze für das Folgejahr, § 19 UStG). Ab 20.000 € wird gewarnt, über 25.000 € wird der Teil jenseits der Marke abgesetzt eingefärbt; dazu kommt der Stand des Vorjahres.
+- **Übersicht**: Offene und überfällige Rechnungen, offene Verbindlichkeiten, offene Angebote und der Netto-Umsatz eines wählbaren Jahres (Stornos zählen negativ, abgezogene Teilrechnungen nicht doppelt). Ein Säulendiagramm zeigt die festgeschriebenen Rechnungen der letzten 24 Monate; Überfahren (am Handy: einmal Antippen) zeigt Betrag und Anzahl, ein Klick öffnet die Rechnungsliste gefiltert auf diesen Monat. Ein Ringdiagramm zeigt die fünf umsatzstärksten Kunden der letzten 24 Monate plus „Sonstige“ (Klick führt zur Adresse). Bei aktiver Kleinunternehmerregelung zeigt eine Kachel den Umsatz des laufenden Jahres als Balken bis zur Höchstgrenze von 100.000 € mit einer Marke bei 25.000 € (Grenze für das Folgejahr, § 19 UStG). Ab 20.000 € wird gewarnt, über 25.000 € wird der Teil jenseits der Marke abgesetzt eingefärbt; dazu kommt der Stand des Vorjahres.
+  Ein zweites Diagramm stellt für das gewählte Jahr Umsatz und Ausgaben je Monat gegenüber, mit Ergebnislinie und Jahresergebnis (vor Steuern und sonstigen Abzügen; Kleinunternehmer: Ausgaben brutto). Eine umschaltbare Kachel zeigt die Top-Lieferanten nach Kosten oder die größten offenen Verbindlichkeiten.
 - **Am Handy**: Die Navigation sitzt hinter einem Menü-Button und öffnet sich als Vollbild-Liste. Tabellen (Belege, Adressen, Administration, Protokoll …) werden in der schmalen Ansicht zu Karten mit beschrifteten Feldern, der Positionseditor zu untereinander stehenden Eingaben.
 - **Mandanten**: Ein Benutzer kann mehreren Firmen angehören und zwischen ihnen umschalten. Alle Daten sind strikt je Mandant getrennt. Es gibt die Rollen Inhaber und Mitglied.
 - **Administration** (übergreifend, nur für Administratoren, Link unten in der Seitenleiste): Der erste registrierte Benutzer ist automatisch Administrator. Es gibt fünf Bereiche:
@@ -108,7 +116,11 @@ DB_PASSWORD=geheim npm start
   - **Protokoll:** Anmeldungen (auch fehlgeschlagene), Festschreiben, Storno, Benutzer- und Admin-Aktionen mit IP.
   - **System:** Registrierung öffnen/schließen (überschreibt `SCHOTTR_ALLOW_REGISTRATION`), Versionen und Datenbankgröße.
 - **Einladungen** (portalintern, ohne E-Mail): Der Inhaber lädt eine E-Mail-Adresse ein. Wer mit genau dieser Adresse angemeldet ist, sieht die Einladung in der Übersicht und kann sie annehmen oder ablehnen. Offene Einladungen lassen sich zurückziehen. Für Personen ohne Konto kann der Inhaber direkt ein Konto mit Startpasswort anlegen.
-- **Adressen**: Ein minimaler Datensatz mit Kundennummer aus einem eigenen Nummernkreis, USt-IdNr. und Leitweg-ID. Auf der Detailseite stehen alle Angebote und Rechnungen der Adresse.
+- **Adressen**: Ein minimaler Datensatz mit Art (Kunde, Lieferant oder beides), Nummer aus eigenem Nummernkreis (Kunden `K…`, Lieferanten `L…`), USt-IdNr. und Leitweg-ID. Die Liste lässt sich nach Art filtern; bei Angeboten und Rechnungen stehen nur Kunden zur Auswahl, bei Eingangsrechnungen nur Lieferanten. Auf der Detailseite stehen alle Belege der Adresse.
+- **Eingangsrechnungen** (Menüpunkt *Eingangsrechnungen*): Belege per Drag & Drop hochladen, auch mehrere auf einmal.
+  - **E-Rechnungen** (XRechnung in CII oder UBL, ZUGFeRD/Factur-X-PDF mit eingebetteter XML) werden vollständig übernommen: Lieferant (per USt-IdNr., Steuernummer oder Name wiedererkannt, sonst neu angelegt), Nummer, Datum, Fälligkeit, Beträge je Steuersatz, Bankverbindung und Positionen. Unstimmigkeiten (Summen, fehlende Steuernummer, fremder Rechnungsempfänger, ZUGFeRD MINIMUM/BASIC WL) werden als Hinweis gezeigt. Diese Angaben sind danach gesperrt; Kostenart, Fälligkeit und Zahlung bleiben änderbar.
+  - **PDFs und Scans** (JPG, PNG) landen als „zu erfassen“ und werden mit Vorschau daneben erfasst: Lieferant (oder neuen Namen eintippen), Nummer, Datum, Kostenart und je Steuersatz Netto oder Brutto – der Rest wird berechnet.
+  - Ohne Beleg erfassen geht auch. Status offen, überfällig, bezahlt; Dubletten (gleiche Datei, gleiche Nummer beim Lieferanten) werden abgewiesen. Die Kostenart merkt sich Schottr je Lieferant.
 - **Artikelstamm** (optional): Artikel mit Nummer, Text, Einheit, Preis und Steuersatz. Im Positionseditor lassen sie sich suchen und einfügen; freie Positionen bleiben jederzeit möglich. Die Werte werden kopiert, spätere Artikeländerungen verändern bestehende Belege also nicht. Die Artikelnummer erscheint im PDF und in der E-Rechnung (BT-155).
 - **Angebote**: Positionen mit Menge, Einheit (UN/ECE Rec. 20) sowie 19 % oder 7 %. Der Status ist Entwurf, Versendet, Angenommen, Abgelehnt oder Abgerechnet. Dazu kommen ein PDF und eine Duplizieren-Funktion.
 - **Rechnungen**: Sie entstehen frei oder mit einem Klick aus einem Angebot.
@@ -125,9 +137,11 @@ DB_PASSWORD=geheim npm start
   - **Hinweis:** PDFs mit nicht eingebetteten Schriften werden beim Hochladen als „nicht PDF/A“ markiert; mit ihnen ist das Rechnungs-PDF nicht mehr streng PDF/A-3. Verwendete Nachweise lassen sich nur archivieren, nicht löschen.
 - **Logo**: PNG (auch transparent) oder JPEG unter Einstellungen hochladen. Es erscheint oben rechts auf Angeboten, Rechnungen und Mahnungen; die PDFs bleiben PDF/A-3-konform.
 - **Export** (Menüpunkt *Export*, Zeitraum frei wählbar):
-  - **DATEV-Buchungsstapel** (EXTF 700): je Rechnung und Steuersatz eine Buchung Debitor an Erlöskonto, Sammeldebitor oder Debitor je Kunde, SKR03/04. Erlöskonten lassen sich in den Einstellungen anpassen. Schlussrechnungen buchen die abgezogenen Teilrechnungen zurück, damit kein Umsatz doppelt erscheint.
-  - **Rechnungsausgangsbuch** als CSV für Excel (Netto/USt je Steuersatz, Zahlbetrag, Status).
-  - **ZIP** mit allen ZUGFeRD-PDFs und XRechnung-Dateien des Zeitraums plus Rechnungsausgangsbuch.
+  - **DATEV-Buchungsstapel** (EXTF 700), wahlweise mit Ausgangs- und/oder Eingangsrechnungen:
+    - Ausgang: je Rechnung und Steuersatz Debitor an Erlöskonto, Sammeldebitor oder Debitor je Kunde, SKR03/04. Schlussrechnungen buchen die abgezogenen Teilrechnungen zurück.
+    - Eingang: je Rechnung und Steuersatz Kreditor an Aufwandskonto der Kostenart, Vorsteuer über BU-Schlüssel 9 (19 %) bzw. 8 (7 %); Sammelkreditor oder Kreditor je Lieferant. Kleinunternehmer buchen brutto ohne Vorsteuer. Erlös- und Aufwandskonten lassen sich in den Einstellungen anpassen – am besten mit der Kanzlei abstimmen.
+  - **Rechnungsausgangsbuch** und **Rechnungseingangsbuch** als CSV für Excel (Netto/USt je Steuersatz, Konten, Status).
+  - **ZIP** mit `Ausgangsrechnungen/` (ZUGFeRD-PDFs, XRechnungen), `Eingangsrechnungen/` (Original-Belege) und beiden Büchern.
 - **Steuerarten**: Regelbesteuerung, Kleinunternehmer (§ 19 UStG), Reverse Charge (§ 13b UStG) und steuerfrei mit Begründung. Die gesetzlich nötigen Hinweistexte kommen automatisch auf PDF und XML.
 
 ## Deutsche Vorgaben
@@ -140,6 +154,8 @@ DB_PASSWORD=geheim npm start
 | E-Rechnung (Wachstumschancengesetz, EN 16931) | ZUGFeRD 2.x, Profil EN 16931 (PDF/A-3b), sowie XRechnung 3.0 (CII) |
 | DIN 5008 | Anschriftfeld, Info-Block, Falz- und Lochmarken im PDF |
 | Pflichtangaben Geschäftsbrief (GmbH) | Geschäftsführer, Registergericht und -nummer in der Fußzeile |
+
+Der Import von E-Rechnungen wurde mit allen Fällen der offiziellen [KoSIT-Testsuite](https://github.com/itplr-kosit/xrechnung-testsuite) (CII und UBL) geprüft.
 
 **Geprüft** wurde mit dem offiziellen KoSIT-Validator (XRechnung 3.0.2, Konfiguration 2026-08-31) und mit Mustang 2.26 (veraPDF für PDF/A-3b und ZUGFeRD-Schematron).
 Mit `npm run sample` entstehen Beispielrechnungen für alle Steuerarten in `./samples`:
@@ -160,8 +176,8 @@ src/
   app.ts               Middleware: Sitzung, CSRF, Mandant, Fehler
   db/                  MariaDB-Zugriff + Migrationen (inkl. GoBD-Trigger)
   lib/                 Geld/Steuer-Rechnung, Nummernkreise, Auth, Validierung, HTML
-  einvoice/            Belegdaten (Snapshot), CII-XML (XRechnung/ZUGFeRD), PDF
-  modules/             Funktionsmodule: auth, dashboard, contacts, documents, settings
+  einvoice/            Belegdaten (Snapshot), CII-XML (XRechnung/ZUGFeRD), PDF, Import (parse.ts)
+  modules/             Funktionsmodule: auth, dashboard, contacts, documents, purchases, settings …
   views/layout.ts      Seitenrahmen
 public/                CSS, JS, Favicon
 ```

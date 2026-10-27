@@ -3,6 +3,7 @@ import { audit } from '../lib/audit.ts';
 import { html, raw, type SafeHtml } from '../lib/html.ts';
 import { attachment, idParam, notFound, readForm, redirectWith, str, tenantOf, userOf } from '../lib/http.ts';
 import { inspectPdf } from '../lib/pdfmerge.ts';
+import { readStoredFile, removeStoredFile, saveFile, sha256 } from '../lib/files.ts';
 import { csrfField, empty, page } from '../views/layout.ts';
 import { fromDbTime } from '../db/index.ts';
 import type { App, Ctx, Module } from '../types.ts';
@@ -39,14 +40,43 @@ export async function getProofIds(docId: number): Promise<number[]> {
   return (await all<{ proof_id: number }>('SELECT proof_id FROM document_proofs WHERE document_id = ? ORDER BY `position`', docId)).map((r) => r.proof_id);
 }
 
+/** Inhalt eines Nachweises – aus der Dateiablage (bzw. bei Altbeständen noch aus der Datenbank) */
+async function proofContent(r: { path: string | null; data?: Buffer | null }): Promise<Buffer> {
+  if (r.path) return readStoredFile('nachweise', r.path);
+  if (r.data) return Buffer.from(r.data);
+  throw new Error('Nachweis ohne Inhalt');
+}
+
 /** Angehängte Nachweise eines Belegs inkl. Inhalt (für PDF/XML) */
 export async function getProofFiles(docId: number) {
-  const rows = await all<{ id: number; name: string; filename: string; data: Buffer; pdfa_ok: number }>(
-    `SELECT p.id, p.name, p.filename, p.data, p.pdfa_ok FROM document_proofs dp JOIN proof_documents p ON p.id = dp.proof_id
+  const rows = await all<{ id: number; name: string; filename: string; path: string | null; data: Buffer | null; pdfa_ok: number }>(
+    `SELECT p.id, p.name, p.filename, p.path, IF(p.path IS NULL, p.data, NULL) AS data, p.pdfa_ok
+     FROM document_proofs dp JOIN proof_documents p ON p.id = dp.proof_id
      WHERE dp.document_id = ? ORDER BY dp.\`position\`, p.name`,
     docId,
   );
-  return rows.map((r) => ({ ...r, data: Buffer.from(r.data) }));
+  const out = [];
+  for (const r of rows) out.push({ id: r.id, name: r.name, filename: r.filename, pdfa_ok: r.pdfa_ok, data: await proofContent(r) });
+  return out;
+}
+
+/**
+ * Einmalige Umstellung: Nachweise, deren Inhalt noch in der Datenbank liegt, in die Dateiablage
+ * verschieben. Der Datenbankinhalt wird erst gelöscht, nachdem die Datei geschrieben und
+ * erneut gelesen (Prüfsumme) wurde.
+ */
+export async function migrateProofBlobs(): Promise<number> {
+  const ids = await all<{ id: number }>('SELECT id FROM proof_documents WHERE path IS NULL AND data IS NOT NULL');
+  for (const { id } of ids) {
+    const r = await one<{ tenant_id: number; filename: string; data: Buffer }>('SELECT tenant_id, filename, data FROM proof_documents WHERE id = ?', id);
+    if (!r) continue;
+    const data = Buffer.from(r.data);
+    const stored = await saveFile('nachweise', r.tenant_id, r.filename, data);
+    if (sha256(await readStoredFile('nachweise', stored.path)) !== stored.sha256) throw new Error(`Nachweis ${id}: Prüfsumme stimmt nach dem Schreiben nicht`);
+    await run('UPDATE proof_documents SET path = ?, sha256 = ?, data = NULL WHERE id = ? AND path IS NULL', stored.path, stored.sha256, id);
+  }
+  if (ids.length) console.log(`${ids.length} Nachweis(e) aus der Datenbank in die Dateiablage verschoben`);
+  return ids.length;
 }
 
 /** Verknüpfungen eines Entwurfs speichern (nur Nachweise desselben Mandanten). */
@@ -146,10 +176,16 @@ function register(app: App) {
     }
     const filename = (file.name || 'nachweis.pdf').replace(/[^\w.\-äöüÄÖÜß ]+/g, '_').slice(0, 150).replace(/(\.pdf)?$/i, '.pdf');
     const now = nowIso();
-    await run(
-      'INSERT INTO proof_documents (tenant_id, name, filename, data, size, pages, pdfa_ok, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      t.id, name, filename, data, data.length, info.pages, info.fontsEmbedded ? 1 : 0, userOf(c).id, now, now,
-    );
+    const stored = await saveFile('nachweise', t.id, filename, data);
+    try {
+      await run(
+        'INSERT INTO proof_documents (tenant_id, name, filename, path, sha256, size, pages, pdfa_ok, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        t.id, name, filename, stored.path, stored.sha256, data.length, info.pages, info.fontsEmbedded ? 1 : 0, userOf(c).id, now, now,
+      );
+    } catch (err) {
+      await removeStoredFile('nachweise', stored.path);
+      throw err;
+    }
     await audit(c, 'proof.upload', `${name} (${filename})`);
     return redirectWith(c, '/proofs', 'ok', info.fontsEmbedded
       ? `„${name}“ hochgeladen.`
@@ -158,8 +194,10 @@ function register(app: App) {
 
   app.get('/proofs/:id/file', async (c) => {
     const t = tenantOf(c);
-    const p = (await one<{ data: Buffer; filename: string }>('SELECT data, filename FROM proof_documents WHERE id = ? AND tenant_id = ?', idParam(c), t.id)) ?? notFound();
-    return c.body(new Uint8Array(p.data), 200, {
+    const p = (await one<{ path: string | null; data: Buffer | null; filename: string }>(
+      'SELECT path, IF(path IS NULL, data, NULL) AS data, filename FROM proof_documents WHERE id = ? AND tenant_id = ?', idParam(c), t.id,
+    )) ?? notFound();
+    return c.body(new Uint8Array(await proofContent(p)), 200, {
       'Content-Type': 'application/pdf',
       'Content-Disposition': attachment(p.filename, true),
       'Cache-Control': 'private, no-store',
@@ -183,11 +221,12 @@ function register(app: App) {
 
   app.post('/proofs/:id/delete', async (c) => {
     const t = tenantOf(c);
-    const p = (await one('SELECT id, name FROM proof_documents WHERE id = ? AND tenant_id = ?', idParam(c), t.id)) ?? notFound();
+    const p = (await one('SELECT id, name, path FROM proof_documents WHERE id = ? AND tenant_id = ?', idParam(c), t.id)) ?? notFound();
     if (await one('SELECT 1 FROM document_proofs WHERE proof_id = ? LIMIT 1', p.id)) {
       return redirectWith(c, '/proofs', 'error', 'Dieser Nachweis ist an Belegen angehängt und kann nur archiviert werden.');
     }
     await run('DELETE FROM proof_documents WHERE id = ?', p.id);
+    if (p.path) await removeStoredFile('nachweise', p.path);
     await audit(c, 'proof.delete', p.name);
     return redirectWith(c, '/proofs', 'ok', 'Nachweis gelöscht.');
   });

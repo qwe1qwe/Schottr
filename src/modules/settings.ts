@@ -11,6 +11,7 @@ import { canEmbedImage } from '../einvoice/pdf.ts';
 import { isValidBic, isValidEmail, isValidIban, isValidVatId, normalizeIban, normalizeVatId, formatIban, isCountryCode } from '../lib/validate.ts';
 import { csrfField, page } from '../views/layout.ts';
 import { emailSchema, passwordSchema } from './auth.ts';
+import { EXPENSE_CATEGORIES } from '../lib/expenses.ts';
 import type { App, Ctx, Module, Tenant } from '../types.ts';
 
 type Field = { key: keyof Tenant; label: string; type?: string; max?: number; hint?: string; textarea?: boolean; options?: [string, string][]; min?: number; max2?: number };
@@ -61,6 +62,7 @@ const sections: { title: string; text?: string; fields: Field[] }[] = [
       { key: 'quote_number_format', label: 'Angebotsnummer', max: 40 },
       { key: 'invoice_number_format', label: 'Rechnungsnummer', max: 40 },
       { key: 'customer_number_format', label: 'Kundennummer', max: 40 },
+      { key: 'supplier_number_format', label: 'Lieferantennummer', max: 40 },
     ],
   },
   {
@@ -85,6 +87,15 @@ const sections: { title: string; text?: string; fields: Field[] }[] = [
       { key: 'datev_debtor_mode', label: 'Debitoren', options: [['collective', 'Sammeldebitor'], ['individual', 'Debitor je Kunde']] },
       { key: 'datev_debtor_account', label: 'Debitorenkonto bzw. Startnummer', type: 'number', min: 1, max2: 999999999, hint: 'Sammeldebitor z. B. 10000; je Kunde: Startnummer + Ziffern der Kundennummer' },
       { key: 'datev_accounts', label: 'Abweichende Erlöskonten (optional)', max: 200, hint: 'z. B. 19=8400, 7=8300, ku=8195, rc=8337, frei=8100' },
+    ],
+  },
+  {
+    title: 'DATEV-Export: Eingangsrechnungen',
+    text: `Eingangsrechnungen werden je Steuersatz als Buchung Kreditor an Aufwandskonto übergeben, die Vorsteuer über den BU-Schlüssel (9 = 19 %, 8 = 7 %). Als Kleinunternehmer wird der Bruttobetrag ohne Vorsteuer gebucht. Standard-Aufwandskonten je Kostenart (SKR03 / SKR04): ${EXPENSE_CATEGORIES.map((x) => `${x.label} ${x.skr03} / ${x.skr04}`).join(' · ')}. Am besten einmal mit der Kanzlei abstimmen.`,
+    fields: [
+      { key: 'datev_creditor_mode', label: 'Kreditoren', options: [['collective', 'Sammelkreditor'], ['individual', 'Kreditor je Lieferant']] },
+      { key: 'datev_creditor_account', label: 'Kreditorenkonto bzw. Startnummer', type: 'number', min: 1, max2: 999999999, hint: 'Sammelkreditor z. B. 70000; je Lieferant: Startnummer + Ziffern der Lieferantennummer' },
+      { key: 'datev_expense_accounts', label: 'Abweichende Aufwandskonten (optional)', max: 400, hint: `Kürzel: ${EXPENSE_CATEGORIES.map((x) => x.key).join(', ')} – z. B. buero=4930, software=4964` },
     ],
   },
   {
@@ -205,6 +216,16 @@ function register(app: App) {
     v.datev_debtor_mode = v.datev_debtor_mode === 'individual' ? 'individual' : 'collective';
     v.datev_account_length = Math.max(4, Math.min(8, Number(v.datev_account_length) || 4));
     v.datev_debtor_account = Math.max(1, Math.min(999999999, Number(v.datev_debtor_account) || 10000));
+    v.supplier_number_format = v.supplier_number_format || 'L{NNNNN}';
+    v.datev_creditor_mode = v.datev_creditor_mode === 'individual' ? 'individual' : 'collective';
+    v.datev_creditor_account = Math.max(1, Math.min(999999999, Number(v.datev_creditor_account) || 70000));
+    if (v.datev_expense_accounts) {
+      const keys = new Set<string>(EXPENSE_CATEGORIES.map((x) => x.key));
+      const parts = String(v.datev_expense_accounts).split(',').map((x) => x.trim()).filter(Boolean);
+      if (parts.some((p) => !/^\w+\s*=\s*\d{3,9}$/.test(p) || !keys.has(p.split('=')[0].trim().toLowerCase()))) {
+        errors0.push(`Aufwandskonten bitte im Format „buero=4930, software=4964“ (Kürzel: ${[...keys].join(', ')}).`);
+      }
+    }
     if (v.datev_consultant && !/^\d{4,7}$/.test(String(v.datev_consultant))) errors0.push('DATEV-Beraternummer: 4–7 Ziffern.');
     if (v.datev_client && !/^\d{1,5}$/.test(String(v.datev_client))) errors0.push('DATEV-Mandantennummer: 1–5 Ziffern.');
     if (v.datev_accounts && !/^\s*(\w+\s*=\s*\d{3,9}\s*,?\s*)*$/.test(String(v.datev_accounts))) errors0.push('Erlöskonten bitte im Format „19=8400, 7=8300“.');
@@ -222,7 +243,7 @@ function register(app: App) {
     if (v.bic && !isValidBic(String(v.bic))) errors.push('Die BIC ist ungültig.');
     if (v.vat_id && !isValidVatId(String(v.vat_id))) errors.push('Die USt-IdNr. hat kein gültiges Format.');
     if (v.email && !isValidEmail(String(v.email))) errors.push('Die E-Mail-Adresse ist ungültig.');
-    for (const k of ['quote_number_format', 'invoice_number_format', 'customer_number_format']) {
+    for (const k of ['quote_number_format', 'invoice_number_format', 'customer_number_format', 'supplier_number_format']) {
       if (!isValidFormat(String(v[k]))) errors.push(`Nummernformat „${v[k]}“ braucht einen Platzhalter {NNN…}.`);
     }
     if (errors.length) return redirectWith(c, '/settings', 'error', errors.join(' '));

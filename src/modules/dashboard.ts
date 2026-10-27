@@ -1,6 +1,6 @@
 import { all, one } from '../db/index.ts';
 import { html, selected } from '../lib/html.ts';
-import { barChart, meter, pieChart, type ChartPoint, type PieSlice } from '../views/chart.ts';
+import { barChart, compareChart, meter, pieChart, type ChartPoint, type ComparePoint, type PieSlice } from '../views/chart.ts';
 import { formatDate, MONTH_NAMES, today } from '../lib/dates.ts';
 import { formatMoney } from '../lib/money.ts';
 import { tenantOf } from '../lib/http.ts';
@@ -9,7 +9,10 @@ import { tenantProblems } from './settings.ts';
 import { documentTable } from './documents/views.ts';
 import { invitationsBox, pendingInvitations } from './invitations.ts';
 import { userOf } from '../lib/http.ts';
-import type { Module } from '../types.ts';
+import { openLiabilities } from './purchases/routes.ts';
+import { purchaseBadge, purchaseStatus } from './purchases/views.ts';
+import { dueOf, payable, type Purchase } from './purchases/repo.ts';
+import type { Module, Tenant } from '../types.ts';
 
 /**
  * Netto-Umsatz festgeschriebener Rechnungen. Stornos zählen negativ; bei Teilschluss- und
@@ -20,6 +23,15 @@ const REVENUE = `COALESCE(SUM(CASE WHEN documents.type_code = '381' THEN -docume
 END), 0)`;
 
 const MONTHS = MONTH_NAMES;
+
+/**
+ * Ausgaben aus erfassten Eingangsrechnungen (Gutschriften negativ). Mit Vorsteuerabzug zählt
+ * der Nettobetrag, als Kleinunternehmer der Bruttobetrag – die Vorsteuer bekommt man dann nicht erstattet.
+ */
+const COST = (t: Pick<Tenant, 'small_business'>) => {
+  const col = t.small_business ? 'gross_total' : 'net_total';
+  return `COALESCE(SUM(CASE WHEN p.is_credit = 1 THEN -p.${col} ELSE p.${col} END), 0)`;
+};
 
 /** Grenzen der Kleinunternehmerregelung (§ 19 Abs. 1 UStG, gültig ab 2025), in Cent */
 const KU_PREV_YEAR_LIMIT = 25_000_00;
@@ -49,11 +61,12 @@ function last24Months(todayIso: string) {
 }
 const MONTHS_SHORT = ['Jan', 'Feb', 'Mär', 'Apr', 'Mai', 'Jun', 'Jul', 'Aug', 'Sep', 'Okt', 'Nov', 'Dez'];
 
-/** Jahre mit festgeschriebenen Rechnungen plus das laufende Jahr, neueste zuerst */
+/** Jahre mit festgeschriebenen Rechnungen oder Eingangsrechnungen plus das laufende Jahr, neueste zuerst */
 async function revenueYears(tenantId: number, current: string): Promise<string[]> {
   const rows = await all<{ y: string }>(
-    "SELECT DISTINCT substr(issue_date, 1, 4) y FROM documents WHERE tenant_id = ? AND kind = 'invoice' AND finalized_at IS NOT NULL",
-    tenantId,
+    `SELECT DISTINCT substr(issue_date, 1, 4) y FROM documents WHERE tenant_id = ? AND kind = 'invoice' AND finalized_at IS NOT NULL
+     UNION SELECT DISTINCT substr(issue_date, 1, 4) y FROM purchase_invoices WHERE tenant_id = ? AND status <> 'draft' AND issue_date IS NOT NULL`,
+    tenantId, tenantId,
   );
   return [...new Set([current, ...rows.map((r) => String(r.y))])].sort().reverse();
 }
@@ -112,6 +125,95 @@ async function topCustomers(tenantId: number, todayIso: string) {
   });
 }
 
+/** Umsatz und Ausgaben je Monat eines Jahres mit Ergebnis */
+async function resultChart(t: Tenant, year: string, todayIso: string) {
+  const rev = await all<{ m: string; s: number | string }>(
+    `SELECT substr(issue_date, 6, 2) m, ${REVENUE} s FROM documents
+     WHERE tenant_id = ? AND kind = 'invoice' AND finalized_at IS NOT NULL AND substr(issue_date, 1, 4) = ? GROUP BY m`,
+    t.id, year,
+  );
+  const cost = await all<{ m: string; s: number | string }>(
+    `SELECT substr(p.issue_date, 6, 2) m, ${COST(t)} s FROM purchase_invoices p
+     WHERE p.tenant_id = ? AND p.status <> 'draft' AND substr(p.issue_date, 1, 4) = ? GROUP BY m`,
+    t.id, year,
+  );
+  const r = new Map(rev.map((x) => [String(x.m), Number(x.s)]));
+  const k = new Map(cost.map((x) => [String(x.m), Number(x.s)]));
+  const nowYm = todayIso.slice(0, 7);
+  const points: ComparePoint[] = MONTHS_SHORT.map((label, i) => {
+    const mm = String(i + 1).padStart(2, '0');
+    const ym = `${year}-${mm}`;
+    return {
+      label,
+      title: `${MONTHS[i]} ${year}`,
+      revenue: r.get(mm) ?? 0,
+      cost: k.get(mm) ?? 0,
+      current: ym === nowYm,
+      future: ym > nowYm,
+      revenueHref: `/invoices?month=${ym}`,
+      costHref: `/purchases?month=${ym}`,
+    };
+  });
+  const costLabel = 'Ausgaben';
+  return compareChart(points, {
+    caption: `Umsatz und Ausgaben ${year}`,
+    sub: `${t.small_business ? 'Umsatz netto, Ausgaben brutto (kein Vorsteuerabzug)' : 'netto'} nach Rechnungsdatum · Ergebnis vor Steuern und sonstigen Abzügen`,
+    emptyText: `${year} gibt es noch keine Rechnungen oder Eingangsrechnungen.`,
+    hint: 'Klick auf eine Säule zeigt die Rechnungen bzw. Eingangsrechnungen des Monats.',
+    costLabel,
+  });
+}
+
+/** Kachel mit Umschalter: Top-Lieferanten nach Kosten bzw. größte offene Verbindlichkeiten */
+async function supplierCard(t: Tenant, todayIso: string) {
+  const from = `${last24Months(todayIso)[0].key}-01`;
+  const rows = await all<{ id: number; label: string; s: number | string }>(
+    `SELECT c.id, COALESCE(NULLIF(c.company, ''), c.name) label, ${COST(t)} s
+     FROM purchase_invoices p JOIN contacts c ON c.id = p.contact_id
+     WHERE p.tenant_id = ? AND p.status <> 'draft' AND p.issue_date >= ? AND p.issue_date <= ?
+     GROUP BY c.id, label ORDER BY s DESC`,
+    t.id, from, todayIso,
+  );
+  const positive = rows.map((r) => ({ ...r, s: Number(r.s) })).filter((r) => r.s > 0);
+  const slices: PieSlice[] = positive.slice(0, 5).map((r) => ({ label: r.label, value: r.s, href: `/contacts/${r.id}` }));
+  const rest = positive.slice(5).reduce((a, r) => a + r.s, 0);
+  if (rest > 0) slices.push({ label: `Sonstige (${positive.length - 5})`, value: rest, rest: true });
+  const pie = pieChart(slices, {
+    caption: 'Top-Lieferanten',
+    sub: `${t.small_business ? 'Kosten brutto' : 'Kosten netto'} seit ${formatDate(from)}`,
+    emptyText: 'In den letzten 24 Monaten wurden keine Eingangsrechnungen erfasst.',
+    centerLabel: '24 Monate',
+    bare: true,
+  });
+
+  const open = await all<Purchase & { contact_label: string | null }>(
+    `SELECT p.*, COALESCE(NULLIF(c.company, ''), c.name) AS contact_label FROM purchase_invoices p LEFT JOIN contacts c ON c.id = p.contact_id
+     WHERE p.tenant_id = ? AND p.status = 'open' AND p.is_credit = 0 AND p.gross_total - p.prepaid_total > 0
+     ORDER BY p.gross_total - p.prepaid_total DESC, COALESCE(p.due_date, p.issue_date) LIMIT 6`,
+    t.id,
+  );
+  const liabilities = open.length
+    ? html`<ul class="plain liability-list">${open.map((p) => html`<li>
+        <a href="/purchases/${p.id}" class="liability-name">${p.contact_label ?? 'ohne Lieferant'}<span class="muted small"> · ${p.number || 'ohne Nr.'}</span></a>
+        <span class="liability-due small">${purchaseStatus(p) === 'overdue' ? purchaseBadge('overdue') : html`<span class="muted">fällig ${formatDate(dueOf(p))}</span>`}</span>
+        <strong class="num">${formatMoney(payable(p))}</strong>
+      </li>`)}</ul>
+      <p class="small"><a href="/purchases?status=open">Alle offenen Eingangsrechnungen</a></p>`
+    : html`<p class="muted small pie-empty">Keine offenen Verbindlichkeiten.</p>`;
+
+  return html`<section class="card dual" data-tabs>
+    <div class="dual-head">
+      <h2 data-tab-title>Lieferanten</h2>
+      <div class="tabs small-tabs" role="tablist">
+        <button type="button" role="tab" data-tab="suppliers" aria-selected="true">Top-Lieferanten</button>
+        <button type="button" role="tab" data-tab="liabilities" aria-selected="false">Größte Verbindlichkeiten</button>
+      </div>
+    </div>
+    <div data-panel="suppliers" role="tabpanel"><h3 class="panel-title">Top-Lieferanten</h3>${pie}</div>
+    <div data-panel="liabilities" role="tabpanel"><h3 class="panel-title">Größte Verbindlichkeiten</h3>${liabilities}</div>
+  </section>`;
+}
+
 /** Kleinunternehmergrenze nach § 19 UStG – nur wenn die Regelung aktiv ist */
 async function smallBusinessLimits(tenantId: number, year: number) {
   const prev = await yearRevenue(tenantId, year - 1);
@@ -161,7 +263,10 @@ export const dashboardModule: Module = {
         selYear,
       );
       const chart = await monthlyChart(t.id, d);
+      const result = await resultChart(t, selYear, d);
       const customers = await topCustomers(t.id, d);
+      const suppliers = await supplierCard(t, d);
+      const liab = await openLiabilities(t.id);
       const ku = t.small_business ? await smallBusinessLimits(t.id, Number(year)) : null;
       const drafts = await all(
         `SELECT d.*, COALESCE(NULLIF(c.company, ''), c.name) contact_label FROM documents d JOIN contacts c ON c.id = d.contact_id
@@ -187,6 +292,8 @@ export const dashboardModule: Module = {
           <a class="stat" href="/invoices?status=open"><span>Offene Rechnungen</span><strong>${formatMoney(open.s)}</strong><small>${open.n} Beleg(e)</small></a>
           <a class="stat ${overdue.n ? 'alert' : ''}" href="/dunning"><span>Überfällig</span><strong>${formatMoney(overdue.s)}</strong><small>${overdue.n} Beleg(e)</small></a>
           <a class="stat" href="/quotes?status=sent"><span>Offene Angebote</span><strong>${formatMoney(quotes.s)}</strong><small>${quotes.n} Beleg(e)</small></a>
+          <a class="stat ${liab.overdueN ? 'alert' : ''}" href="/purchases?status=${liab.overdueN ? 'overdue' : 'open'}"><span>Verbindlichkeiten</span><strong>${formatMoney(liab.s)}</strong>
+            <small>${liab.n} offen${liab.overdueN ? ` · ${liab.overdueN} überfällig (${formatMoney(liab.overdueS)})` : ''}</small></a>
           <div class="stat">
             <form method="get" action="/" class="stat-year">
               <label for="revenue-year">Umsatz</label>
@@ -198,7 +305,9 @@ export const dashboardModule: Module = {
           </div>
         </div>
         ${chart}
-        <div class="dash-grid${ku ? '' : ' single'}">${customers}${ku ?? ''}</div>
+        ${result}
+        <div class="dash-grid">${customers}${suppliers}</div>
+        ${ku ? html`<div class="dash-grid single">${ku}</div>` : ''}
         ${drafts.length ? html`<h2 class="section-title">Rechnungsentwürfe</h2>${documentTable(drafts, 'invoice')}` : ''}
         <h2 class="section-title">Offene Rechnungen</h2>
         ${openList.length ? documentTable(openList, 'invoice') : html`<p class="muted">Keine offenen Rechnungen. 🎉</p>`}`,

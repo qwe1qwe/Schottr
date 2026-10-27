@@ -89,10 +89,10 @@ export function documentForm(
       <div class="grid-3">
         <label class="span-2">Kunde
           <select name="contact_id" required>
-            <option value="">– Adresse wählen –</option>
+            <option value="">– Kunde wählen –</option>
             ${contacts.map((ct) => html`<option value="${ct.id}" data-leitweg="${ct.leitweg_id}"${selected(ct.id, d.contact_id)}>${ct.company || ct.name}${ct.city ? ` (${ct.city})` : ''}</option>`)}
           </select>
-          ${contacts.length ? '' : html`<small><a href="/contacts/new">Zuerst eine Adresse anlegen</a></small>`}
+          ${contacts.length ? '' : html`<small><a href="/contacts/new?kind=customer">Zuerst einen Kunden anlegen</a></small>`}
         </label>
         <label>${kind === 'quote' ? 'Angebotsdatum' : 'Rechnungsdatum'} <input type="date" name="issue_date" value="${d.issue_date}" required></label>
         <label class="span-2">Betreff <input name="subject" value="${d.subject}" maxlength="200" placeholder="z. B. Projekt oder Auftrag"></label>

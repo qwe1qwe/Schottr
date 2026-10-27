@@ -28,4 +28,20 @@ export const config = {
   sessionDays: Number(env.SCHOTTR_SESSION_DAYS ?? 14),
   /** Hinter einem Reverse-Proxy (z. B. Nginx Proxy Manager) X-Forwarded-For auswerten. */
   trustProxy: bool(env.SCHOTTR_TRUST_PROXY, true),
+  /**
+   * Ablage für Dateien (Nachweise, Eingangsrechnungen) – je Bereich und Mandant ein Ordner:
+   * <dataDir>/nachweise/<Mandant>/ und <dataDir>/verbindlichkeiten/<Mandant>/.
+   * Wird bei jedem Zugriff gelesen, damit Tests ein eigenes Verzeichnis setzen können.
+   */
+  get dataDir(): string {
+    return env.SCHOTTR_DATA_DIR || 'data';
+  },
+  /** Im Docker-Image gesetzt: dann muss die Dateiablage als Volume eingebunden sein. */
+  get inDocker(): boolean {
+    return bool(env.SCHOTTR_DOCKER, false);
+  },
+  /** Notausgang: ohne eingebundenes Volume trotzdem starten (Dateien gehen beim Neuerstellen verloren!) */
+  get allowEphemeralFiles(): boolean {
+    return bool(env.SCHOTTR_ALLOW_EPHEMERAL_FILES, false);
+  },
 };

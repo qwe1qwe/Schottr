@@ -17,27 +17,39 @@ const PUBLIC_PATHS = ['/login', '/register', '/health'];
 export function createApp() {
   const app = new Hono<AppEnv>();
 
-  app.use(
-    secureHeaders({
-      contentSecurityPolicy: {
-        defaultSrc: ["'self'"],
-        scriptSrc: ["'self'"],
-        styleSrc: ["'self'"],
-        imgSrc: ["'self'", 'data:'],
-        fontSrc: ["'self'"],
-        formAction: ["'self'"],
-        frameAncestors: ["'none'"],
-        objectSrc: ["'none'"],
-        baseUri: ["'self'"],
-      },
-      crossOriginEmbedderPolicy: false,
-      // „no-referrer“ würde Browser dazu bringen, bei Formularen „Origin: null“ zu senden
-      referrerPolicy: 'same-origin',
-    }),
+  const strictHeaders = secureHeaders({
+    contentSecurityPolicy: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'"],
+      styleSrc: ["'self'"],
+      imgSrc: ["'self'", 'data:'],
+      fontSrc: ["'self'"],
+      formAction: ["'self'"],
+      frameAncestors: ["'none'"],
+      objectSrc: ["'none'"],
+      baseUri: ["'self'"],
+    },
+    crossOriginEmbedderPolicy: false,
+    // „no-referrer“ würde Browser dazu bringen, bei Formularen „Origin: null“ zu senden
+    referrerPolicy: 'same-origin',
+    });
+  // Belegvorschau (PDF/Bild) darf in der eigenen Seite eingebettet werden. Ohne weitere
+  // CSP-Vorgaben, sonst verweigern manche Browser ihren PDF-Betrachter.
+  const framableHeaders = secureHeaders({
+    contentSecurityPolicy: { frameAncestors: ["'self'"] },
+    xFrameOptions: 'SAMEORIGIN',
+    crossOriginEmbedderPolicy: false,
+    crossOriginResourcePolicy: 'same-origin',
+    referrerPolicy: 'same-origin',
+  });
+  app.use((c, next) =>
+    c.req.query('inline') === '1' && /^\/purchases\/\d+\/file$/.test(new URL(c.req.url).pathname)
+      ? framableHeaders(c, next)
+      : strictHeaders(c, next),
   );
 
-  // Uploads (z. B. Logo) und Formulare begrenzen
-  app.use(bodyLimit({ maxSize: 15 * 1024 * 1024, onError: (c) => c.text('Anfrage zu groß', 413) }));
+  // Uploads (Logo, Nachweise, mehrere Belege auf einmal) und Formulare begrenzen
+  app.use(bodyLimit({ maxSize: 50 * 1024 * 1024, onError: (c) => c.text('Anfrage zu groß (max. 50 MB je Upload)', 413) }));
 
   app.use('/static/*', serveStatic({ root: './public', rewriteRequestPath: (p) => p.replace(/^\/static/, '') }));
   app.use('/fonts/*', serveStatic({ root: './assets' }));

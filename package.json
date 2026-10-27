@@ -1,6 +1,6 @@
 {
   "name": "schottr",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Schottr – schlanke Angebots- und Rechnungssoftware mit ZUGFeRD und XRechnung (MariaDB)",
   "private": true,
   "type": "module",
@@ -17,6 +17,7 @@
   },
   "dependencies": {
     "@hono/node-server": "^2.1.5",
+    "fast-xml-parser": "^5.11.2",
     "hono": "^4.13.14",
     "mysql2": "^3.24.6",
     "pdf-lib": "^1.17.1",

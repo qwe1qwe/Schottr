@@ -415,4 +415,77 @@ export const migrations: { version: number; statements: string[] }[] = [
        ) THEN ${forbid('Festgeschriebene Rechnungen koennen nicht geaendert werden')}; END IF`,
     ],
   },
+  {
+    version: 7,
+    statements: [
+      // Adressen haben eine Art: Kunde, Lieferant oder beides
+      `ALTER TABLE contacts
+        ADD COLUMN kind ENUM('customer', 'supplier', 'both') NOT NULL DEFAULT 'customer' AFTER tenant_id,
+        ADD COLUMN expense_category VARCHAR(20) NOT NULL DEFAULT '',
+        ADD KEY contacts_kind (tenant_id, kind, archived)`,
+      `ALTER TABLE tenants
+        ADD COLUMN supplier_number_format VARCHAR(40) NOT NULL DEFAULT 'L{NNNNN}',
+        ADD COLUMN datev_creditor_mode ENUM('collective', 'individual') NOT NULL DEFAULT 'collective',
+        ADD COLUMN datev_creditor_account INT NOT NULL DEFAULT 70000,
+        ADD COLUMN datev_expense_accounts VARCHAR(400) NOT NULL DEFAULT ''`,
+
+      // Nachweise liegen künftig als Datei unter data/nachweise/<Mandant>/ (Inhalt wird beim Start verschoben)
+      `ALTER TABLE proof_documents
+        MODIFY data LONGBLOB NULL,
+        ADD COLUMN path VARCHAR(300) NULL AFTER filename,
+        ADD COLUMN sha256 CHAR(64) NOT NULL DEFAULT '' AFTER path`,
+
+      // Eingangsrechnungen (Verbindlichkeiten). Datei unter data/verbindlichkeiten/<Mandant>/
+      `CREATE TABLE purchase_invoices (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        tenant_id INT NOT NULL,
+        contact_id INT NULL,
+        status ENUM('draft', 'open', 'paid') NOT NULL DEFAULT 'draft',
+        is_credit TINYINT(1) NOT NULL DEFAULT 0,
+        number VARCHAR(100) NOT NULL DEFAULT '',
+        issue_date DATE NULL,
+        due_date DATE NULL,
+        service_date DATE NULL,
+        description VARCHAR(300) NOT NULL DEFAULT '',
+        category VARCHAR(20) NOT NULL DEFAULT 'sonstiges',
+        currency CHAR(3) NOT NULL DEFAULT 'EUR',
+        net_total BIGINT NOT NULL DEFAULT 0,
+        tax_total BIGINT NOT NULL DEFAULT 0,
+        gross_total BIGINT NOT NULL DEFAULT 0,
+        prepaid_total BIGINT NOT NULL DEFAULT 0,
+        paid_at DATE NULL,
+        iban VARCHAR(40) NOT NULL DEFAULT '',
+        payment_reference VARCHAR(140) NOT NULL DEFAULT '',
+        einvoice_format VARCHAR(30) NOT NULL DEFAULT '',
+        einvoice_data LONGTEXT NULL,
+        file_name VARCHAR(200) NOT NULL DEFAULT '',
+        file_path VARCHAR(300) NOT NULL DEFAULT '',
+        file_mime VARCHAR(60) NOT NULL DEFAULT '',
+        file_size INT NOT NULL DEFAULT 0,
+        file_sha256 CHAR(64) NOT NULL DEFAULT '',
+        created_by INT NULL,
+        created_at DATETIME(3) NOT NULL,
+        updated_at DATETIME(3) NOT NULL,
+        KEY purchases_tenant (tenant_id, status, due_date),
+        KEY purchases_date (tenant_id, issue_date),
+        KEY purchases_contact (contact_id),
+        KEY purchases_sha (tenant_id, file_sha256),
+        CONSTRAINT purchases_tenant FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
+        CONSTRAINT purchases_contact FOREIGN KEY (contact_id) REFERENCES contacts(id),
+        CONSTRAINT purchases_user FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
+      ) ${TABLE}`,
+      // Beträge je Steuersatz (BG-23 der E-Rechnung bzw. manuell erfasst)
+      `CREATE TABLE purchase_invoice_taxes (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        purchase_id INT NOT NULL,
+        \`position\` INT NOT NULL,
+        category VARCHAR(2) NOT NULL DEFAULT 'S',
+        rate INT NOT NULL,
+        basis BIGINT NOT NULL,
+        tax BIGINT NOT NULL,
+        KEY purchase_taxes_doc (purchase_id, \`position\`),
+        CONSTRAINT purchase_taxes_doc FOREIGN KEY (purchase_id) REFERENCES purchase_invoices(id) ON DELETE CASCADE
+      ) ${TABLE}`,
+    ],
+  },
 ];

@@ -8,7 +8,7 @@ import { nextNumber } from '../../lib/numbering.ts';
 import { writeProofLinks } from '../proofs.ts';
 import { FINAL_TYPES, SELECTABLE_TYPES, type Prepayment } from '../../einvoice/model.ts';
 import type { Tenant } from '../../types.ts';
-import { getContact } from '../contacts.ts';
+import { getContact, isCustomer } from '../contacts.ts';
 
 export type Kind = 'quote' | 'invoice';
 
@@ -150,7 +150,9 @@ const optDate = (v: string) => (v === '' ? null : v);
 export async function parseDraft(form: Form, kind: Kind, tenantId: number): Promise<DraftInput> {
   const errors: string[] = [];
   const contactId = Number(str(form, 'contact_id'));
-  if (!await getContact(tenantId, contactId)) errors.push('Bitte eine Adresse auswählen.');
+  const contact = await getContact(tenantId, contactId);
+  if (!contact) errors.push('Bitte einen Kunden auswählen.');
+  else if (!isCustomer(contact)) errors.push('Die gewählte Adresse ist als Lieferant angelegt – bitte unter Adressen die Art auf „Kunde & Lieferant“ ändern.');
 
   const d: DraftInput = {
     contact_id: contactId,

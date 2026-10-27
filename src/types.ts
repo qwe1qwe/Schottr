@@ -53,6 +53,10 @@ export interface Tenant {
   datev_debtor_mode: 'collective' | 'individual';
   datev_debtor_account: number;
   datev_accounts: string;
+  supplier_number_format: string;
+  datev_creditor_mode: 'collective' | 'individual';
+  datev_creditor_account: number;
+  datev_expense_accounts: string;
 }
 
 export type Role = 'owner' | 'member';

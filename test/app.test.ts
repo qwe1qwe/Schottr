@@ -1,6 +1,8 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import mysql from 'mysql2/promise';
 import { openDatabase, closeDatabase, one, all, run } from '../src/db/index.ts';
 import { createApp } from '../src/app.ts';
@@ -21,6 +23,8 @@ const opts = { skip: TEST_DB ? false : 'TEST_DATABASE_URL nicht gesetzt' };
 
 before(async () => {
   if (!TEST_DB) return;
+  // eigene, leere Dateiablage für Nachweise und Eingangsrechnungen
+  process.env.SCHOTTR_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'schottr-test-'));
   // frische Testdatenbank: alle Tabellen löschen
   const conn = await mysql.createConnection({ uri: TEST_DB, multipleStatements: true });
   const [tables] = await conn.query<mysql.RowDataPacket[]>('SELECT table_name AS t FROM information_schema.tables WHERE table_schema = DATABASE()');
@@ -397,6 +401,10 @@ test('Nachweisdokumentationen', opts, async () => {
   const proof = (await one('SELECT * FROM proof_documents WHERE name = ?', 'Aufmaß Halle 1'))!;
   assert.equal(proof.pdfa_ok, 1);
   assert.equal(proof.pages, 1);
+  // Inhalt liegt als Datei unter <data>/nachweise/<Mandant>/, nicht in der Datenbank
+  assert.equal(proof.data, null);
+  assert.match(proof.path, new RegExp(`^${first.id}/`));
+  assert.deepEqual(fs.readFileSync(path.join(process.env.SCHOTTR_DATA_DIR!, 'nachweise', proof.path)), pdfBytes);
 
   // Keine PDF → abgelehnt
   const bad = new FormData();
@@ -572,4 +580,252 @@ test('Übersicht: Top-Kunden, Kleinunternehmergrenze und Monatsfilter', opts, as
   assert.deepEqual(shown.sort(), expected.sort());
   // ungültiger Monat wird ignoriert
   assert.doesNotMatch(await (await req('/invoices?month=2026-13')).text(), /filter-chip/);
+});
+
+/* ---------------- Eingangsrechnungen ---------------- */
+
+const fixture = (name: string) => fs.readFileSync(new URL(`./fixtures/${name}`, import.meta.url));
+
+async function upload(files: { name: string; data: Buffer; type: string }[]) {
+  const fd = new FormData();
+  fd.append('_csrf', csrf);
+  for (const f of files) fd.append('files[]', new Blob([new Uint8Array(f.data)], { type: f.type }), f.name);
+  return app.request('/purchases/upload', { method: 'POST', headers: { cookie }, body: fd });
+}
+
+const flashOf = (res: Response) => {
+  const c = res.headers.getSetCookie().find((x) => x.startsWith('schottr_flash='));
+  if (!c) return '';
+  let v = c.split(';')[0].slice('schottr_flash='.length);
+  while (v.startsWith('%')) v = decodeURIComponent(v);
+  return JSON.parse(v).message as string;
+};
+
+test('Adressen: Kunden und Lieferanten getrennt', opts, async () => {
+  const first = (await one<{ id: number }>("SELECT id FROM tenants WHERE name = 'Test GmbH'"))!;
+  await req('/tenant/switch', { form: { tenant_id: String(first.id) } });
+  let res = await req('/contacts', { form: { kind: 'supplier', company: 'Papier Meier KG', city: 'Würzburg', country: 'DE' } });
+  const supplierId = Number(location(res).split('/').pop());
+  const supplier = (await one('SELECT * FROM contacts WHERE id = ?', supplierId))!;
+  assert.equal(supplier.kind, 'supplier');
+  assert.match(supplier.customer_number, /^L\d{5}$/, 'eigener Nummernkreis für Lieferanten');
+
+  // Filter im Adressbereich
+  const suppliers = await (await req('/contacts?kind=supplier')).text();
+  assert.match(suppliers, /Papier Meier KG/);
+  assert.doesNotMatch(suppliers, /Kunde AG/);
+  const customers = await (await req('/contacts?kind=customer')).text();
+  assert.doesNotMatch(customers, /Papier Meier KG/);
+
+  // Lieferanten stehen nicht zur Auswahl für Rechnungen und werden abgelehnt
+  assert.doesNotMatch(await (await req('/invoices/new')).text(), /Papier Meier KG/);
+  res = await req('/invoices', {
+    form: { contact_id: String(supplierId), type_code: '380', issue_date: '2026-09-01', 'item_title[]': 'x', 'item_price[]': '1', 'item_vat[]': '1900' },
+  });
+  assert.match(flashOf(res), /als Lieferant angelegt/);
+  // Kunden mit Belegen bleiben Kunde
+  const kunde = (await one<{ id: number }>("SELECT id FROM contacts WHERE company = 'Kunde AG' AND tenant_id = ?", first.id))!;
+  res = await req(`/contacts/${kunde.id}`, { form: { kind: 'supplier', company: 'Kunde AG', street: 'Str. 2', zip: '54321', city: 'Ort', country: 'DE' } });
+  assert.match(flashOf(res), /bleibt daher Kunde/);
+});
+
+test('Eingangsrechnungen: E-Rechnung, Scan, manuell, Export und Übersicht', opts, async () => {
+  const first = (await one<Record<string, any>>("SELECT * FROM tenants WHERE name = 'Test GmbH'"))!;
+  await req('/tenant/switch', { form: { tenant_id: String(first.id) } });
+  const dataDir = process.env.SCHOTTR_DATA_DIR!;
+
+  // 1) XRechnung (CII) aus der KoSIT-Testsuite: wird vollständig übernommen, Lieferant neu angelegt
+  let res = await upload([{ name: 'xrechnung.xml', data: fixture('02.01a-INVOICE_uncefact.xml'), type: 'application/xml' }]);
+  assert.equal(res.status, 303);
+  assert.match(flashOf(res), /E-Rechnung übernommen.*neu angelegt/);
+  const xr = (await one('SELECT * FROM purchase_invoices WHERE tenant_id = ? AND file_name = ?', first.id, 'xrechnung.xml'))!;
+  assert.equal(xr.status, 'open');
+  assert.equal(xr.number, '1234567');
+  assert.equal(xr.issue_date, '2018-04-13');
+  assert.equal(xr.gross_total, 1282969);
+  assert.equal(xr.einvoice_format, 'XRechnung (CII)');
+  assert.ok(fs.existsSync(path.join(dataDir, 'verbindlichkeiten', xr.file_path)));
+  assert.match(xr.file_path, new RegExp(`^${first.id}/`));
+  const taxes = await all('SELECT category, rate FROM purchase_invoice_taxes WHERE purchase_id = ? ORDER BY `position`', xr.id);
+  assert.deepEqual(taxes.map((t) => `${t.category}${t.rate}`), ['S1900', 'E0']);
+  const seller = (await one('SELECT * FROM contacts WHERE id = ?', xr.contact_id))!;
+  assert.equal(seller.kind, 'supplier');
+  assert.equal(seller.vat_id, 'ATU123456789');
+  const detail = await (await req(`/purchases/${xr.id}`)).text();
+  assert.match(detail, /Positionen laut E-Rechnung/);
+  assert.match(detail, /12\.829,69/);
+
+  // dieselbe Datei nochmal → nicht doppelt
+  res = await upload([{ name: 'nochmal.xml', data: fixture('02.01a-INVOICE_uncefact.xml'), type: 'application/xml' }]);
+  assert.match(flashOf(res), /bereits hochgeladen/);
+  // UBL derselben Rechnung (andere Datei, gleiche Nummer, gleicher Lieferant) → als Dublette erkannt
+  const ubl = fixture('03.01a-INVOICE_ubl.xml');
+  res = await upload([{ name: 'ubl.xml', data: ubl, type: 'application/xml' }]);
+  assert.match(flashOf(res), /übernommen/);
+  const ublRow = (await one('SELECT * FROM purchase_invoices WHERE file_name = ?', 'ubl.xml'))!;
+  assert.equal(ublRow.einvoice_format, 'XRechnung (UBL)');
+  assert.equal(ublRow.contact_id, xr.contact_id, 'Lieferant über die USt-IdNr. wiedererkannt');
+  // Zahlbetrag negativ (Vorauszahlung höher) → nichts mehr zu zahlen
+  assert.equal(ublRow.status, 'paid');
+
+  // 2) ZUGFeRD-PDF: Rechnung aus Schottr selbst als Eingangsrechnung hochladen
+  const own = (await one<{ id: number; number: string }>("SELECT id, number FROM documents WHERE tenant_id = ? AND kind = 'invoice' AND type_code = '380' AND finalized_at IS NOT NULL AND pdf IS NOT NULL LIMIT 1", first.id))!;
+  const zugferd = Buffer.from(await (await req(`/invoices/${own.id}/pdf`)).arrayBuffer());
+  res = await upload([{ name: 'zugferd.pdf', data: zugferd, type: 'application/pdf' }]);
+  const zf = (await one('SELECT * FROM purchase_invoices WHERE file_name = ?', 'zugferd.pdf'))!;
+  assert.equal(zf.number, own.number);
+  assert.equal(zf.einvoice_format, 'ZUGFeRD (EN 16931)');
+  // Absender „Test GmbH“ existierte nur als eigener Mandant → neuer Lieferant
+  assert.equal((await one('SELECT company FROM contacts WHERE id = ?', zf.contact_id))!.company, 'Test GmbH');
+  // E-Rechnungsdaten lassen sich nicht überschreiben, Kostenart schon
+  await req(`/purchases/${zf.id}`, { form: { category: 'software', number: 'ANDERS', due_date: '', description: 'Lizenz', paid_at: '' } });
+  const zf2 = (await one('SELECT * FROM purchase_invoices WHERE id = ?', zf.id))!;
+  assert.equal(zf2.number, own.number);
+  assert.equal(zf2.category, 'software');
+  assert.equal((await one('SELECT expense_category FROM contacts WHERE id = ?', zf.contact_id))!.expense_category, 'software', 'Kostenart wird beim Lieferanten gemerkt');
+
+  // 3) Scan (JPEG) + normale PDF ohne XML → zwei Belege „zu erfassen“
+  const jpeg = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(200, 1)]);
+  const quote = (await one<{ id: number }>("SELECT id FROM documents WHERE kind = 'quote' AND tenant_id = ? LIMIT 1", first.id))!;
+  const plainPdf = Buffer.from(await (await req(`/quotes/${quote.id}/pdf`)).arrayBuffer());
+  res = await upload([
+    { name: 'kassenbon.jpg', data: jpeg, type: 'image/jpeg' },
+    { name: 'rechnung.pdf', data: plainPdf, type: 'application/pdf' },
+    { name: 'notiz.txt', data: Buffer.from('hallo'), type: 'text/plain' },
+  ]);
+  assert.equal(location(res), '/purchases?status=draft');
+  assert.match(flashOf(res), /2 Beleg\(e\) hochgeladen.*notiz\.txt/);
+  const scan = (await one('SELECT * FROM purchase_invoices WHERE file_name = ?', 'kassenbon.jpg'))!;
+  assert.equal(scan.status, 'draft');
+  assert.equal(scan.file_mime, 'image/jpeg');
+  // Formular mit Vorschau
+  const edit = await (await req(`/purchases/${scan.id}/edit`)).text();
+  assert.match(edit, new RegExp(`src="/purchases/${scan.id}/file\\?inline=1"`));
+  // Vorschau darf eingebettet werden, aber nur von der eigenen Seite
+  const preview = await req(`/purchases/${scan.id}/file?inline=1`);
+  assert.match(preview.headers.get('content-security-policy') ?? '', /frame-ancestors 'self'/);
+  assert.equal(preview.headers.get('content-type'), 'image/jpeg');
+  assert.match((await req(`/purchases/${scan.id}/file`)).headers.get('content-security-policy') ?? '', /frame-ancestors 'none'/);
+
+  // Erfassen: neuer Lieferant per Name, nur Brutto 19 % angegeben
+  res = await req(`/purchases/${scan.id}`, {
+    form: {
+      contact_id: '', new_supplier: 'Tankstelle Süd', number: 'B-77', issue_date: '2026-09-10', due_date: '', category: 'kfz',
+      description: 'Diesel', paid_at: '2026-09-10', 'tax_rate[]': '1900', 'tax_net[]': '', 'tax_tax[]': '', 'tax_gross[]': '119,00',
+    },
+  });
+  const saved = (await one('SELECT * FROM purchase_invoices WHERE id = ?', scan.id))!;
+  assert.equal(saved.status, 'paid');
+  assert.equal(saved.net_total, 10000);
+  assert.equal(saved.tax_total, 1900);
+  const tank = (await one('SELECT * FROM contacts WHERE id = ?', saved.contact_id))!;
+  assert.equal(tank.company, 'Tankstelle Süd');
+  assert.equal(tank.kind, 'supplier');
+
+  // Manuell ohne Beleg, zwei Steuersätze, offen und überfällig
+  const meier = (await one<{ id: number }>("SELECT id FROM contacts WHERE company = 'Papier Meier KG'"))!;
+  res = await req('/purchases', {
+    form: {
+      contact_id: String(meier.id), number: 'PM-1', issue_date: '2026-09-15', due_date: '2026-09-29', category: 'buero', description: '',
+      'tax_rate[]': ['1900', '700'], 'tax_net[]': ['100,00', '50'], 'tax_tax[]': ['', ''], 'tax_gross[]': ['', ''],
+    },
+  });
+  const pm = (await one('SELECT * FROM purchase_invoices WHERE number = ?', 'PM-1'))!;
+  assert.equal(pm.status, 'open');
+  assert.equal(pm.gross_total, 11900 + 5350);
+  // doppelte Rechnungsnummer beim selben Lieferanten → abgelehnt
+  res = await req('/purchases', { form: { contact_id: String(meier.id), number: 'PM-1', issue_date: '2026-09-16', 'tax_rate[]': '1900', 'tax_net[]': '1' } });
+  assert.match(flashOf(res), /bereits erfasst/);
+  // ohne Betrag → Fehler
+  res = await req('/purchases', { form: { contact_id: String(meier.id), issue_date: '2026-09-16', 'tax_rate[]': '1900', 'tax_net[]': '' } });
+  assert.match(flashOf(res), /mindestens einen Betrag/);
+
+  // Liste: Filter überfällig
+  const overdue = await (await req('/purchases?status=overdue')).text();
+  assert.match(overdue, /PM-1/);
+  assert.doesNotMatch(overdue, /B-77/);
+
+  // 4) Übersicht: Verbindlichkeiten, Umsatz/Ausgaben, Lieferanten-Kachel
+  const dash = await (await req('/?year=2026')).text();
+  assert.match(dash, /Verbindlichkeiten/);
+  assert.match(dash, /Umsatz und Ausgaben 2026/);
+  assert.match(dash, /href="\/purchases\?month=2026-09"/);
+  assert.match(dash, /Größte Verbindlichkeiten/);
+  assert.match(dash, /PM-1/);
+  assert.match(dash, /September 2026: Umsatz [^"]* · Ausgaben 250,00.€/);
+
+  // 5) Export: DATEV (nur Eingang), Rechnungseingangsbuch, ZIP
+  const q = 'from=2026-09-01&to=2026-09-30';
+  const datev = Buffer.from(await (await req(`/export/datev?${q}&in=1`)).arrayBuffer()).toString('latin1');
+  const lines = datev.trim().split('\r\n');
+  assert.match(lines[0], /"Eingangsrechnungen 2026-09"/);
+  const rows = lines.slice(2).map((l) => l.split(';'));
+  // Tankstelle: 119,00 H, Kreditor 70000, Kfz 4530, BU 9 · Papier Meier: 119,00 + 53,50 mit BU 9 und 8 (Bürobedarf 4930)
+  assert.deepEqual(
+    rows.map((r) => [r[0], r[1], r[6], r[7], r[8]].join(' ')).sort(),
+    ['119,00 "H" 70000 4530 "9"', '119,00 "H" 70000 4930 "9"', '53,50 "H" 70000 4930 "8"'].sort(),
+  );
+  const book = await (await req(`/export/purchases?${q}`)).text();
+  assert.match(book, /Tankstelle Süd/);
+  assert.match(book, /Bürobedarf;4930;70000;100,00;19,00;50,00;3,50/);
+  const zip = Buffer.from(await (await req(`/export/zip?${q}`)).arrayBuffer()).toString('latin1');
+  assert.match(zip, /Rechnungseingangsbuch_2026-09-01_2026-09-30\.csv/);
+  assert.match(zip, /Eingangsrechnungen\/2026-09-10_Tankstelle_S/);
+
+  // Kleinunternehmer: brutto ohne BU-Schlüssel
+  await run('UPDATE tenants SET small_business = 1 WHERE id = ?', first.id);
+  try {
+    const ku = Buffer.from(await (await req(`/export/datev?${q}&in=1`)).arrayBuffer()).toString('latin1');
+    assert.ok(ku.trim().split('\r\n').slice(2).every((l) => l.split(';')[8] === '""'));
+  } finally {
+    await run('UPDATE tenants SET small_business = 0 WHERE id = ?', first.id);
+  }
+
+  // 6) Bezahlt / offen, Löschen entfernt die Datei
+  await req(`/purchases/${pm.id}/paid`, { form: { paid_at: '2026-10-01' } });
+  assert.equal((await one('SELECT status, paid_at FROM purchase_invoices WHERE id = ?', pm.id))!.paid_at, '2026-10-01');
+  await req(`/purchases/${pm.id}/open`, { form: {} });
+  assert.equal((await one('SELECT status FROM purchase_invoices WHERE id = ?', pm.id))!.status, 'open');
+  const pdfDraft = (await one('SELECT * FROM purchase_invoices WHERE file_name = ?', 'rechnung.pdf'))!;
+  await req(`/purchases/${pdfDraft.id}/delete`, { form: {} });
+  assert.equal(await one('SELECT 1 FROM purchase_invoices WHERE id = ?', pdfDraft.id), undefined);
+  assert.equal(fs.existsSync(path.join(dataDir, 'verbindlichkeiten', pdfDraft.file_path)), false);
+
+  // Lieferant mit Eingangsrechnungen lässt sich nicht löschen
+  await req(`/contacts/${meier.id}/delete`, { form: {} });
+  assert.ok(await one('SELECT 1 FROM contacts WHERE id = ?', meier.id));
+
+  // Mandantentrennung: anderer Mandant sieht die Belege nicht
+  const other = (await one<{ id: number; disabled: number }>(
+    "SELECT t.id, t.disabled FROM tenants t JOIN memberships m ON m.tenant_id = t.id JOIN users u ON u.id = m.user_id WHERE t.id <> ? AND u.email = 'tina@example.com' ORDER BY t.id LIMIT 1",
+    first.id,
+  ))!;
+  await run('UPDATE tenants SET disabled = 0 WHERE id = ?', other.id);
+  try {
+    await req('/tenant/switch', { form: { tenant_id: String(other.id) } });
+    assert.doesNotMatch(await (await req('/purchases')).text(), /xrechnung\.xml|PM-1/);
+    assert.equal((await req(`/purchases/${xr.id}`)).status, 404);
+    assert.equal((await req(`/purchases/${xr.id}/file`)).status, 404);
+  } finally {
+    await run('UPDATE tenants SET disabled = ? WHERE id = ?', other.disabled, other.id);
+    await req('/tenant/switch', { form: { tenant_id: String(first.id) } });
+  }
+});
+
+test('Nachweise aus der Datenbank werden in die Dateiablage verschoben', opts, async () => {
+  const { migrateProofBlobs } = await import('../src/modules/proofs.ts');
+  const first = (await one<{ id: number }>("SELECT id FROM tenants WHERE name = 'Test GmbH'"))!;
+  const data = fixture('02.01a-INVOICE_uncefact.xml'); // Inhalt egal
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 23);
+  const res = await run(
+    'INSERT INTO proof_documents (tenant_id, name, filename, data, size, pages, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 1, ?, ?)',
+    first.id, 'Altbestand', 'alt.pdf', data, data.length, now, now,
+  );
+  assert.equal(await migrateProofBlobs(), 1);
+  const row = (await one('SELECT * FROM proof_documents WHERE id = ?', res.insertId))!;
+  assert.equal(row.data, null);
+  assert.deepEqual(fs.readFileSync(path.join(process.env.SCHOTTR_DATA_DIR!, 'nachweise', row.path)), data);
+  assert.equal(await migrateProofBlobs(), 0, 'läuft nur einmal');
+  await req('/tenant/switch', { form: { tenant_id: String(first.id) } });
+  assert.deepEqual(Buffer.from(await (await req(`/proofs/${row.id}/file`)).arrayBuffer()), data);
 });

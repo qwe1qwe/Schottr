@@ -45,6 +45,10 @@ const ACTIONS: Record<string, string> = {
   'export.datev': 'DATEV-Export',
   'export.journal': 'Export Rechnungsausgangsbuch',
   'export.zip': 'Export Belege (ZIP)',
+  'export.purchases': 'Export Rechnungseingangsbuch',
+  'purchase.import': 'E-Rechnung übernommen',
+  'purchase.update': 'Eingangsrechnung geändert',
+  'purchase.delete': 'Eingangsrechnung gelöscht',
 };
 const actionLabel = (a: string) => ACTIONS[a] ?? a.replace(/^admin\./, 'Admin: ');
 
