@@ -427,3 +427,79 @@ test('Nachweisdokumentationen', opts, async () => {
   assert.ok(await one('SELECT 1 FROM proof_documents WHERE id = ?', proof.id));
   await assert.rejects(run('DELETE FROM document_proofs WHERE document_id = ?', Number(id)), /Festgeschriebene/);
 });
+
+test('Stornorechnungen lassen sich nicht duplizieren', opts, async () => {
+  const storno = (await one<{ id: number; tenant_id: number }>("SELECT id, tenant_id FROM documents WHERE type_code = '381' LIMIT 1"))!;
+  await req('/tenant/switch', { form: { tenant_id: String(storno.tenant_id) } });
+  const before = (await one<{ n: number }>("SELECT COUNT(*) n FROM documents WHERE type_code = '381'"))!.n;
+  assert.doesNotMatch(await (await req(`/invoices/${storno.id}`)).text(), /\/duplicate"/);
+  await req(`/invoices/${storno.id}/duplicate`, { form: {} });
+  assert.equal((await one<{ n: number }>("SELECT COUNT(*) n FROM documents WHERE type_code = '381'"))!.n, before);
+});
+
+test('Nachträgliche Bearbeitung festgeschriebener Rechnungen', opts, async () => {
+  const first = (await one<{ id: number }>("SELECT id FROM tenants WHERE name = 'Test GmbH'"))!;
+  await req('/tenant/switch', { form: { tenant_id: String(first.id) } });
+  const contact = (await one<{ id: number }>("SELECT id FROM contacts WHERE company = 'Kunde AG'"))!;
+  let res = await req('/invoices', {
+    form: {
+      contact_id: String(contact.id), type_code: '380', issue_date: '2026-11-10', due_date: '2026-11-24', service_mode: 'date',
+      service_date: '2026-11-10', 'item_title[]': 'Vor Korrektur', 'item_description[]': '', 'item_quantity[]': '1',
+      'item_unit[]': 'LS', 'item_price[]': '100', 'item_vat[]': '1900',
+    },
+  });
+  const id = location(res).split('/').pop()!;
+  await req(`/invoices/${id}/finalize`, { form: {} });
+  const before = (await one('SELECT number, pdf FROM documents WHERE id = ?', Number(id)))!;
+  const counter = (await one<{ value: number }>("SELECT `value` FROM counters WHERE tenant_id = ? AND kind = 'invoice'", first.id))!.value;
+
+  // Bestätigungsseite liefert einen 6-stelligen Code (nur als CSS-Pseudoelement)
+  const pageHtml = await (await req(`/invoices/${id}/correct`)).text();
+  const code = [...pageHtml.matchAll(/<span data-c="([A-Z0-9])"><\/span>/g)].map((m) => m[1]).join('');
+  assert.equal(code.length, 6);
+
+  // falscher Code → nichts passiert
+  res = await req(`/invoices/${id}/correct`, { form: { reason: 'Anschrift korrigiert', code: 'XXXXXX' } });
+  assert.equal(res.status, 400);
+  assert.ok((await one('SELECT finalized_at FROM documents WHERE id = ?', Number(id)))!.finalized_at);
+
+  // richtiger Code, aber ohne ausreichenden Grund → nichts passiert
+  res = await req(`/invoices/${id}/correct`, { form: { reason: 'kurz', code: code.toLowerCase() } });
+  assert.equal(res.status, 400);
+
+  // korrekt → geöffnet, alte Fassung archiviert
+  res = await req(`/invoices/${id}/correct`, { form: { reason: 'Positionstext korrigiert', code } });
+  assert.equal(location(res), `/invoices/${id}/edit`);
+  const opened = (await one('SELECT * FROM documents WHERE id = ?', Number(id)))!;
+  assert.equal(opened.finalized_at, null);
+  assert.equal(opened.revision, 1);
+  assert.equal(opened.number, before.number);
+  const v1 = (await one('SELECT * FROM document_versions WHERE document_id = ? AND version = 1', Number(id)))!;
+  assert.equal(v1.reason, 'Positionstext korrigiert');
+  assert.deepEqual(Buffer.from(v1.pdf), Buffer.from(before.pdf));
+  await assert.rejects(run('UPDATE document_versions SET reason = ? WHERE id = ?', 'x', v1.id), /Archivierte/);
+  await assert.rejects(run('DELETE FROM document_versions WHERE id = ?', v1.id), /Archivierte/);
+  // geöffnete Rechnung kann nicht gelöscht werden
+  await req(`/invoices/${id}/delete`, { form: {} });
+  assert.ok(await one('SELECT 1 FROM documents WHERE id = ?', Number(id)));
+
+  // bearbeiten und erneut festschreiben → gleiche Nummer, kein neuer Zähler
+  await req(`/invoices/${id}`, {
+    form: {
+      contact_id: String(contact.id), type_code: '380', issue_date: '2026-11-10', due_date: '2026-11-24', service_mode: 'date',
+      service_date: '2026-11-10', 'item_title[]': 'Nach Korrektur', 'item_description[]': '', 'item_quantity[]': '1',
+      'item_unit[]': 'LS', 'item_price[]': '120', 'item_vat[]': '1900',
+    },
+  });
+  await req(`/invoices/${id}/finalize`, { form: {} });
+  const after = (await one('SELECT * FROM documents WHERE id = ?', Number(id)))!;
+  assert.ok(after.finalized_at);
+  assert.equal(after.number, before.number);
+  assert.equal(after.gross_total, 14280);
+  assert.equal((await one<{ value: number }>("SELECT `value` FROM counters WHERE tenant_id = ? AND kind = 'invoice'", first.id))!.value, counter);
+  // die Sperre gilt wieder
+  await assert.rejects(run('UPDATE documents SET gross_total = 1 WHERE id = ?', Number(id)), /Festgeschriebene/);
+  // alte Fassung abrufbar
+  assert.equal((await req(`/invoices/${id}/versions/1/pdf`)).headers.get('content-type'), 'application/pdf');
+  assert.match(await (await req(`/invoices/${id}`)).text(), /Frühere Fassungen/);
+});

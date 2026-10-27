@@ -251,7 +251,8 @@ body.bare { display: grid; place-items: center; min-height: 100vh; padding: 1rem
 
 /* ---------- Artikel im Positionseditor ---------- */
 .add-items { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; }
-.article-search { width: 18rem; }
+.article-picker { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
+.article-search { width: 20rem; }
 .art-no { cursor: pointer; display: inline-block; font-size: .72rem; font-weight: 600; color: var(--accent); background: var(--accent-soft); border-radius: 5px; padding: 0 .4rem; margin-bottom: .25rem; }
 
 /* ---------- Einladungen ---------- */
@@ -296,3 +297,17 @@ body.bare { display: grid; place-items: center; min-height: 100vh; padding: 1rem
 .rename-form { display: flex; gap: .5rem; align-items: center; }
 .rename-form input { max-width: 22rem; padding: .35rem .5rem; }
 .proof-list li { border-bottom: 1px solid var(--line); }
+
+/* ---------- Nachträgliche Bearbeitung ---------- */
+.danger-notice { background: var(--danger-soft); border-color: color-mix(in srgb, var(--danger) 40%, transparent); }
+.confirm-code {
+  display: inline-flex; gap: .35rem; padding: .6rem .8rem; margin-top: .25rem;
+  background: var(--surface-2); border: 1px dashed var(--line-strong); border-radius: 8px;
+  user-select: none; -webkit-user-select: none; pointer-events: none;
+}
+.confirm-code span::before {
+  content: attr(data-c);
+  display: inline-block; width: 1.5rem; text-align: center;
+  font: 600 1.5rem/1.2 ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace; letter-spacing: .05em;
+}
+.code-input { max-width: 10rem; font-family: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace; font-size: 1.2rem; letter-spacing: .3em; text-transform: uppercase; }

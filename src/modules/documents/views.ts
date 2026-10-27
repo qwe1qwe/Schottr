@@ -167,7 +167,11 @@ export function documentForm(
         <div class="add-items">
           <button type="button" class="btn ghost" data-add-item>+ Freie Position</button>
           ${articles.length
-            ? html`<input list="article-list" class="article-search" data-article-search placeholder="Artikel suchen und einfügen …" aria-label="Artikel einfügen">
+            ? html`<div class="article-picker">
+                <input list="article-list" class="article-search" data-article-search placeholder="Artikel suchen (Nr. oder Bezeichnung) …" aria-label="Artikel suchen" autocomplete="off">
+                <button type="button" class="btn" data-article-insert>Artikel einfügen</button>
+                <small class="muted" data-article-msg hidden>Kein passender Artikel gefunden.</small>
+              </div>
               <datalist id="article-list">${articles.map((a) => html`<option value="${articleLabel(a)}"></option>`)}</datalist>
               <script type="application/json" id="article-data">${raw(JSON.stringify(articles.map((a) => ({
                 label: articleLabel(a), number: a.number, title: a.title, description: a.description, unit: a.unit,

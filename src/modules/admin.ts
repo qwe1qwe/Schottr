@@ -32,6 +32,8 @@ const ACTIONS: Record<string, string> = {
   'login.disabled': 'Anmeldung gesperrtes Konto',
   'invoice.finalize': 'Rechnung festgeschrieben',
   'invoice.cancel': 'Rechnung storniert',
+  'invoice.reopen': 'Rechnung nachträglich geöffnet',
+  'invoice.refinalize': 'Rechnung erneut festgeschrieben',
   'settings.update': 'Firmendaten geändert',
   'member.invite': 'Benutzer eingeladen',
   'member.accept': 'Einladung angenommen',

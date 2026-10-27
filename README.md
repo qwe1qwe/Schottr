@@ -112,6 +112,7 @@ DB_PASSWORD=geheim npm start
 - **Rechnungen**: Sie entstehen frei oder mit einem Klick aus einem Angebot.
   - **Entwurf**: frei änderbar, Vorschau-PDF mit Wasserzeichen.
   - **Festschreiben**: vergibt die fortlaufende Rechnungsnummer und friert alle Daten ein (Snapshot). Dabei werden das ZUGFeRD-PDF und die XRechnung-XML einmalig erzeugt und gespeichert.
+  - **Nachträglich bearbeiten** (Ausnahmefall): Nach einer Warnung musst du einen Änderungsgrund angeben und einen zufälligen 6-stelligen Code abtippen. Der Code lässt sich weder markieren noch einfügen. Die bisherige Fassung (PDF, XRechnung, Daten) wird dann unveränderlich als Version archiviert und ins Protokoll geschrieben. Die Rechnung wird wieder zum Entwurf mit derselben Nummer und muss danach erneut festgeschrieben werden. Frühere Fassungen bleiben an der Rechnung abrufbar. Nicht möglich bei Storno- und stornierten Rechnungen sowie bei Teilrechnungen, die bereits abgezogen wurden.
   - **Bezahlt / offen**, **Überfällig** (automatisch), **Stornieren** (erzeugt eine Stornorechnung, Typ 381, mit Bezug auf das Original).
 - **Mahnwesen**: Die Seite *Mahnwesen* listet überfällige Rechnungen und schlägt die nächste Stufe vor, sobald Fälligkeit bzw. Mahnfrist plus Kulanz abgelaufen sind. Es gibt drei Stufen: Zahlungserinnerung, 1. Mahnung und 2. (letzte) Mahnung. Gebühren, Frist und Kulanz stellst du in den Einstellungen ein und kannst sie je Mahnung anpassen. Das Mahn-PDF zeigt Rechnungsbetrag, Gebühren und offenen Gesamtbetrag. Mahngebühren werden ohne Umsatzsteuer ausgewiesen.
 - **Rechnungsarten (BT-3)**: Rechnung (380), Teilrechnung (875), Teilschlussrechnung (876), Schlussrechnung (877) sowie die Stornorechnung (381), die über „Stornieren“ entsteht. Teilschluss- und Schlussrechnungen ziehen festgeschriebene Teilrechnungen desselben Kunden ab. Netto, Steuer und Brutto jeder abgezogenen Teilrechnung werden ausgewiesen (§ 14 Abs. 5 UStG), im XML als `TotalPrepaidAmount`, Rechnungsbezug (BG-3) und Hinweis. Jede Teilrechnung kann nur einmal abgezogen werden.
@@ -133,7 +134,7 @@ DB_PASSWORD=geheim npm start
 |---|---|
 | § 14 Abs. 4 UStG – Pflichtangaben | Vor dem Festschreiben wird geprüft: Anschriften, Steuernummer/USt-IdNr., Leistungsdatum oder -zeitraum, Steuer je Satz, Befreiungshinweis |
 | Fortlaufende, einmalige Rechnungsnummer | Die Nummer wird erst beim Festschreiben vergeben, Entwürfe verbrauchen keine. Nummer, Daten und PDF entstehen in einer Transaktion; schlägt etwas fehl, wird auch die Nummer zurückgegeben. Der Nummernkreis ist pro Jahr oder Monat konfigurierbar. |
-| GoBD – Unveränderbarkeit | MariaDB-Trigger verhindern Änderungen und Löschungen an festgeschriebenen Rechnungen und ihren Positionen. Korrekturen laufen nur über eine Stornorechnung. |
+| GoBD – Unveränderbarkeit | Nachträgliche Bearbeitung nur mit Pflicht-Grund, archivierter Vorfassung und Protokolleintrag. Ansonsten verhindern MariaDB-Trigger Änderungen und Löschungen an festgeschriebenen Rechnungen und ihren Positionen. Korrekturen laufen nur über eine Stornorechnung. |
 | E-Rechnung (Wachstumschancengesetz, EN 16931) | ZUGFeRD 2.x, Profil EN 16931 (PDF/A-3b), sowie XRechnung 3.0 (CII) |
 | DIN 5008 | Anschriftfeld, Info-Block, Falz- und Lochmarken im PDF |
 | Pflichtangaben Geschäftsbrief (GmbH) | Geschäftsführer, Registergericht und -nummer in der Fußzeile |

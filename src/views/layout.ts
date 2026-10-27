@@ -1,6 +1,17 @@
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { html, raw, type SafeHtml, selected } from '../lib/html.ts';
 import { takeFlash } from '../lib/http.ts';
 import type { Ctx, Module } from '../types.ts';
+
+/** Versionskennung der statischen Dateien – erzwingt nach Updates das Neuladen im Browser */
+const ASSET_VERSION = crypto
+  .createHash('sha1')
+  .update(['app.css', 'app.js'].map((f) => fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '../../public', f))).join(''))
+  .digest('hex')
+  .slice(0, 10);
 
 let navItems: NonNullable<Module['nav']>[] = [];
 export function setNav(items: NonNullable<Module['nav']>[]) {
@@ -35,9 +46,9 @@ export function page(c: Ctx, opts: PageOptions) {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${opts.title} · Schottr</title>
-<link rel="stylesheet" href="/static/app.css">
+<link rel="stylesheet" href="/static/app.css?v=${ASSET_VERSION}">
 <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
-<script src="/static/app.js" defer></script>
+<script src="/static/app.js?v=${ASSET_VERSION}" defer></script>
 </head>
 <body>
 <div class="shell">
@@ -101,7 +112,7 @@ export function barePage(
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${title} · Schottr</title>
-<link rel="stylesheet" href="/static/app.css">
+<link rel="stylesheet" href="/static/app.css?v=${ASSET_VERSION}">
 <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
 </head>
 <body class="bare">

@@ -16,6 +16,13 @@
     if (el instanceof HTMLElement && el.hasAttribute('data-autosubmit')) el.closest('form')?.requestSubmit();
   });
 
+  // Bestätigungscodes müssen abgetippt werden – Einfügen unterbinden
+  for (const type of ['paste', 'drop']) {
+    document.addEventListener(type, (e) => {
+      if (e.target instanceof HTMLElement && e.target.hasAttribute('data-no-paste')) e.preventDefault();
+    });
+  }
+
   // Ganze Tabellenzeile klickbar
   document.addEventListener('click', (e) => {
     const target = e.target;
@@ -34,10 +41,9 @@
   document.addEventListener('submit', (e) => {
     const f = e.target;
     if (e.defaultPrevented || !(f instanceof HTMLFormElement) || f.method.toLowerCase() !== 'post') return;
-    if (f.enctype === 'multipart/form-data') return;
     const fields = [];
     for (const el of f.elements) {
-      if (!el.name || el.name === '_csrf' || SKIP.has(el.type) || el.disabled) continue;
+      if (!el.name || el.name === '_csrf' || SKIP.has(el.type) || el.disabled || el.hasAttribute('data-no-paste')) continue;
       if (el.type === 'checkbox' || el.type === 'radio') fields.push([el.name, el.value, el.checked]);
       else fields.push([el.name, el.value]);
     }
@@ -161,12 +167,25 @@
     } catch {
       articles = [];
     }
+    const msg = form.querySelector('[data-article-msg]');
     const isEmpty = (row) =>
       !row.querySelector('[name="item_title[]"]').value.trim() && !row.querySelector('[name="item_price[]"]').value.trim();
+
+    /** exakter Treffer (Auswahl aus der Vorschlagsliste) oder – wenn erlaubt – erster Treffer im Text */
+    const find = (query, fuzzy) => {
+      const q = query.trim().toLowerCase();
+      if (!q) return null;
+      const exact = articles.find((a) => a.label.toLowerCase() === q || (a.number && a.number.toLowerCase() === q));
+      if (exact || !fuzzy) return exact || null;
+      return articles.find((a) => a.label.toLowerCase().includes(q) || (a.description || '').toLowerCase().includes(q)) || null;
+    };
+
     let inserting = false;
-    const insert = () => {
-      const a = articles.find((x) => x.label === articleSearch.value);
-      if (!a || inserting) return;
+    const insert = (fuzzy) => {
+      if (inserting) return;
+      const a = find(articleSearch.value, fuzzy);
+      if (msg) msg.hidden = !!a || !fuzzy || !articleSearch.value.trim();
+      if (!a) return;
       inserting = true;
       articleSearch.value = '';
       const last = tbody.querySelector('tr.item:last-child');
@@ -188,33 +207,19 @@
       qty.select();
       inserting = false;
     };
-    // Auswahl aus der Vorschlagsliste löst „input“ aus, Tippen + Verlassen „change“
-    articleSearch.addEventListener('input', insert);
-    articleSearch.addEventListener('change', insert);
+    // Klick auf einen Vorschlag → sofort einfügen; Tippen allein fügt nichts ein
+    articleSearch.addEventListener('input', (e) => {
+      if (msg) msg.hidden = true;
+      if (!e.inputType || e.inputType === 'insertReplacementText') insert(false);
+    });
     articleSearch.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') {
         e.preventDefault();
-        insert();
+        insert(true);
       }
     });
+    form.querySelector('[data-article-insert]')?.addEventListener('click', () => insert(true));
   }
-
-  form.querySelector('[data-add-item]').addEventListener('click', () => addRow());
-
-  tbody.addEventListener('click', (e) => {
-    // Artikelbezug einer Position lösen (Werte bleiben als Freitext erhalten)
-    const tag = e.target instanceof Element && e.target.closest('.art-no');
-    if (tag) {
-      tag.hidden = true;
-      tag.closest('tr').querySelector('[name="item_article[]"]').value = '';
-      return;
-    }
-    const btn = e.target instanceof Element && e.target.closest('.remove');
-    if (!btn) return;
-    btn.closest('tr').remove();
-    if (!tbody.querySelector('tr.item')) addRow(false);
-    recalc();
-  });
 
   form.addEventListener('input', (e) => {
     if (e.target instanceof HTMLTextAreaElement) autogrow(e.target);

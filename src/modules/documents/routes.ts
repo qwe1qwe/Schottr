@@ -12,6 +12,7 @@ import { buildDocumentData, checkInvoice, xrechnungWarnings, dueAmount, INVOICE_
 import { articleOptions } from '../articles.ts';
 import { dunningSection } from '../dunning.ts';
 import { audit } from '../../lib/audit.ts';
+import { reopenBlocker, versionsSection } from './correction.ts';
 import { getLogo } from '../../lib/logo.ts';
 import { appendPdfs } from '../../lib/pdfmerge.ts';
 import { getProofFiles, getProofIds, proofOptions } from '../proofs.ts';
@@ -111,7 +112,8 @@ async function finalize(t: Tenant, doc: Doc): Promise<void> {
     const locked = await one('SELECT finalized_at FROM documents WHERE id = ? FOR UPDATE', doc.id);
     if (!locked || locked.finalized_at) throw new UserError('Diese Rechnung ist bereits festgeschrieben.');
 
-    const number = await nextNumber(t.id, 'invoice', t.invoice_number_format, doc.issue_date);
+    // Nachträglich geöffnete Rechnungen behalten ihre Nummer
+    const number = doc.number ?? await nextNumber(t.id, 'invoice', t.invoice_number_format, doc.issue_date);
     const data = buildDocumentData({ tenant: t, contact, doc, items, number, draft: false, precedingInvoice, prepayments, proofs });
     const xrechnung = xrechnungWarnings(data).length ? null : buildCii(data, 'xrechnung', ciiAttachments(proofFiles));
     // Nachweise hinten an das ZUGFeRD-PDF anhängen
@@ -121,7 +123,7 @@ async function finalize(t: Tenant, doc: Doc): Promise<void> {
     await run(
       `UPDATE documents SET number = ?, status = ?, snapshot = ?, xml = ?, pdf = ?, finalized_at = ?,
         net_total = ?, tax_total = ?, gross_total = ?, prepaid_total = ?, updated_at = ? WHERE id = ?`,
-      number, doc.type_code === '381' ? 'settled' : (data.due ?? data.gross) <= 0 ? 'paid' : 'open', JSON.stringify(data), xrechnung, pdf, now,
+      number, doc.type_code === '381' ? 'settled' : doc.paid_at || (data.due ?? data.gross) <= 0 ? 'paid' : 'open', JSON.stringify(data), xrechnung, pdf, now,
       data.net, data.tax, data.gross, data.prepaid ?? 0, now, doc.id,
     );
     if (doc.corrects_id) {
@@ -249,6 +251,8 @@ function register(app: App, kind: Kind) {
     );
     const hasXml = !!await one('SELECT 1 FROM documents WHERE id = ? AND xml IS NOT NULL', doc.id);
     const dunnings = kind === 'invoice' ? await dunningSection(c, t, doc) : '';
+    const versions = kind === 'invoice' ? await versionsSection(doc.id) : '';
+    const canReopen = kind === 'invoice' && !!doc.finalized_at && !(await reopenBlocker(doc as any));
 
     let actions: SafeHtml;
     if (kind === 'quote') {
@@ -260,8 +264,11 @@ function register(app: App, kind: Kind) {
       actions = html`
         <a class="btn" href="${base}/${doc.id}/pdf" target="_blank">Vorschau</a>
         <a class="btn" href="${base}/${doc.id}/edit">Bearbeiten</a>
-        ${postButton(c, `${base}/${doc.id}/finalize`, 'Festschreiben', 'btn primary',
-          'Rechnung festschreiben? Danach ist sie unveränderbar und erhält eine fortlaufende Rechnungsnummer.')}`;
+        ${doc.revision
+          ? postButton(c, `${base}/${doc.id}/finalize`, 'Erneut festschreiben', 'btn primary',
+              `Rechnung ${doc.number} als Version ${doc.revision + 1} erneut festschreiben?`)
+          : postButton(c, `${base}/${doc.id}/finalize`, 'Festschreiben', 'btn primary',
+              'Rechnung festschreiben? Danach ist sie unveränderbar und erhält eine fortlaufende Rechnungsnummer.')}`;
     } else {
       actions = html`
         <a class="btn" href="${base}/${doc.id}/pdf" target="_blank">ZUGFeRD-PDF (Industrie)</a>
@@ -297,6 +304,10 @@ function register(app: App, kind: Kind) {
       body: html`
       <div class="status-line">${badge(status)}${doc.type_code === '381' ? html` <span class="tag">Storno</span>` : ''}
         ${doc.subject ? html`<span class="subject">${doc.subject}</span>` : ''}</div>
+      ${isDraftInvoice && doc.revision
+        ? html`<div class="notice danger-notice">Diese Rechnung wird <strong>nachträglich bearbeitet</strong>. Die bisherige Fassung ist als Version ${doc.revision} archiviert.
+            Nach dem Bearbeiten bitte <strong>erneut festschreiben</strong> – bis dahin gilt sie als Entwurf.</div>`
+        : ''}
       ${problems.length
         ? html`<div class="notice"><strong>Vor dem Festschreiben noch erledigen:</strong><ul>${problems.map((p) => html`<li>${p}</li>`)}</ul>
             ${problems.some((p) => p.includes('Einstellungen')) ? html`<a href="/settings">Zu den Einstellungen</a>` : ''}</div>`
@@ -312,6 +323,7 @@ function register(app: App, kind: Kind) {
         ? html`<section><h2 class="section-title">Angehängte Nachweise <span class="count">${data.proofs.length}</span></h2>
             <ul class="plain">${data.proofs.map((p) => html`<li>${p.name} <span class="muted small">· ${p.filename}</span></li>`)}</ul></section>`
         : ''}
+      ${versions}
       ${dunnings}
       ${related.length
         ? html`<section><h2 class="section-title">Verknüpfte Belege</h2>
@@ -319,11 +331,12 @@ function register(app: App, kind: Kind) {
               · ${formatDate(r.issue_date)} · ${formatMoney(r.gross_total)} ${badge(displayStatus(r as any))}</li>`)}</ul></section>`
         : ''}
       <div class="danger-zone">
-        ${postButton(c, `${base}/${doc.id}/duplicate`, 'Duplizieren', 'btn ghost')}
+        ${doc.type_code !== '381' ? postButton(c, `${base}/${doc.id}/duplicate`, 'Duplizieren', 'btn ghost') : ''}
         ${kind === 'quote'
           ? html`${['sent', 'accepted', 'rejected'].filter((s) => s !== doc.status).map((s) =>
               postButton(c, `${base}/${doc.id}/status?to=${s}`, { sent: 'Als versendet markieren', accepted: 'Angenommen', rejected: 'Abgelehnt' }[s]!, 'btn ghost'))}`
           : ''}
+        ${canReopen ? html`<a class="btn danger" href="${base}/${doc.id}/correct">Nachträglich bearbeiten</a>` : ''}
         ${kind === 'invoice' && doc.finalized_at && doc.type_code !== '381' && doc.status !== 'cancelled'
           ? postButton(c, `${base}/${doc.id}/cancel`, 'Stornieren', 'btn danger',
               'Stornorechnung erzeugen? Die Rechnung wird damit storniert. Das lässt sich nicht rückgängig machen.')
@@ -425,7 +438,7 @@ function register(app: App, kind: Kind) {
         throw err;
       }
       const fin = await getDoc(t.id, kind, doc.id);
-      await audit(c, 'invoice.finalize', `${fin?.number} · ${formatMoney(fin?.gross_total ?? 0)}`);
+      await audit(c, doc.revision ? 'invoice.refinalize' : 'invoice.finalize', `${fin?.number}${doc.revision ? ` (Version ${doc.revision + 1})` : ''} · ${formatMoney(fin?.gross_total ?? 0)}`);
       return redirectWith(c, `${base}/${doc.id}`, 'ok', 'Rechnung festgeschrieben. ZUGFeRD-PDF und XRechnung stehen zum Download bereit.');
     });
 

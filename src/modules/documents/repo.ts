@@ -38,6 +38,7 @@ export interface Doc {
   tax_total: number;
   gross_total: number;
   prepaid_total: number;
+  revision: number;
   skonto_percent: number;
   skonto_days: number;
   source_quote_id: number | null;
@@ -64,7 +65,7 @@ export interface Item {
 }
 
 const DOC_COLUMNS =
-  'id, tenant_id, kind, type_code, number, status, contact_id, issue_date, valid_until, due_date, service_date, service_from, service_to, subject, intro, outro, buyer_reference, order_reference, tax_mode, exemption_reason, currency, net_total, tax_total, gross_total, prepaid_total, skonto_percent, skonto_days, source_quote_id, corrects_id, snapshot, finalized_at, paid_at, created_at, updated_at';
+  'id, tenant_id, kind, type_code, number, status, contact_id, issue_date, valid_until, due_date, service_date, service_from, service_to, subject, intro, outro, buyer_reference, order_reference, tax_mode, exemption_reason, currency, net_total, tax_total, gross_total, prepaid_total, revision, skonto_percent, skonto_days, source_quote_id, corrects_id, snapshot, finalized_at, paid_at, created_at, updated_at';
 
 export async function getDoc(tenantId: number, kind: Kind, id: number): Promise<Doc | undefined> {
   return await one<Doc>(`SELECT ${DOC_COLUMNS} FROM documents WHERE tenant_id = ? AND kind = ? AND id = ?`, tenantId, kind, id);
@@ -371,6 +372,8 @@ export async function invoiceFromQuote(t: Tenant, quote: Doc, userId: number): P
 }
 
 export async function duplicate(t: Tenant, doc: Doc, userId: number): Promise<number> {
+  // Stornorechnungen entstehen nur über „Stornieren“ mit Bezug auf die Originalrechnung
+  if (doc.type_code === '381') throw new UserError('Stornorechnungen können nicht dupliziert werden.');
   const date = today();
   const input: DraftInput = {
     ...docToInput(doc, await getItems(doc.id)),
@@ -386,6 +389,7 @@ export async function duplicate(t: Tenant, doc: Doc, userId: number): Promise<nu
 
 export async function deleteDraft(doc: Doc) {
   if (doc.finalized_at) throw new UserError('Festgeschriebene Rechnungen können nicht gelöscht werden (GoBD). Bitte stornieren.');
+  if (doc.revision > 0) throw new UserError('Diese Rechnung war bereits festgeschrieben und wird gerade nachträglich bearbeitet – bitte erneut festschreiben statt löschen.');
   await tx(async () => {
     await run('UPDATE documents SET source_quote_id = NULL WHERE source_quote_id = ? AND finalized_at IS NULL', doc.id);
     await run('DELETE FROM documents WHERE id = ?', doc.id);

@@ -377,4 +377,42 @@ export const migrations: { version: number; statements: string[] }[] = [
        THEN ${forbid('Festgeschriebene Rechnungen koennen nicht geaendert werden')}; END IF`,
     ],
   },
+  {
+    version: 6,
+    statements: [
+      // Nachträgliche Bearbeitung festgeschriebener Rechnungen – jede Fassung bleibt erhalten (GoBD)
+      `ALTER TABLE documents ADD COLUMN revision INT NOT NULL DEFAULT 0`,
+      `CREATE TABLE document_versions (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        document_id INT NOT NULL,
+        version INT NOT NULL,
+        number VARCHAR(40) NOT NULL,
+        status VARCHAR(20) NOT NULL,
+        net_total BIGINT NOT NULL,
+        tax_total BIGINT NOT NULL,
+        gross_total BIGINT NOT NULL,
+        snapshot LONGTEXT NOT NULL,
+        xml LONGTEXT NULL,
+        pdf LONGBLOB NULL,
+        finalized_at DATETIME(3) NOT NULL,
+        reason TEXT NOT NULL,
+        reopened_by INT NULL,
+        reopened_by_email VARCHAR(200) NOT NULL DEFAULT '',
+        reopened_at DATETIME(3) NOT NULL,
+        UNIQUE KEY versions_doc (document_id, version),
+        CONSTRAINT versions_document FOREIGN KEY (document_id) REFERENCES documents(id)
+      ) ${TABLE}`,
+      `CREATE TRIGGER versions_no_update BEFORE UPDATE ON document_versions FOR EACH ROW
+       ${forbid('Archivierte Rechnungsversionen koennen nicht geaendert werden')}`,
+      `CREATE TRIGGER versions_no_delete BEFORE DELETE ON document_versions FOR EACH ROW
+       ${forbid('Archivierte Rechnungsversionen koennen nicht geloescht werden')}`,
+      // Die Sperre lässt sich nur über die protokollierte Korrekturfunktion lösen
+      // (Sitzungsvariable @schottr_reopen, nur innerhalb dieser einen Transaktion gesetzt).
+      `DROP TRIGGER documents_immutable`,
+      `CREATE TRIGGER documents_immutable BEFORE UPDATE ON documents FOR EACH ROW
+       IF OLD.finalized_at IS NOT NULL AND COALESCE(@schottr_reopen, 0) <> OLD.id AND (
+         ${['number', 'contact_id', 'issue_date', 'net_total', 'tax_total', 'gross_total', 'prepaid_total', 'skonto_percent', 'skonto_days', 'snapshot', 'xml', 'pdf', 'finalized_at', 'type_code', 'tax_mode'].map(changed).join(' OR ')}
+       ) THEN ${forbid('Festgeschriebene Rechnungen koennen nicht geaendert werden')}; END IF`,
+    ],
+  },
 ];
