@@ -7,6 +7,8 @@ import { isCountryCode, isValidEmail, isValidVatId, normalizeVatId } from '../li
 import { csrfField, page, empty } from '../views/layout.ts';
 import { documentTable } from './documents/views.ts';
 import { purchaseTable } from './purchases/views.ts';
+import { donationTable } from './donations/routes.ts';
+import type { Donation } from './donations/repo.ts';
 import type { App, Ctx, Module, Tenant } from '../types.ts';
 
 /** Art einer Adresse: Kunde (Angebote/Rechnungen), Lieferant (Eingangsrechnungen) oder beides */
@@ -103,11 +105,12 @@ function parseContact(form: Form) {
 
 /** Wie oft eine Adresse als Kunde bzw. als Lieferant verwendet wird */
 async function usage(contactId: number) {
-  const r = await one<{ docs: number; purchases: number }>(
-    `SELECT (SELECT COUNT(*) FROM documents WHERE contact_id = ?) AS docs, (SELECT COUNT(*) FROM purchase_invoices WHERE contact_id = ?) AS purchases`,
-    contactId, contactId,
+  const r = await one<{ docs: number; purchases: number; donations: number }>(
+    `SELECT (SELECT COUNT(*) FROM documents WHERE contact_id = ?) AS docs, (SELECT COUNT(*) FROM purchase_invoices WHERE contact_id = ?) AS purchases,
+       (SELECT COUNT(*) FROM donations WHERE contact_id = ?) + (SELECT COUNT(*) FROM donation_receipts WHERE contact_id = ?) AS donations`,
+    contactId, contactId, contactId, contactId,
   );
-  return { docs: Number(r?.docs ?? 0), purchases: Number(r?.purchases ?? 0) };
+  return { docs: Number(r?.docs ?? 0), purchases: Number(r?.purchases ?? 0), donations: Number(r?.donations ?? 0) };
 }
 
 function kindSelect(current: ContactKind): SafeHtml {
@@ -226,6 +229,11 @@ function register(app: App) {
        WHERE p.tenant_id = ? AND p.contact_id = ? ORDER BY p.issue_date DESC, p.id DESC`,
       t.id, ct.id,
     );
+    const donations = t.nonprofit || (await one('SELECT 1 FROM donations WHERE contact_id = ? LIMIT 1', ct.id))
+      ? await all<Donation & { receipt_number: string | null }>(
+          `SELECT d.*, r.number receipt_number FROM donations d LEFT JOIN donation_receipts r ON r.id = d.receipt_id
+           WHERE d.tenant_id = ? AND d.contact_id = ? ORDER BY d.donation_date DESC, d.id DESC`, t.id, ct.id)
+      : [];
     const quotes = docs.filter((d) => d.kind === 'quote');
     const invoices = docs.filter((d) => d.kind === 'invoice');
     const address = [ct.company, ct.name, ct.street, ct.address_extra, [ct.zip, ct.city].filter(Boolean).join(' '), ct.country !== 'DE' ? ct.country : '']
@@ -239,6 +247,7 @@ function register(app: App) {
         ${isCustomer(ct) ? html`<a class="btn" href="/quotes/new?contact=${ct.id}">Neues Angebot</a>
           <a class="btn" href="/invoices/new?contact=${ct.id}">Neue Rechnung</a>` : ''}
         ${isSupplier(ct) ? html`<a class="btn" href="/purchases/new?contact=${ct.id}">Eingangsrechnung erfassen</a>` : ''}
+        ${t.nonprofit ? html`<a class="btn" href="/donations/new?contact=${ct.id}">Zuwendung erfassen</a>` : ''}
         <a class="btn ghost" href="/contacts/${ct.id}/edit">Bearbeiten</a>`,
       body: html`
       ${ct.archived ? html`<div class="notice">Diese Adresse ist archiviert.</div>` : ''}
@@ -275,6 +284,12 @@ function register(app: App) {
             <h2 class="section-title">Eingangsrechnungen <span class="count">${purchases.length}</span></h2>
             ${purchases.length ? purchaseTable(purchases, false) : html`<p class="muted">Noch keine Eingangsrechnungen.</p>`}
           </section>`
+        : ''}
+      ${donations.length
+        ? html`<section>
+            <h2 class="section-title">Zuwendungen <span class="count">${donations.length}</span></h2>
+            ${donationTable(t, donations, false)}
+          </section>`
         : ''}`,
     });
   });
@@ -291,7 +306,7 @@ function register(app: App) {
       <div class="danger-zone">
         <form method="post" action="/contacts/${ct.id}/archive">${csrfField(c)}
           <button class="btn ghost">${ct.archived ? 'Aus Archiv holen' : 'Archivieren'}</button></form>
-        ${used.docs || used.purchases ? '' : html`<form method="post" action="/contacts/${ct.id}/delete" data-confirm="Adresse endgültig löschen?">${csrfField(c)}
+        ${used.docs || used.purchases || used.donations ? '' : html`<form method="post" action="/contacts/${ct.id}/delete" data-confirm="Adresse endgültig löschen?">${csrfField(c)}
           <button class="btn danger">Löschen</button></form>`}
       </div>`,
     });
@@ -323,7 +338,7 @@ function register(app: App) {
     const t = tenantOf(c);
     const ct = await getContact(t.id, idParam(c)) ?? notFound();
     const used = await usage(ct.id);
-    if (used.docs || used.purchases) {
+    if (used.docs || used.purchases || used.donations) {
       return redirectWith(c, `/contacts/${ct.id}`, 'error', 'Adressen mit Belegen können nur archiviert werden.');
     }
     await run('DELETE FROM contacts WHERE id = ? AND tenant_id = ?', ct.id, t.id);

@@ -8,7 +8,7 @@ import { formatIban } from '../lib/validate.ts';
 import { INVOICE_TYPES, dueAmount, representativeLabel, type DocumentData } from './model.ts';
 
 const FONT_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '../../assets/fonts');
-const FONTS = {
+export const FONTS = {
   regular: path.join(FONT_DIR, 'IBMPlexSans-Regular.woff'),
   bold: path.join(FONT_DIR, 'IBMPlexSans-SemiBold.woff'),
   italic: path.join(FONT_DIR, 'IBMPlexSans-Italic.woff'),

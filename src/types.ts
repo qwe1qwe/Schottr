@@ -35,6 +35,18 @@ export interface Tenant {
   nonprofit: number;
   /** Vorgabe für den Tätigkeitsbereich neuer Rechnungen (siehe lib/nonprofit.ts) */
   default_sphere: string;
+  /** Zuwendungsbestätigungen: begünstigte Zwecke (wird hinter „Förderung“ eingesetzt) */
+  npo_purposes: string;
+  /** Freistellungsbescheid bzw. Anlage zum KSt-Bescheid oder Feststellung nach § 60a AO */
+  npo_notice: 'exemption' | 'assessment';
+  npo_tax_office: string;
+  npo_notice_date: string | null;
+  /** letzter Veranlagungszeitraum laut Freistellungsbescheid */
+  npo_notice_period: string;
+  /** Mitgliedsbeiträge abziehbar? (nicht z. B. bei Sport, § 10b Abs. 1 Satz 8 EStG) */
+  npo_membership_deductible: number;
+  npo_signer: string;
+  donation_receipt_number_format: string;
   payment_days: number;
   quote_valid_days: number;
   quote_number_format: string;
@@ -87,6 +99,7 @@ export type App = Hono<AppEnv>;
  */
 export interface Module {
   name: string;
-  nav?: { label: string; href: string; order: number };
+  /** visible: Menüeintrag nur für passende Mandanten zeigen (z. B. Spenden nur bei gemeinnützigen) */
+  nav?: { label: string; href: string; order: number; visible?: (t: Tenant) => boolean };
   register(app: App): void;
 }

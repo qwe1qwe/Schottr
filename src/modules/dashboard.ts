@@ -13,6 +13,7 @@ import { openLiabilities } from './purchases/routes.ts';
 import { purchaseBadge, purchaseStatus } from './purchases/views.ts';
 import { dueOf, payable, type Purchase } from './purchases/repo.ts';
 import { isSphere, nonprofitLimits, NONPROFIT_ALLOWANCE, SPHERES, type Sphere } from '../lib/nonprofit.ts';
+import { donationTotals } from './donations/repo.ts';
 import type { Module, Tenant } from '../types.ts';
 
 /**
@@ -281,7 +282,10 @@ async function nonprofitLimitsCard(t: Tenant, year: number) {
   const biz = businessIncome(cur, year);
   const prevBiz = businessIncome(prev, year - 1);
   const prevLim = nonprofitLimits(year - 1);
-  const total = SPHERES.reduce((a, x) => a + cur[x.value].s, 0);
+  const gifts = await donationTotals(t.id, year);
+  const giftSum = gifts.money.s + gifts.membership.s + gifts.goods.s;
+  const giftCount = gifts.money.n + gifts.membership.n + gifts.goods.n;
+  const total = SPHERES.reduce((a, x) => a + cur[x.value].s, 0) + giftSum;
   const euro = (v: number) => formatMoney(v).replace(/,00(?=\s?€)/, '');
   const level = (v: number, max: number) => (v > max ? 'danger' : v >= max * 0.8 ? 'warn' : 'ok') as 'ok' | 'warn' | 'danger';
 
@@ -311,11 +315,14 @@ async function nonprofitLimitsCard(t: Tenant, year: number) {
     <p class="small ku-status ku-${fundsState}">${fundsState === 'over'
       ? html`<strong>Über ${euro(lim.funds)}:</strong> Die Mittel müssen zeitnah – spätestens bis Ende des übernächsten Jahres – für die satzungsmäßigen Zwecke verwendet werden.`
       : html`Bis ${euro(lim.funds)} Einnahmen im Jahr entfällt die Pflicht zur zeitnahen Mittelverwendung.
-          Spenden, Mitgliedsbeiträge und Zuschüsse ohne Rechnung zählen mit.`}</p>
+          Enthalten sind Rechnungen und die unter „Spenden“ erfassten Zuwendungen – Zuschüsse und Barkasse zählen ebenfalls mit.`}</p>
     <ul class="plain npo-split small">${SPHERES.map((x) => html`<li>
       <a href="/invoices?year=${year}&amp;sphere=${x.value}" title="${x.hint}">${x.label}</a>
       <span class="muted">${cur[x.value].n} Rechnung(en)</span>
-      <strong class="num">${formatMoney(cur[x.value].s)}</strong></li>`)}</ul>
+      <strong class="num">${formatMoney(cur[x.value].s)}</strong></li>`)}
+      <li><a href="/donations?year=${year}">Spenden und Mitgliedsbeiträge</a>
+        <span class="muted">${giftCount} Zuwendung(en)</span>
+        <strong class="num">${formatMoney(giftSum)}</strong></li></ul>
     <p class="small ${prevBiz.s > prevLim.business ? 'danger-text' : 'muted'}">Vorjahr ${year - 1}: ${formatMoney(prevBiz.s)} in wirtschaftlichen Geschäftsbetrieben
       ${prevBiz.s > prevLim.business ? ` – über der Grenze von ${euro(prevLim.business)}.` : ` – innerhalb der Grenze von ${euro(prevLim.business)}.`}</p>
     <p class="muted small">Brutto aus den festgeschriebenen Rechnungen in Schottr (Stornos abgezogen), zugeordnet nach dem Bereich der Rechnung.

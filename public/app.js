@@ -116,6 +116,16 @@
     sync();
   });
 
+  /* ---------- Zuwendung: Felder je Art (Geld, Mitgliedsbeitrag, Sachzuwendung) ---------- */
+  document.querySelectorAll('[data-donation-form]').forEach((form) => {
+    const sync = () => {
+      const kind = form.querySelector('input[name="kind"]:checked')?.value ?? 'money';
+      form.querySelectorAll('[data-kind-show]').forEach((el) => (el.hidden = !el.dataset.kindShow.split(' ').includes(kind)));
+    };
+    form.querySelectorAll('input[name="kind"]').forEach((r) => r.addEventListener('change', sync));
+    sync();
+  });
+
   /* ---------- Kacheln mit Umschalter (z. B. Lieferanten / Verbindlichkeiten) ---------- */
   document.querySelectorAll('[data-tabs]').forEach((box, n) => {
     const key = `schottr:tab:${location.pathname}:${n}`;

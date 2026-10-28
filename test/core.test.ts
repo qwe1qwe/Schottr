@@ -64,3 +64,28 @@ test('IBAN und USt-IdNr.', () => {
 test('Datumsrechnung', () => {
   assert.equal(addDays('2026-12-25', 14), '2027-01-08');
 });
+
+test('Beträge in Worten (Zuwendungsbestätigung)', async () => {
+  const { amountInWords, numberToWords } = await import('../src/lib/words.ts');
+  assert.equal(amountInWords(125050), 'eintausendzweihundertfünfzig Euro und fünfzig Cent');
+  assert.equal(amountInWords(100), 'ein Euro');
+  assert.equal(amountInWords(1), 'ein Cent');
+  assert.equal(amountInWords(2100), 'einundzwanzig Euro');
+  assert.equal(amountInWords(10100), 'einhunderteins Euro');
+  assert.equal(amountInWords(30000000), 'dreihunderttausend Euro');
+  assert.equal(numberToWords(1_000_000), 'eine Million');
+  assert.equal(numberToWords(2_345_678), 'zwei Millionen dreihundertfünfundvierzigtausendsechshundertachtundsiebzig');
+  assert.equal(numberToWords(17), 'siebzehn');
+  assert.equal(numberToWords(1001), 'eintausendeins');
+});
+
+test('Zuwendungsbestätigung: Bescheid-Gültigkeit nach § 63 Abs. 5 AO', async () => {
+  const { noticeValidUntil, noticeText } = await import('../src/modules/donations/receipt.ts');
+  assert.equal(noticeValidUntil({ npo_notice: 'exemption', npo_notice_date: '2024-02-29' }), '2029-02-28');
+  assert.equal(noticeValidUntil({ npo_notice: 'assessment', npo_notice_date: '2025-06-01' }), '2028-06-01');
+  const text = noticeText({
+    purposes: 'des Sports',
+    notice: { type: 'exemption', taxOffice: 'München', taxNumber: '143/123/45678', date: '2024-05-14', period: '2021 bis 2023' },
+  });
+  assert.match(text, /^Wir sind wegen Förderung des Sports nach dem Freistellungsbescheid bzw\. nach der Anlage zum Körperschaftsteuerbescheid des Finanzamtes München StNr\. 143\/123\/45678 vom 14\.05\.2024 für den letzten Veranlagungszeitraum 2021 bis 2023 nach § 5 Abs\. 1 Nr\. 9/);
+});

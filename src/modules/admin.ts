@@ -324,7 +324,7 @@ function register(app: App) {
 
   app.post('/admin/tenants/:id/delete', async (c) => {
     const t = (await one('SELECT id, name FROM tenants WHERE id = ?', idParam(c))) ?? notFound();
-    if (await one('SELECT 1 FROM documents WHERE tenant_id = ? LIMIT 1', t.id)) {
+    if (await one('SELECT 1 FROM documents WHERE tenant_id = ? UNION ALL SELECT 1 FROM donations WHERE tenant_id = ? LIMIT 1', t.id, t.id)) {
       return redirectWith(c, `/admin/tenants/${t.id}`, 'error', 'Mandanten mit Belegen können nicht gelöscht werden – bitte sperren.');
     }
     await tx(async () => {

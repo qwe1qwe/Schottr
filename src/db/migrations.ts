@@ -502,4 +502,85 @@ export const migrations: { version: number; statements: string[] }[] = [
       `ALTER TABLE documents ADD COLUMN sphere VARCHAR(10) NOT NULL DEFAULT '' AFTER exemption_reason`,
     ],
   },
+  {
+    version: 9,
+    statements: [
+      // Angaben für Zuwendungsbestätigungen (amtliches Muster, BMF-Schreiben vom 7.11.2013)
+      `ALTER TABLE tenants
+        ADD COLUMN npo_purposes VARCHAR(500) NOT NULL DEFAULT '' AFTER default_sphere,
+        ADD COLUMN npo_notice ENUM('exemption', 'assessment') NOT NULL DEFAULT 'exemption' AFTER npo_purposes,
+        ADD COLUMN npo_tax_office VARCHAR(100) NOT NULL DEFAULT '' AFTER npo_notice,
+        ADD COLUMN npo_notice_date DATE NULL AFTER npo_tax_office,
+        ADD COLUMN npo_notice_period VARCHAR(40) NOT NULL DEFAULT '' AFTER npo_notice_date,
+        ADD COLUMN npo_membership_deductible TINYINT(1) NOT NULL DEFAULT 1 AFTER npo_notice_period,
+        ADD COLUMN npo_signer VARCHAR(200) NOT NULL DEFAULT '' AFTER npo_membership_deductible,
+        ADD COLUMN donation_receipt_number_format VARCHAR(40) NOT NULL DEFAULT 'ZB-{YYYY}-{NNNN}' AFTER npo_signer`,
+
+      // Ausgestellte Zuwendungsbestätigungen – das Doppel (§ 50 Abs. 7 EStDV) bleibt als PDF erhalten
+      `CREATE TABLE donation_receipts (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        tenant_id INT NOT NULL,
+        contact_id INT NOT NULL,
+        number VARCHAR(40) NOT NULL,
+        kind ENUM('single', 'collective', 'goods') NOT NULL,
+        issue_date DATE NOT NULL,
+        period_from DATE NOT NULL,
+        period_to DATE NOT NULL,
+        total BIGINT NOT NULL,
+        status ENUM('issued', 'cancelled') NOT NULL DEFAULT 'issued',
+        cancelled_at DATETIME(3) NULL,
+        cancel_reason VARCHAR(300) NOT NULL DEFAULT '',
+        snapshot LONGTEXT NOT NULL,
+        pdf LONGBLOB NOT NULL,
+        created_by INT NULL,
+        created_at DATETIME(3) NOT NULL,
+        UNIQUE KEY receipts_number (tenant_id, number),
+        KEY receipts_date (tenant_id, issue_date),
+        KEY receipts_contact (contact_id),
+        CONSTRAINT receipts_tenant FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
+        CONSTRAINT receipts_contact FOREIGN KEY (contact_id) REFERENCES contacts(id),
+        CONSTRAINT receipts_user FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
+      ) ${TABLE}`,
+      // Inhalt und Nummer einer Bestätigung sind unveränderlich, nur der Status darf auf „storniert“ wechseln
+      `CREATE TRIGGER receipts_immutable BEFORE UPDATE ON donation_receipts FOR EACH ROW
+       IF ${['number', 'contact_id', 'kind', 'issue_date', 'period_from', 'period_to', 'total', 'snapshot', 'pdf'].map(changed).join(' OR ')}
+         OR (OLD.status = 'cancelled' AND NEW.status <> 'cancelled')
+       THEN ${forbid('Zuwendungsbestaetigungen koennen nicht geaendert werden')}; END IF`,
+      `CREATE TRIGGER receipts_no_delete BEFORE DELETE ON donation_receipts FOR EACH ROW
+       ${forbid('Zuwendungsbestaetigungen koennen nicht geloescht werden')}`,
+
+      // Zuwendungen: Geldspenden, Mitgliedsbeiträge und Sachspenden (ideeller Bereich)
+      `CREATE TABLE donations (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        tenant_id INT NOT NULL,
+        contact_id INT NOT NULL,
+        kind ENUM('money', 'membership', 'goods') NOT NULL DEFAULT 'money',
+        donation_date DATE NOT NULL,
+        amount BIGINT NOT NULL,
+        waiver TINYINT(1) NOT NULL DEFAULT 0,
+        description VARCHAR(1000) NOT NULL DEFAULT '',
+        goods_origin ENUM('', 'business', 'private', 'unknown') NOT NULL DEFAULT '',
+        goods_documents TINYINT(1) NOT NULL DEFAULT 0,
+        note VARCHAR(300) NOT NULL DEFAULT '',
+        receipt_id INT NULL,
+        created_by INT NULL,
+        created_at DATETIME(3) NOT NULL,
+        updated_at DATETIME(3) NOT NULL,
+        KEY donations_date (tenant_id, donation_date),
+        KEY donations_contact (contact_id),
+        KEY donations_receipt (receipt_id),
+        CONSTRAINT donations_tenant FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
+        CONSTRAINT donations_contact FOREIGN KEY (contact_id) REFERENCES contacts(id),
+        CONSTRAINT donations_receipt FOREIGN KEY (receipt_id) REFERENCES donation_receipts(id),
+        CONSTRAINT donations_user FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
+      ) ${TABLE}`,
+      // Bestätigte Zuwendungen sind gesperrt – erst nach Storno der Bestätigung wieder änderbar
+      `CREATE TRIGGER donations_locked BEFORE UPDATE ON donations FOR EACH ROW
+       IF OLD.receipt_id IS NOT NULL AND NEW.receipt_id <=> OLD.receipt_id AND (
+         ${['contact_id', 'kind', 'donation_date', 'amount', 'waiver', 'description', 'goods_origin', 'goods_documents'].map(changed).join(' OR ')}
+       ) THEN ${forbid('Bestaetigte Zuwendungen koennen nicht geaendert werden')}; END IF`,
+      `CREATE TRIGGER donations_no_delete BEFORE DELETE ON donations FOR EACH ROW
+       IF OLD.receipt_id IS NOT NULL THEN ${forbid('Bestaetigte Zuwendungen koennen nicht geloescht werden')}; END IF`,
+    ],
+  },
 ];

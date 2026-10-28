@@ -64,7 +64,7 @@ export function page(c: Ctx, opts: PageOptions) {
     <div class="sidebar-panel" id="main-menu">
     ${tenant
       ? html`<nav class="nav">
-          ${navItems.map(
+          ${navItems.filter((n) => !n.visible || n.visible(tenant)).map(
             (n) => html`<a href="${n.href}" class="${isActive(n.href) ? 'active' : ''}">${n.label}</a>`,
           )}
         </nav>`

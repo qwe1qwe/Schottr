@@ -936,3 +936,128 @@ test('Gemeinnütziger Verein: Bereich je Rechnung, Grenzen in der Übersicht, Vo
   assert.doesNotMatch(page, /Gemeinnützigkeit \d{4}/);
   assert.doesNotMatch(await (await req('/invoices/new')).text(), /Bereich \(Gemeinnützigkeit\)/);
 });
+
+test('Spenden: erfassen, Einzel-, Sach- und Sammelbestätigung, Storno', opts, async () => {
+  const t = (await one("SELECT * FROM tenants WHERE name = 'Musikverein Teststadt e. V.'"))!;
+  await req('/tenant/switch', { form: { tenant_id: String(t.id) } });
+  await run('UPDATE tenants SET nonprofit = 1 WHERE id = ?', t.id);
+  const year = Number(new Date().toISOString().slice(0, 4));
+  const d = (m: string) => `${year}-${m}`;
+
+  // Menüpunkt nur bei gemeinnützigen Mandanten
+  let page = await (await req('/')).text();
+  assert.match(page, /href="\/donations"/);
+
+  {
+    const r = await req('/contacts', { form: { name: 'Erika Mustermann', street: 'Hauptstraße 5', zip: '12345', city: 'Teststadt', country: 'DE' } });
+    assert.match(location(r), /^\/contacts\/\d+$/);
+  }
+  const erika = (await one("SELECT id FROM contacts WHERE name = 'Erika Mustermann' AND tenant_id = ?", t.id))!.id;
+  const brauerei = (await one("SELECT id FROM contacts WHERE company = 'Brauerei GmbH' AND tenant_id = ?", t.id))!.id;
+
+  const donate = async (form: Record<string, string>) => {
+    const r = await req('/donations', { form: { contact_id: String(erika), kind: 'money', ...form } });
+    const id = location(r).split('/').pop()!;
+    assert.match(id, /^\d+$/, `Zuwendung angelegt: ${JSON.stringify(form)}`);
+    return Number(id);
+  };
+  const m1 = await donate({ donation_date: d('01-15'), amount: '100' });
+  const m2 = await donate({ donation_date: d('01-20'), amount: '50,50', waiver: '1' });
+  const beitrag = await donate({ donation_date: d('01-02'), amount: '60', kind: 'membership' });
+  const sache = await donate({ donation_date: d('01-10'), amount: '800', kind: 'goods', description: 'Notenständer, 10 Stück, neuwertig', goods_origin: 'private' });
+  const fremd = await donate({ contact_id: String(brauerei), donation_date: d('01-03'), amount: '1000' });
+
+  // Ohne Bescheid-Angaben keine Bestätigung
+  let r = await req(`/donations/${m1}/receipt`, { form: {} });
+  assert.equal((await one('SELECT receipt_id FROM donations WHERE id = ?', m1))!.receipt_id, null);
+  page = await (await req('/donations')).text();
+  assert.match(page, /Für Zuwendungsbestätigungen fehlt noch etwas/);
+
+  // Bescheid eintragen (Musik = abziehbare Beiträge)
+  await run(
+    `UPDATE tenants SET npo_purposes = ?, npo_notice = 'exemption', npo_tax_office = 'Teststadt', npo_notice_date = ?, npo_notice_period = '2021 bis 2023',
+       npo_signer = 'Kai Kasse, Kassenwart', npo_membership_deductible = 1, donation_receipt_number_format = 'ZB-{YYYY}-{NNNN}' WHERE id = ?`,
+    'von Kunst und Kultur (§ 52 Abs. 2 Satz 1 Nr. 5 AO)', `${year - 1}-05-14`, t.id,
+  );
+
+  // Sachzuwendung einzeln bestätigen
+  r = await req(`/donations/${sache}/receipt`, { form: {} });
+  assert.match(location(r), /^\/donations\/receipts\/\d+$/);
+  const sachReceipt = (await one('SELECT * FROM donation_receipts WHERE id = ?', Number(location(r).split('/').pop())))!;
+  assert.equal(sachReceipt.kind, 'goods');
+  assert.equal(sachReceipt.number, `ZB-${year}-0001`);
+  assert.equal(sachReceipt.total, 80000);
+  assert.equal(Buffer.from(sachReceipt.pdf).subarray(0, 5).toString(), '%PDF-');
+  const snap = JSON.parse(sachReceipt.snapshot);
+  assert.equal(snap.goods.origin, 'private');
+  assert.deepEqual(snap.donor, ['Erika Mustermann', 'Hauptstraße 5', '12345 Teststadt']);
+
+  // Bestätigte Zuwendung ist gesperrt – auch in der Datenbank
+  await assert.rejects(run('UPDATE donations SET amount = 1 WHERE id = ?', sache), /Bestaetigte Zuwendungen/);
+  await assert.rejects(run('UPDATE donation_receipts SET total = 1 WHERE id = ?', sachReceipt.id), /Zuwendungsbestaetigungen/);
+  await assert.rejects(run('DELETE FROM donation_receipts WHERE id = ?', sachReceipt.id), /Zuwendungsbestaetigungen/);
+  r = await req(`/donations/${sache}/delete`, { form: {} });
+  assert.ok(await one('SELECT 1 FROM donations WHERE id = ?', sache), 'nicht gelöscht');
+
+  // Jahresabschluss: Erika bekommt eine Sammelbestätigung (Spende, Aufwandsspende, Beitrag), die Brauerei eine Einzelbestätigung
+  page = await (await req(`/donations?year=${year}`)).text();
+  assert.match(page, /4 unbestätigte Zuwendung\(en\) von 2 Zuwendenden/);
+  r = await req(`/donations/receipts/collective?year=${year}`, { form: {} });
+  const receipts = await all('SELECT * FROM donation_receipts WHERE tenant_id = ? ORDER BY id', t.id);
+  assert.equal(receipts.length, 3);
+  const sammel = receipts.find((x) => x.contact_id === erika && x.kind === 'collective')!;
+  const einzel = receipts.find((x) => x.contact_id === brauerei)!;
+  assert.equal(sammel.total, 10000 + 5050 + 6000);
+  assert.equal(String(sammel.period_from), `${year}-01-01`);
+  assert.equal(String(sammel.period_to), `${year}-12-31`);
+  assert.equal(einzel.kind, 'single');
+  const items = JSON.parse(sammel.snapshot).items;
+  assert.deepEqual(items.map((i: any) => [i.kind, i.waiver, i.amount]), [['membership', false, 6000], ['money', false, 10000], ['money', true, 5050]]);
+  for (const id of [m1, m2, beitrag, fremd]) assert.ok((await one('SELECT receipt_id FROM donations WHERE id = ?', id))!.receipt_id);
+
+  // PDF abrufbar, Sammelbestätigung hat die Anlage auf Seite 2
+  r = await req(`/donations/receipts/${sammel.id}/pdf`);
+  assert.equal(r.headers.get('content-type'), 'application/pdf');
+  const pdf = Buffer.from(await r.arrayBuffer()).toString('latin1');
+  assert.equal([...pdf.matchAll(/\/Type \/Page\b/g)].length, 2);
+
+  // Storno: Doppel bleibt, Zuwendungen werden frei, neue Bestätigung bekommt neue Nummer
+  r = await req(`/donations/receipts/${sammel.id}/cancel`, { form: { reason: 'Betrag korrigiert' } });
+  assert.equal((await one('SELECT status FROM donation_receipts WHERE id = ?', sammel.id))!.status, 'cancelled');
+  assert.equal((await one('SELECT receipt_id FROM donations WHERE id = ?', m2))!.receipt_id, null);
+  r = await req(`/donations/${m2}`, { form: { contact_id: String(erika), kind: 'money', donation_date: d('01-20'), amount: '55', waiver: '1' } });
+  assert.equal((await one('SELECT amount FROM donations WHERE id = ?', m2))!.amount, 5500);
+  r = await req(`/donations/receipts/collective?year=${year}&contact=${erika}`, { form: {} });
+  const neu = (await one("SELECT * FROM donation_receipts WHERE tenant_id = ? AND status = 'issued' AND kind = 'collective'", t.id))!;
+  assert.equal(neu.total, 10000 + 5500 + 6000);
+  assert.equal(neu.number, `ZB-${year}-0004`);
+
+  // Nicht abziehbare Mitgliedsbeiträge (z. B. Sportverein) werden nicht bestätigt
+  await run('UPDATE tenants SET npo_membership_deductible = 0 WHERE id = ?', t.id);
+  const b2 = await donate({ donation_date: d('02-01'), amount: '60', kind: 'membership' });
+  r = await req(`/donations/${b2}/receipt`, { form: {} });
+  assert.equal((await one('SELECT receipt_id FROM donations WHERE id = ?', b2))!.receipt_id, null);
+  page = await (await req(`/donations/${b2}`)).text();
+  assert.match(page, /ohne Bestätigung/);
+
+  // Zu alter Bescheid (§ 63 Abs. 5 AO) → keine Bestätigung
+  await run('UPDATE tenants SET npo_notice_date = ? WHERE id = ?', `${year - 6}-01-01`, t.id);
+  const m3 = await donate({ donation_date: d('02-02'), amount: '20' });
+  r = await req(`/donations/${m3}/receipt`, { form: {} });
+  assert.equal((await one('SELECT receipt_id FROM donations WHERE id = ?', m3))!.receipt_id, null);
+
+  // Übersicht: Spenden zählen zu den Einnahmen (§ 55 AO)
+  page = await (await req('/')).text();
+  assert.match(page, /Spenden und Mitgliedsbeiträge/);
+
+  // Adressen mit Zuwendungen lassen sich nicht löschen
+  r = await req(`/contacts/${erika}/delete`, { form: {} });
+  assert.ok(await one('SELECT 1 FROM contacts WHERE id = ?', erika));
+
+  // ohne Gemeinnützigkeit kein Menüpunkt und kein Zugriff
+  await run('UPDATE tenants SET nonprofit = 0 WHERE id = ?', t.id);
+  page = await (await req('/')).text();
+  assert.doesNotMatch(page, /href="\/donations"/);
+  r = await req('/donations');
+  assert.equal(r.status, 303);
+});

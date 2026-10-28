@@ -222,6 +222,13 @@ input.num { text-align: right; }
 .notice { background: var(--warn-soft); border: 1px solid var(--warn-line); border-radius: 8px; padding: .75rem 1rem; margin-bottom: 1rem; }
 .notice ul { margin: .4rem 0; padding-left: 1.2rem; }
 .notice.soft { background: var(--surface-2); border-color: var(--line); }
+.year-select { width: auto; }
+.bare-fieldset { border: 0; padding: 0; margin: 0; }
+.bare-fieldset legend { padding: 0; margin-bottom: .35rem; }
+.row-card { display: flex; gap: 1rem; align-items: center; justify-content: space-between; flex-wrap: wrap; }
+.row-card p { margin: .25rem 0 0; }
+.inline-form { display: flex; gap: .5rem; flex-wrap: wrap; align-items: center; }
+.inline-form input { width: auto; flex: 1 1 14rem; }
 .empty { text-align: center; padding: 3rem 1rem; border: 1px dashed var(--line-strong); border-radius: var(--radius); color: var(--muted); }
 
 /* ---------- Werkzeugleiste, Tabs ---------- */

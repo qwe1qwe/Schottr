@@ -4,7 +4,7 @@ import { html, checked, selected, type SafeHtml } from '../lib/html.ts';
 import { readForm, str, redirectWith, requireOwner, tenantOf, userOf, idParam, notFound } from '../lib/http.ts';
 import { isValidFormat } from '../lib/numbering.ts';
 import { formatAmount, parseDecimal } from '../lib/money.ts';
-import { formatDate } from '../lib/dates.ts';
+import { formatDate, isIsoDate } from '../lib/dates.ts';
 import { audit } from '../lib/audit.ts';
 import { getLogo } from '../lib/logo.ts';
 import { canEmbedImage } from '../einvoice/pdf.ts';
@@ -208,6 +208,31 @@ function register(app: App) {
             </div>
           </div>
         </fieldset>
+        <fieldset class="card" id="zuwendungen" data-show-if="nonprofit">
+          <legend>Zuwendungsbestätigungen</legend>
+          <p class="muted small">Angaben für Spendenquittungen nach amtlichem Muster – wie im Freistellungsbescheid (bzw. in der Anlage zum Körperschaftsteuerbescheid) oder im Bescheid nach § 60a AO. Als Steuernummer wird die oben eingetragene verwendet.</p>
+          <div class="grid-2">
+            <label class="span-2">Begünstigte Zwecke
+              <input name="npo_purposes" maxlength="500" value="${t.npo_purposes}" ${owner ? '' : html`disabled`} placeholder="z. B. von Kunst und Kultur (§ 52 Abs. 2 Satz 1 Nr. 5 AO)">
+              <small class="muted">wird hinter „wegen Förderung …“ eingesetzt, z. B. „des Sports“ oder „der Jugendhilfe“</small></label>
+            <label>Grundlage
+              <select name="npo_notice" ${owner ? '' : html`disabled`}>
+                <option value="exemption"${selected('exemption', t.npo_notice)}>Freistellungsbescheid / Anlage zum KSt-Bescheid</option>
+                <option value="assessment"${selected('assessment', t.npo_notice)}>Feststellungsbescheid nach § 60a AO (neu gegründet)</option>
+              </select></label>
+            <label>Finanzamt <input name="npo_tax_office" maxlength="100" value="${t.npo_tax_office}" ${owner ? '' : html`disabled`} placeholder="z. B. München"></label>
+            <label>Datum des Bescheids <input type="date" name="npo_notice_date" value="${t.npo_notice_date ?? ''}" ${owner ? '' : html`disabled`}>
+              <small class="muted">anerkannt 5 Jahre (Freistellung) bzw. 3 Jahre (§ 60a AO), § 63 Abs. 5 AO</small></label>
+            <label>Letzter Veranlagungszeitraum <input name="npo_notice_period" maxlength="40" value="${t.npo_notice_period}" ${owner ? '' : html`disabled`} placeholder="z. B. 2021 bis 2023">
+              <small class="muted">nur beim Freistellungsbescheid</small></label>
+            <label>Unterzeichner <input name="npo_signer" maxlength="200" value="${t.npo_signer}" ${owner ? '' : html`disabled`} placeholder="z. B. Kai Kasse, Kassenwart">
+              <small class="muted">steht unter der Unterschriftslinie</small></label>
+            <label>Nummernkreis <input name="donation_receipt_number_format" maxlength="40" value="${t.donation_receipt_number_format}" ${owner ? '' : html`disabled`}></label>
+            <label class="check span-2"><input type="checkbox" name="npo_membership_deductible" value="1"${checked(t.npo_membership_deductible)} ${owner ? '' : html`disabled`}>
+              Mitgliedsbeiträge sind als Sonderausgaben abziehbar</label>
+            <small class="muted span-2">Nicht abziehbar sind Beiträge an Vereine, die den Sport, kulturelle Betätigungen der Freizeitgestaltung, Heimatpflege oder Zwecke nach § 52 Abs. 2 Satz 1 Nr. 23 AO (z. B. Kleingärtnerei, Brauchtum, Tierzucht) fördern (§ 10b Abs. 1 Satz 8 EStG). Dann werden Beiträge nicht bestätigt, und auf Spendenquittungen steht die Bestätigung, dass es sich nicht um einen solchen Mitgliedsbeitrag handelt.</small>
+          </div>
+        </fieldset>
         <fieldset class="card">
           <legend>Umsatzsteuer</legend>
           <label class="check"><input type="checkbox" name="small_business" value="1"${checked(t.small_business)} ${owner ? '' : html`disabled`}>
@@ -266,6 +291,15 @@ function register(app: App) {
     v.nonprofit = str(form, 'nonprofit') === '1' ? 1 : 0;
     const sphere = str(form, 'default_sphere');
     v.default_sphere = isSphere(sphere) ? sphere : t.default_sphere || 'business';
+    v.npo_purposes = str(form, 'npo_purposes', 500);
+    v.npo_notice = str(form, 'npo_notice') === 'assessment' ? 'assessment' : 'exemption';
+    v.npo_tax_office = str(form, 'npo_tax_office', 100);
+    const noticeDate = str(form, 'npo_notice_date');
+    if (noticeDate && !isIsoDate(noticeDate)) errors0.push('Datum des Bescheids ist ungültig.');
+    v.npo_notice_period = str(form, 'npo_notice_period', 40);
+    v.npo_signer = str(form, 'npo_signer', 200);
+    v.npo_membership_deductible = str(form, 'npo_membership_deductible') === '1' ? 1 : 0;
+    v.donation_receipt_number_format = str(form, 'donation_receipt_number_format', 40) || 'ZB-{YYYY}-{NNNN}';
 
     const errors: string[] = [...errors0];
     if (!v.name) errors.push(v.org_type === 'association' ? 'Der Vereinsname darf nicht leer sein.' : 'Firmenname darf nicht leer sein.');
@@ -274,15 +308,15 @@ function register(app: App) {
     if (v.bic && !isValidBic(String(v.bic))) errors.push('Die BIC ist ungültig.');
     if (v.vat_id && !isValidVatId(String(v.vat_id))) errors.push('Die USt-IdNr. hat kein gültiges Format.');
     if (v.email && !isValidEmail(String(v.email))) errors.push('Die E-Mail-Adresse ist ungültig.');
-    for (const k of ['quote_number_format', 'invoice_number_format', 'customer_number_format', 'supplier_number_format']) {
+    for (const k of ['quote_number_format', 'invoice_number_format', 'customer_number_format', 'supplier_number_format', 'donation_receipt_number_format']) {
       if (!isValidFormat(String(v[k]))) errors.push(`Nummernformat „${v[k]}“ braucht einen Platzhalter {NNN…}.`);
     }
     if (errors.length) return redirectWith(c, '/settings', 'error', errors.join(' '));
 
     const keys = Object.keys(v);
     await run(
-      `UPDATE tenants SET ${keys.map((k) => `${k} = ?`).join(', ')} WHERE id = ?`,
-      ...keys.map((k) => v[k]), t.id,
+      `UPDATE tenants SET ${keys.map((k) => `${k} = ?`).join(', ')}, npo_notice_date = ? WHERE id = ?`,
+      ...keys.map((k) => v[k]), isIsoDate(noticeDate) ? noticeDate : null, t.id,
     );
     await audit(c, 'settings.update');
     return redirectWith(c, '/settings', 'ok', 'Einstellungen gespeichert.');
