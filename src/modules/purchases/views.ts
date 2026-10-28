@@ -1,7 +1,9 @@
+import { SPHERES } from '../../lib/nonprofit.ts';
 import { html, raw, selected, checked, type SafeHtml } from '../../lib/html.ts';
 import { formatDate, today } from '../../lib/dates.ts';
 import { formatAmount, formatMoney, formatQuantity, formatRate } from '../../lib/money.ts';
-import { EXPENSE_CATEGORIES, categoryLabel } from '../../lib/expenses.ts';
+import { EXPENSE_CATEGORIES, categoriesFor, categoryLabel } from '../../lib/expenses.ts';
+import { tenantOf } from '../../lib/http.ts';
 import { unitShort } from '../../lib/units.ts';
 import { csrfField } from '../../views/layout.ts';
 import type { Ctx } from '../../types.ts';
@@ -87,9 +89,20 @@ function taxRowHtml(t?: PurchaseTax): SafeHtml {
   </tr>`;
 }
 
+/** Kostenarten: bei Vereinen zuerst die Vereins-Kostenarten, dann die allgemeinen (als Gruppen) */
+function categoryOptions(c: Ctx, current: string): SafeHtml {
+  const list = categoriesFor(tenantOf(c));
+  const option = (x: { key: string; label: string }) => html`<option value="${x.key}"${selected(x.key, current)}>${x.label}</option>`;
+  const missing = EXPENSE_CATEGORIES.find((x) => x.key === current && !list.some((y) => y.key === current));
+  const assoc = list.filter((x) => x.association);
+  if (!assoc.length) return html`${list.map(option)}${missing ? option(missing) : ''}`;
+  return html`<optgroup label="Verein">${assoc.map(option)}</optgroup>
+    <optgroup label="Allgemein">${list.filter((x) => !x.association).map(option)}${missing ? option(missing) : ''}</optgroup>`;
+}
+
 export function purchaseForm(
   c: Ctx, action: string, d: PurchaseInput, suppliers: Contact[],
-  opts: { locked?: Purchase; taxes?: PurchaseTax[]; preview?: SafeHtml; smallBusiness?: boolean } = {},
+  opts: { locked?: Purchase; taxes?: PurchaseTax[]; preview?: SafeHtml; smallBusiness?: boolean; defaultSphere?: string | null } = {},
 ): SafeHtml {
   const locked = opts.locked;
   const fields = html`
@@ -112,8 +125,12 @@ export function purchaseForm(
           </div>`}
       <div class="grid-2 ${locked ? '' : 'spaced-top'}">
         <label>Kostenart
-          <select name="category" data-category>${EXPENSE_CATEGORIES.map((x) => html`<option value="${x.key}"${selected(x.key, d.category)}>${x.label}</option>`)}</select>
+          <select name="category" data-category>${categoryOptions(c, d.category)}</select>
         </label>
+        ${opts.defaultSphere
+          ? html`<label>Bereich (Gemeinnützigkeit)
+              <select name="sphere">${SPHERES.map((s) => html`<option value="${s.value}" title="${s.hint}"${selected(s.value, d.sphere || opts.defaultSphere)}>${s.label}</option>`)}</select></label>`
+          : ''}
         <label>Fällig am <input type="date" name="due_date" value="${d.due_date ?? ''}">
           <small class="muted">leer = sofort fällig</small></label>
         <label class="span-2">Beschreibung <input name="description" value="${d.description}" maxlength="300" placeholder="optional, z. B. Druckerpapier, Hosting Oktober"></label>

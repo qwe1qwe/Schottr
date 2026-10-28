@@ -98,7 +98,7 @@ const sections: { title: string; assocTitle?: string; text?: string; fields: Fie
   },
   {
     title: 'DATEV-Export: Eingangsrechnungen',
-    text: `Eingangsrechnungen werden je Steuersatz als Buchung Kreditor an Aufwandskonto übergeben, die Vorsteuer über den BU-Schlüssel (9 = 19 %, 8 = 7 %). Als Kleinunternehmer wird der Bruttobetrag ohne Vorsteuer gebucht. Standard-Aufwandskonten je Kostenart (SKR03 / SKR04): ${EXPENSE_CATEGORIES.map((x) => `${x.label} ${x.skr03} / ${x.skr04}`).join(' · ')}. Am besten einmal mit der Kanzlei abstimmen.`,
+    text: `Eingangsrechnungen werden je Steuersatz als Buchung Kreditor an Aufwandskonto übergeben, die Vorsteuer über den BU-Schlüssel (9 = 19 %, 8 = 7 %). Als Kleinunternehmer wird der Bruttobetrag ohne Vorsteuer gebucht. Standard-Aufwandskonten je Kostenart (SKR03 / SKR04): ${EXPENSE_CATEGORIES.filter((x) => !('association' in x)).map((x) => `${x.label} ${x.skr03} / ${x.skr04}`).join(' · ')}. Vereine haben zusätzliche Kostenarten: ${EXPENSE_CATEGORIES.filter((x) => 'association' in x).map((x) => `${x.label} ${x.skr03} / ${x.skr04}`).join(' · ')}. Am besten einmal mit der Kanzlei abstimmen.`,
     fields: [
       { key: 'datev_creditor_mode', label: 'Kreditoren', options: [['collective', 'Sammelkreditor'], ['individual', 'Kreditor je Lieferant']] },
       { key: 'datev_creditor_account', label: 'Kreditorenkonto bzw. Startnummer', type: 'number', min: 1, max2: 999999999, hint: 'Sammelkreditor z. B. 70000; je Lieferant: Startnummer + Ziffern der Lieferantennummer' },

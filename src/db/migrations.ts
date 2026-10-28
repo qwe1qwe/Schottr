@@ -583,4 +583,96 @@ export const migrations: { version: number; statements: string[] }[] = [
        IF OLD.receipt_id IS NOT NULL THEN ${forbid('Bestaetigte Zuwendungen koennen nicht geloescht werden')}; END IF`,
     ],
   },
+  {
+    version: 10,
+    statements: [
+      // Kassenbuch: Abschluss bis zu einem Datum (danach keine Änderungen mehr)
+      `ALTER TABLE tenants ADD COLUMN cashbook_locked_until DATE NULL AFTER donation_receipt_number_format`,
+      // Eingangsrechnungen bekommen wie Ausgangsrechnungen einen Tätigkeitsbereich (gemeinnützige Vereine)
+      `ALTER TABLE purchase_invoices ADD COLUMN sphere VARCHAR(10) NOT NULL DEFAULT '' AFTER category`,
+
+      // Konten: Bankkonten und Bargeldkassen mit Anfangsbestand
+      `CREATE TABLE cash_accounts (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        tenant_id INT NOT NULL,
+        name VARCHAR(100) NOT NULL,
+        kind ENUM('bank', 'cash') NOT NULL DEFAULT 'bank',
+        iban VARCHAR(40) NOT NULL DEFAULT '',
+        opening_date DATE NOT NULL,
+        opening_balance BIGINT NOT NULL DEFAULT 0,
+        archived TINYINT(1) NOT NULL DEFAULT 0,
+        created_at DATETIME(3) NOT NULL,
+        KEY cash_accounts_tenant (tenant_id, archived),
+        CONSTRAINT cash_accounts_tenant FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+      ) ${TABLE}`,
+
+      // Geldzählungen einer Kasse (Stückelung als JSON); die Differenz zum Buchbestand wird gebucht
+      `CREATE TABLE cash_counts (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        tenant_id INT NOT NULL,
+        account_id INT NOT NULL,
+        count_date DATE NOT NULL,
+        counted BIGINT NOT NULL,
+        denominations VARCHAR(1000) NOT NULL DEFAULT '{}',
+        book_balance BIGINT NOT NULL,
+        difference BIGINT NOT NULL,
+        note VARCHAR(300) NOT NULL DEFAULT '',
+        created_by INT NULL,
+        created_at DATETIME(3) NOT NULL,
+        KEY cash_counts_account (account_id, count_date),
+        CONSTRAINT cash_counts_tenant FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
+        CONSTRAINT cash_counts_account FOREIGN KEY (account_id) REFERENCES cash_accounts(id),
+        CONSTRAINT cash_counts_user FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
+      ) ${TABLE}`,
+
+      // Buchungen: Betrag mit Vorzeichen (+ Einnahme, − Ausgabe). Verknüpft mit genau einer Quelle
+      // (Rechnung, Eingangsrechnung, Spende, Umbuchung, Geldzählung) oder frei erfasst.
+      `CREATE TABLE cash_entries (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        tenant_id INT NOT NULL,
+        account_id INT NOT NULL,
+        entry_date DATE NOT NULL,
+        amount BIGINT NOT NULL,
+        source ENUM('manual', 'invoice', 'purchase', 'donation', 'transfer', 'count') NOT NULL DEFAULT 'manual',
+        document_id INT NULL,
+        purchase_id INT NULL,
+        donation_id INT NULL,
+        count_id INT NULL,
+        transfer_group CHAR(16) NULL,
+        text VARCHAR(300) NOT NULL DEFAULT '',
+        receipt_ref VARCHAR(100) NOT NULL DEFAULT '',
+        sphere VARCHAR(10) NOT NULL DEFAULT '',
+        vat_rate INT NOT NULL DEFAULT 0,
+        created_by INT NULL,
+        created_at DATETIME(3) NOT NULL,
+        updated_at DATETIME(3) NOT NULL,
+        UNIQUE KEY cash_entries_document (document_id),
+        UNIQUE KEY cash_entries_purchase (purchase_id),
+        UNIQUE KEY cash_entries_donation (donation_id),
+        UNIQUE KEY cash_entries_count (count_id),
+        KEY cash_entries_account (account_id, entry_date, id),
+        KEY cash_entries_tenant (tenant_id, entry_date),
+        KEY cash_entries_transfer (transfer_group),
+        CONSTRAINT cash_entries_tenant FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
+        CONSTRAINT cash_entries_account FOREIGN KEY (account_id) REFERENCES cash_accounts(id),
+        CONSTRAINT cash_entries_document FOREIGN KEY (document_id) REFERENCES documents(id),
+        CONSTRAINT cash_entries_purchase FOREIGN KEY (purchase_id) REFERENCES purchase_invoices(id),
+        CONSTRAINT cash_entries_donation FOREIGN KEY (donation_id) REFERENCES donations(id),
+        CONSTRAINT cash_entries_count FOREIGN KEY (count_id) REFERENCES cash_counts(id),
+        CONSTRAINT cash_entries_user FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
+      ) ${TABLE}`,
+
+      // Abgeschlossene Zeiträume sind gesperrt – auch direkt in der Datenbank
+      `CREATE TRIGGER cash_entries_lock_ins BEFORE INSERT ON cash_entries FOR EACH ROW
+       IF NEW.entry_date <= COALESCE((SELECT cashbook_locked_until FROM tenants WHERE id = NEW.tenant_id), '0000-01-01') THEN ${forbid('Das Kassenbuch ist fuer diesen Zeitraum abgeschlossen')}; END IF`,
+      `CREATE TRIGGER cash_entries_lock_upd BEFORE UPDATE ON cash_entries FOR EACH ROW
+       IF OLD.entry_date <= COALESCE((SELECT cashbook_locked_until FROM tenants WHERE id = OLD.tenant_id), '0000-01-01') OR NEW.entry_date <= COALESCE((SELECT cashbook_locked_until FROM tenants WHERE id = NEW.tenant_id), '0000-01-01') THEN ${forbid('Das Kassenbuch ist fuer diesen Zeitraum abgeschlossen')}; END IF`,
+      `CREATE TRIGGER cash_entries_lock_del BEFORE DELETE ON cash_entries FOR EACH ROW
+       IF OLD.entry_date <= COALESCE((SELECT cashbook_locked_until FROM tenants WHERE id = OLD.tenant_id), '0000-01-01') THEN ${forbid('Das Kassenbuch ist fuer diesen Zeitraum abgeschlossen')}; END IF`,
+      `CREATE TRIGGER cash_counts_lock_ins BEFORE INSERT ON cash_counts FOR EACH ROW
+       IF NEW.count_date <= COALESCE((SELECT cashbook_locked_until FROM tenants WHERE id = NEW.tenant_id), '0000-01-01') THEN ${forbid('Das Kassenbuch ist fuer diesen Zeitraum abgeschlossen')}; END IF`,
+      `CREATE TRIGGER cash_counts_lock_del BEFORE DELETE ON cash_counts FOR EACH ROW
+       IF OLD.count_date <= COALESCE((SELECT cashbook_locked_until FROM tenants WHERE id = OLD.tenant_id), '0000-01-01') THEN ${forbid('Das Kassenbuch ist fuer diesen Zeitraum abgeschlossen')}; END IF`,
+    ],
+  },
 ];

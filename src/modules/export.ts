@@ -1,4 +1,6 @@
-import { all } from '../db/index.ts';
+import { all, one } from '../db/index.ts';
+import { cashbookEnabled, unassigned } from './cashbook/repo.ts';
+import { accountReports, cashbookCsv, cashbookPdf, countsCsv, donationsCsv, sphereCsv, sphereSummary, summaryPdf } from './cashbook/report.ts';
 import { audit } from '../lib/audit.ts';
 import { buildDatevCsv, creditorAccount, revenueAccounts, type DatevInvoice, type DatevPurchase } from '../lib/datev.ts';
 import { categoryLabel, expenseAccounts } from '../lib/expenses.ts';
@@ -209,6 +211,20 @@ function register(app: App) {
         ${rows.length} Ausgangsrechnung(en) · netto ${formatMoney(sums.net)} · brutto ${formatMoney(sums.gross)}<br>
         ${purchases.length} Eingangsrechnung(en) · netto ${formatMoney(pSums.net)} · brutto ${formatMoney(pSums.gross)}</p>
       ${drafts ? html`<div class="notice"><a href="/purchases?status=draft">${drafts} hochgeladene(r) Beleg(e)</a> sind noch nicht erfasst und fehlen daher im Export.</div>` : ''}
+      ${cashbookEnabled(t)
+        ? html`<section class="card package-card">
+            <h2>Jahrespaket fürs Steuerbüro</h2>
+            <p class="muted small">Alles für die Steuererklärung des Vereins in einer ZIP-Datei: Übersicht (PDF) mit Kontenständen${t.nonprofit ? ', Einnahmen und Ausgaben nach Bereichen und Spenden' : ' sowie Einnahmen und Ausgaben'},
+              Kassenbuch je Konto (PDF und Excel), Kassenzählungen, Ausgangs- und Eingangsrechnungen samt Belegen${t.nonprofit ? ', Zuwendungsliste und Zuwendungsbestätigungen' : ''}.</p>
+            <form method="get" action="/export/package" class="inline-form">
+              <select name="year" class="year-select" aria-label="Jahr">${[0, 1, 2, 3].map((i) => {
+                const y = Number(today().slice(0, 4)) - i;
+                return html`<option value="${y}"${i === 1 ? h` selected` : ''}>${y}</option>`;
+              })}</select>
+              <button class="btn primary">Paket herunterladen</button>
+            </form>
+          </section>`
+        : ''}
       <div class="export-grid">
         <section class="card">
           <h2>DATEV-Buchungsstapel</h2>
@@ -299,6 +315,83 @@ function register(app: App) {
     return c.body(purchaseJournalCsv(t, rows), 200, {
       'Content-Type': 'text/csv; charset=utf-8',
       'Content-Disposition': attachment(`Rechnungseingangsbuch_${from}_${to}.csv`),
+      'Cache-Control': 'private, no-store',
+    });
+  });
+
+  app.get('/export/package', async (c) => {
+    const t = tenantOf(c);
+    if (!cashbookEnabled(t)) return c.redirect('/export');
+    const year = /^\d{4}$/.test(c.req.query('year') ?? '') ? c.req.query('year')! : String(Number(today().slice(0, 4)) - 1);
+    const from = `${year}-01-01`;
+    const to = `${year}-12-31`;
+    const files: { name: string; data: Buffer | string }[] = [];
+
+    // Kassenbuch je Konto
+    const reports = await accountReports(t, from, to);
+    for (const rep of reports) {
+      const base = `01_Kassenbuch/${safeName(rep.account.name)}_${year}`;
+      files.push({ name: `${base}.pdf`, data: await cashbookPdf(t, rep, from, to) });
+      files.push({ name: `${base}.csv`, data: cashbookCsv(t, rep) });
+    }
+    const counts = await countsCsv(t, from, to);
+    if (counts) files.push({ name: `02_Kassenzaehlungen_${year}.csv`, data: counts });
+
+    // Rechnungen und Belege
+    const rows = await invoicesIn(t, from, to);
+    if (rows.length) files.push({ name: `03_Ausgangsrechnungen/Rechnungsausgangsbuch_${year}.csv`, data: journalCsv(rows) });
+    for (const r of rows) {
+      const blobs = await all<{ pdf: Buffer | null; xml: string | null }>('SELECT pdf, xml FROM documents WHERE id = ?', r.id);
+      const d = JSON.parse(r.snapshot) as DocumentData;
+      const base = `03_Ausgangsrechnungen/${safeName(`${d.number}_${INVOICE_TYPES[d.typeCode] ?? 'Rechnung'}`)}`;
+      if (blobs[0]?.pdf) files.push({ name: `${base}.pdf`, data: Buffer.from(blobs[0].pdf) });
+      if (blobs[0]?.xml) files.push({ name: `${base}_XRechnung.xml`, data: blobs[0].xml });
+    }
+    const purchases = await purchasesIn(t, from, to);
+    if (purchases.length) files.push({ name: `04_Eingangsrechnungen/Rechnungseingangsbuch_${year}.csv`, data: purchaseJournalCsv(t, purchases) });
+    const used = new Set<string>();
+    for (const p of purchases) {
+      if (!p.file_path) continue;
+      let name = zipPurchaseName(p).replace(/^Eingangsrechnungen\//, '04_Eingangsrechnungen/');
+      if (used.has(name)) name = name.replace(/(\.\w+)?$/, `_${p.id}$1`);
+      used.add(name);
+      files.push({ name, data: await readStoredFile('verbindlichkeiten', p.file_path) });
+    }
+
+    // Spenden
+    const donations = await donationsCsv(t, from, to);
+    if (donations) files.push({ name: `05_Spenden/Zuwendungsliste_${year}.csv`, data: donations });
+    const receipts = await all<{ number: string; pdf: Buffer; status: string }>(
+      'SELECT number, pdf, status FROM donation_receipts WHERE tenant_id = ? AND issue_date BETWEEN ? AND ? ORDER BY number', t.id, from, to,
+    );
+    for (const r of receipts) {
+      files.push({ name: `05_Spenden/Zuwendungsbestaetigungen/${safeName(r.number)}${r.status === 'cancelled' ? '_STORNIERT' : ''}.pdf`, data: Buffer.from(r.pdf) });
+    }
+
+    // Auswertung und Deckblatt
+    const sums = sphereSummary(t, reports);
+    files.push({ name: `06_Einnahmen_Ausgaben_${year}.csv`, data: sphereCsv(sums) });
+    const notes: string[] = [];
+    const open = (await unassigned(t)).filter((u) => u.date >= from && u.date <= to);
+    if (open.length) notes.push(`${open.length} bezahlte Rechnung(en)/Spende(n) aus ${year} sind noch keinem Konto zugeordnet und fehlen im Kassenbuch.`);
+    const openInv = await one<{ n: number; s: number }>(
+      "SELECT COUNT(*) n, COALESCE(SUM(gross_total - prepaid_total), 0) s FROM documents WHERE tenant_id = ? AND kind = 'invoice' AND status = 'open' AND issue_date <= ?", t.id, to,
+    );
+    if (openInv?.n) notes.push(`${openInv.n} Ausgangsrechnung(en) bis ${formatDate(to)} sind noch offen (${formatMoney(Number(openInv.s))}).`);
+    const drafts = await one<{ n: number }>("SELECT COUNT(*) n FROM purchase_invoices WHERE tenant_id = ? AND status = 'draft'", t.id);
+    if (drafts?.n) notes.push(`${drafts.n} hochgeladene(r) Beleg(e) sind noch nicht erfasst und fehlen.`);
+    if (!t.cashbook_locked_until || t.cashbook_locked_until < to) notes.push(`Das Kassenbuch ist für ${year} noch nicht abgeschlossen – Änderungen sind noch möglich.`);
+    for (const r of reports) {
+      // Stand am Tagesende (innerhalb eines Tages ist die Reihenfolge der Buchungen zufällig)
+      const endOfDay = new Map(r.rows.map((x) => [x.entry_date, x.balance]));
+      if (r.account.kind === 'cash' && [...endOfDay.values()].some((b) => b < 0)) notes.push(`Die Kasse „${r.account.name}“ war zeitweise im Minus – bitte prüfen.`);
+    }
+    files.unshift({ name: `00_Uebersicht_${year}.pdf`, data: await summaryPdf(t, from, to, reports, sums, notes) });
+
+    await audit(c, 'export.package', `${year}: ${files.length} Dateien`);
+    return c.body(new Uint8Array(createZip(files)), 200, {
+      'Content-Type': 'application/zip',
+      'Content-Disposition': attachment(`Steuerbuero_${safeName(t.name)}_${year}.zip`),
       'Cache-Control': 'private, no-store',
     });
   });

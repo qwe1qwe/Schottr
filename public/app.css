@@ -223,6 +223,20 @@ input.num { text-align: right; }
 .notice ul { margin: .4rem 0; padding-left: 1.2rem; }
 .notice.soft { background: var(--surface-2); border-color: var(--line); }
 .year-select { width: auto; }
+.cash-balances { display: flex; flex-wrap: wrap; gap: .6rem; margin-bottom: 1rem; }
+.cash-balance { display: flex; flex-direction: column; gap: .15rem; padding: .6rem .9rem; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); color: var(--ink); text-decoration: none; min-width: 10rem; }
+.cash-balance span:first-child { font-size: .8rem; color: var(--muted); }
+.cash-balance > .num { font-size: 1.15rem; font-weight: 600; }
+.cash-balance:hover { border-color: var(--line-strong); }
+.cash-balance.active { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.cash-balance.total { background: var(--surface-2); }
+.neg-amount { color: var(--danger); }
+.cash-card .chart { margin: 0; }
+.assign-list li { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: .75rem; align-items: center; }
+.assign-list select { width: auto; max-width: 14rem; }
+.count-table td, .count-table th { padding-top: .3rem; padding-bottom: .3rem; }
+.count-table input { max-width: 7rem; padding: .3rem .5rem; }
+@media (max-width: 720px) { .assign-list li { grid-template-columns: minmax(0, 1fr) auto; } .assign-list form { grid-column: 1 / -1; } }
 .bare-fieldset { border: 0; padding: 0; margin: 0; }
 .bare-fieldset legend { padding: 0; margin-bottom: .35rem; }
 .row-card { display: flex; gap: 1rem; align-items: center; justify-content: space-between; flex-wrap: wrap; }
@@ -444,6 +458,11 @@ body.bare { display: grid; place-items: center; min-height: 100vh; padding: 1rem
 .cmp .chart-bar:hover .bar, .cmp .chart-bar:focus-visible .bar, .cmp .chart-bar.selected .bar { fill: var(--ink); }
 .cmp-line { fill: none; stroke: var(--cmp-res); stroke-width: 2; stroke-linejoin: round; pointer-events: none; }
 .chart-x.m12 { grid-template-columns: repeat(12, minmax(0, 1fr)); }
+.balance-chart .balance-area { fill: color-mix(in srgb, var(--accent) 14%, transparent); }
+.balance-chart .balance-line { fill: none; stroke: var(--accent); stroke-width: 2; }
+.balance-chart .chart-bar { cursor: crosshair; }
+.balance-chart .chart-bar:hover .hit, .balance-chart .chart-bar:focus-visible .hit, .balance-chart .chart-bar.selected .hit { fill: color-mix(in srgb, var(--ink) 35%, transparent); }
+.balance-chart .chart-x span { text-align: left; }
 .cmp-total { display: flex; justify-content: flex-end; align-items: baseline; gap: .5rem; margin: .75rem 0 0; color: var(--muted); font-size: .9rem; }
 .cmp-total strong { color: var(--accent); font-size: 1.15rem; }
 .cmp-total.neg strong { color: var(--danger); }
@@ -505,6 +524,8 @@ body.bare { display: grid; place-items: center; min-height: 100vh; padding: 1rem
 .tax-rows select { width: auto; }
 .paid-form { display: inline-flex; gap: .4rem; align-items: center; }
 .paid-form input[type='date'] { width: auto; padding: .45rem .5rem; }
+.paid-form select { width: auto; padding: .45rem 1.6rem .45rem .5rem; }
+.paid-form .amount-input { width: 7rem; padding: .45rem .5rem; }
 ul.tight { margin: .35rem 0 0; padding-left: 1.2rem; }
 .notes-block { white-space: pre-line; color: var(--muted); }
 .export-grid .check { font-size: .9rem; }

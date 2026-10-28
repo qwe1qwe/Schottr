@@ -1061,3 +1061,125 @@ test('Spenden: erfassen, Einzel-, Sach- und Sammelbestätigung, Storno', opts, a
   r = await req('/donations');
   assert.equal(r.status, 303);
 });
+
+test('Kassenbuch: Konten, Zuordnung, Umbuchung, Kassenzählung, Abschluss, Steuerbüro-Paket', opts, async () => {
+  const t = (await one("SELECT * FROM tenants WHERE name = 'Musikverein Teststadt e. V.'"))!;
+  await req('/tenant/switch', { form: { tenant_id: String(t.id) } });
+  await run('UPDATE tenants SET nonprofit = 1, small_business = 0, cashbook_locked_until = NULL WHERE id = ?', t.id);
+  const today = new Date().toISOString().slice(0, 10);
+  const year = Number(today.slice(0, 4));
+
+  // Menüpunkt für Vereine; ohne Konten geht es zur Kontenverwaltung
+  let page = await (await req('/')).text();
+  assert.match(page, /href="\/cashbook"/);
+  let r = await req('/cashbook');
+  assert.equal(location(r), '/cashbook/accounts');
+
+  r = await req('/cashbook/accounts', { form: { name: 'Girokonto', kind: 'bank', iban: '', opening_date: `${year}-01-01`, opening_balance: '1000' } });
+  const bank = Number(new URLSearchParams(location(r).split('?')[1]).get('account'));
+  r = await req('/cashbook/accounts', { form: { name: 'Barkasse', kind: 'cash', iban: '', opening_date: `${year}-01-01`, opening_balance: '50' } });
+  const kasse = Number(new URLSearchParams(location(r).split('?')[1]).get('account'));
+  assert.ok(bank && kasse);
+  const balance = async (id: number) => {
+    const a = (await one('SELECT * FROM cash_accounts WHERE id = ?', id))!;
+    const s = (await one('SELECT COALESCE(SUM(amount), 0) s FROM cash_entries WHERE account_id = ?', id))!;
+    return Number(a.opening_balance) + Number(s.s);
+  };
+  assert.equal(await balance(bank), 100000);
+
+  // Spenden ohne Konto erscheinen unter „Noch nicht zugeordnet“
+  page = await (await req('/cashbook')).text();
+  assert.match(page, /Noch nicht zugeordnet/);
+  const spende = (await one("SELECT * FROM donations WHERE tenant_id = ? AND kind = 'money' ORDER BY id LIMIT 1", t.id))!;
+  r = await req('/cashbook/assign', { form: { source: 'donation', id: String(spende.id), account_id: String(bank), entry_date: String(spende.donation_date), amount: formatCents(spende.amount) } });
+  assert.equal((await one('SELECT account_id FROM cash_entries WHERE donation_id = ?', spende.id))!.account_id, bank);
+
+  // Neue Spende direkt mit Konto
+  const erika = (await one("SELECT id FROM contacts WHERE name = 'Erika Mustermann' AND tenant_id = ?", t.id))!.id;
+  r = await req('/donations', { form: { contact_id: String(erika), kind: 'money', donation_date: today, amount: '25', account_id: String(kasse) } });
+  const neueSpende = Number(location(r).split('/').pop());
+  assert.equal((await one('SELECT amount FROM cash_entries WHERE donation_id = ?', neueSpende))!.amount, 2500);
+
+  // Rechnung bezahlt auf das Girokonto (mit Skonto-Betrag), wieder offen → Buchung weg
+  const inv = (await one("SELECT * FROM documents WHERE tenant_id = ? AND kind = 'invoice' AND status = 'open' AND sphere = 'ideell'", t.id))!;
+  r = await req(`/invoices/${inv.id}/paid`, { form: { paid_at: today, account_id: String(bank), amount: '1166,20' } });
+  let entry = (await one('SELECT * FROM cash_entries WHERE document_id = ?', inv.id))!;
+  assert.equal(entry.amount, 116620);
+  assert.equal((await one('SELECT status FROM documents WHERE id = ?', inv.id))!.status, 'paid');
+  r = await req(`/invoices/${inv.id}/paid`, { form: {} });
+  assert.equal(await one('SELECT 1 FROM cash_entries WHERE document_id = ?', inv.id), undefined);
+  r = await req(`/invoices/${inv.id}/paid`, { form: { paid_at: today, account_id: String(bank), amount: '1190' } });
+
+  // Vereine haben eigene Kostenarten (Unternehmen nicht)
+  page = await (await req('/purchases/new')).text();
+  assert.match(page, /<optgroup label="Verein">/);
+  assert.match(page, /Verbandsbeiträge, GEMA &amp; Abgaben/);
+
+  // Eingangsrechnung bezahlt aus der Kasse
+  r = await req('/purchases', { form: { new_supplier: 'Getränke Huber', issue_date: today, sphere: 'business', category: 'bewirtung', 'tax_rate[]': '1900', 'tax_net[]': '', 'tax_tax[]': '', 'tax_gross[]': '119,00' } });
+  const pid = Number(location(r).split('/').pop());
+  assert.equal((await one('SELECT sphere FROM purchase_invoices WHERE id = ?', pid))!.sphere, 'business');
+  assert.equal((await one('SELECT category FROM purchase_invoices WHERE id = ?', pid))!.category, 'bewirtung');
+  r = await req(`/purchases/${pid}/paid`, { form: { paid_at: today, account_id: String(kasse), amount: '119' } });
+  assert.equal((await one('SELECT amount FROM cash_entries WHERE purchase_id = ?', pid))!.amount, -11900);
+
+  // Freie Buchung, Umbuchung
+  r = await req('/cashbook/entries', { form: { account_id: String(kasse), entry_date: today, direction: 'out', amount: '20', text: 'Porto', receipt_ref: 'Q1', sphere: 'ideell', vat_rate: '0' } });
+  const porto = (await one("SELECT * FROM cash_entries WHERE tenant_id = ? AND text = 'Porto'", t.id))!;
+  assert.equal(porto.amount, -2000);
+  r = await req('/cashbook/transfer', { form: { from_id: String(bank), to_id: String(kasse), entry_date: today, amount: '200', text: '' } });
+  assert.equal((await all("SELECT * FROM cash_entries WHERE tenant_id = ? AND source = 'transfer'", t.id)).length, 2);
+
+  // Kasse: 50 + 25 − 119 − 20 + 200 = 136 € Buchbestand; gezählt 2×100 + 1×20 + 3×2 = 226 € → 90 € Getränkeverkauf
+  assert.equal(await balance(kasse), 13600);
+  r = await req('/cashbook/count', { form: { account_id: String(kasse), count_date: today, d_10000: '2', d_2000: '1', d_200: '3', text: 'Getränkeverkauf Probenabende', sphere: 'business', vat_rate: '1900', note: 'gezählt von Kai' } });
+  const count = (await one('SELECT * FROM cash_counts WHERE account_id = ?', kasse))!;
+  assert.equal(count.counted, 22600);
+  assert.equal(count.book_balance, 13600);
+  assert.equal(count.difference, 9000);
+  const diff = (await one('SELECT * FROM cash_entries WHERE count_id = ?', count.id))!;
+  assert.equal(diff.amount, 9000);
+  assert.equal(diff.sphere, 'business');
+  assert.equal(diff.vat_rate, 1900);
+  assert.equal(await balance(kasse), 22600);
+
+  // Übersicht und Kassenbuch zeigen Stände und Verlauf
+  page = await (await req('/')).text();
+  assert.match(page, /Kontostände/);
+  assert.match(page, /class="chart balance-chart"/);
+  page = await (await req(`/cashbook?account=${kasse}`)).text();
+  assert.match(page, /Getränkeverkauf Probenabende/);
+  assert.match(page, /226,00.€/);
+  assert.ok([...page.matchAll(/class="chart-bar balance-day/g)].length >= 300, 'ein Tag je Trefferfläche');
+
+  // Steuerbüro-Paket
+  r = await req(`/export/package?year=${year}`);
+  assert.equal(r.headers.get('content-type'), 'application/zip');
+  const zip = Buffer.from(await r.arrayBuffer()).toString('latin1');
+  for (const name of [`00_Uebersicht_${year}.pdf`, `01_Kassenbuch/Barkasse_${year}.pdf`, `01_Kassenbuch/Girokonto_${year}.csv`, `02_Kassenzaehlungen_${year}.csv`,
+    `03_Ausgangsrechnungen/Rechnungsausgangsbuch_${year}.csv`, `04_Eingangsrechnungen/Rechnungseingangsbuch_${year}.csv`, `05_Spenden/Zuwendungsliste_${year}.csv`,
+    `06_Einnahmen_Ausgaben_${year}.csv`]) {
+    assert.ok(zip.includes(name), `${name} im Paket`);
+  }
+  assert.match(zip, /05_Spenden\/Zuwendungsbestaetigungen\/ZB-\d{4}-0001\.pdf/);
+
+  // Abschluss: danach keine Änderungen mehr – auch nicht direkt in der Datenbank
+  r = await req('/cashbook/lock', { form: { date: today } });
+  r = await req(`/cashbook/entries/${porto.id}/delete`, { form: {} });
+  assert.ok(await one('SELECT 1 FROM cash_entries WHERE id = ?', porto.id), 'nicht gelöscht');
+  await assert.rejects(run('UPDATE cash_entries SET amount = 1 WHERE id = ?', porto.id), /abgeschlossen/);
+  r = await req(`/purchases/${pid}/open`, { form: {} });
+  assert.equal((await one('SELECT status FROM purchase_invoices WHERE id = ?', pid))!.status, 'paid', 'Zahlung im abgeschlossenen Zeitraum bleibt');
+
+  // Unternehmen haben kein Kassenbuch und keine Vereins-Kostenarten
+  await run("UPDATE tenants SET org_type = 'company', nonprofit = 0 WHERE id = ?", t.id);
+  page = await (await req('/')).text();
+  assert.doesNotMatch(page, /href="\/cashbook"/);
+  page = await (await req('/purchases/new')).text();
+  assert.doesNotMatch(page, /Verbandsbeiträge/);
+  await run("UPDATE tenants SET org_type = 'association' WHERE id = ?", t.id);
+});
+
+function formatCents(c: number) {
+  return (c / 100).toFixed(2).replace('.', ',');
+}

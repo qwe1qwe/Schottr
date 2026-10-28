@@ -270,3 +270,76 @@ export function compareChart(points: ComparePoint[], opts: { caption: string; su
     ${opts.hint ? html`<p class="chart-hint muted small">${opts.hint}</p>` : ''}
   </figure>`;
 }
+
+/* ---------------- Kontostand-Verlauf ---------------- */
+
+export interface BalancePoint {
+  date: string;
+  balance: number;
+  /** Veränderung an diesem Tag */
+  delta: number;
+  /** Anzahl Buchungen an diesem Tag */
+  n: number;
+}
+
+const WEEKDAYS = ['So', 'Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa'];
+const MONTHS_SHORT_DE = ['Jan', 'Feb', 'Mär', 'Apr', 'Mai', 'Jun', 'Jul', 'Aug', 'Sep', 'Okt', 'Nov', 'Dez'];
+
+/**
+ * Tagesgenauer Verlauf eines Kontostands über 12 Monate als Treppenlinie mit Fläche.
+ * Jeder Tag hat eine unsichtbare Trefferfläche: Überfahren (bzw. Antippen) zeigt Datum und
+ * Stand oben in der Kopfzeile – dieselbe Technik wie beim Säulendiagramm ([data-chart]).
+ */
+export function balanceChart(points: BalancePoint[], opts: { caption: SafeHtml | string; summary: string; emptyText: string; hint?: string; bare?: boolean }): SafeHtml {
+  const n = points.length;
+  // Tage nach heute: Platz auf der Achse, aber keine Linie
+  const until = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Europe/Berlin' }).format(new Date());
+  const past = points.filter((p) => p.date <= until);
+  const values = past.map((p) => p.balance);
+  const max = Math.max(0, ...values);
+  const min = Math.min(0, ...values);
+  const step = niceStep(max - min || 100_000, 4);
+  const lo = Math.floor(min / step) * step;
+  const hi = Math.max(Math.ceil(max / step) * step, lo + step);
+  const y = (v: number) => H - ((v - lo) / (hi - lo)) * H;
+  const ticks: number[] = [];
+  for (let v = hi; v >= lo - step / 2; v -= step) ticks.push(Math.round(v));
+
+  let line = '';
+  past.forEach((p, i) => {
+    const yy = y(p.balance).toFixed(2);
+    line += i === 0 ? `M0 ${yy} H1` : `V${yy} H${i + 1}`;
+  });
+  const area = past.length ? `${line} V${y(0).toFixed(2)} H0 Z` : '';
+  // Monatsanfänge für die x-Achse (12 Spalten)
+  const months = points.filter((p, i) => i === 0 || p.date.endsWith('-01')).slice(0, 12);
+
+  return html`<figure class="chart balance-chart${opts.bare ? '' : ' card'}" data-chart>
+    <figcaption class="chart-head">
+      <h2>${opts.caption}</h2>
+      <p class="chart-readout" data-chart-readout aria-live="polite">${opts.summary}</p>
+    </figcaption>
+    <div class="chart-body">
+      <div class="chart-y" aria-hidden="true">${ticks.map((t) => html`<span>${axisLabel(t)}</span>`)}</div>
+      <div class="chart-plot">
+        <div class="chart-grid" aria-hidden="true">${ticks.map((t) => html`<span class="${t === 0 ? 'zero' : ''}"></span>`)}</div>
+        <svg class="chart-svg" viewBox="0 0 ${Math.max(n, 1)} ${H}" preserveAspectRatio="none" role="list" aria-label="Kontostand je Tag">
+          ${past.length ? html`<path class="balance-area" d="${area}"></path><path class="balance-line" d="${line}" vector-effect="non-scaling-stroke"></path>` : ''}
+          ${past.map((p, i) => {
+            const d = new Date(`${p.date}T12:00:00Z`);
+            const change = p.n ? ` (${p.delta >= 0 ? '+' : '−'}${formatMoney(Math.abs(p.delta))} · ${p.n} ${p.n === 1 ? 'Buchung' : 'Buchungen'})` : '';
+            const text = `${WEEKDAYS[d.getUTCDay()]}, ${p.date.split('-').reverse().join('.')}: ${formatMoney(p.balance)}${change}`;
+            return html`<g class="chart-bar balance-day${p.n ? ' has-entries' : ''}" data-bar="${text}" role="listitem" aria-label="${text}"><rect class="hit" x="${i}" y="0" width="1" height="${H}"></rect></g>`;
+          })}
+        </svg>
+        ${past.length === 0 ? html`<p class="chart-empty muted small">${opts.emptyText}</p>` : ''}
+      </div>
+      <span></span>
+      <div class="chart-x m12" aria-hidden="true">${months.map((p) => {
+        const [yy, mm] = p.date.split('-');
+        return html`<span class="${mm === '01' ? 'year' : ''}">${MONTHS_SHORT_DE[Number(mm) - 1]}${mm === '01' ? html`<b>${yy}</b>` : ''}</span>`;
+      })}</div>
+    </div>
+    ${opts.hint ? html`<p class="chart-hint muted small">${opts.hint}</p>` : ''}
+  </figure>`;
+}

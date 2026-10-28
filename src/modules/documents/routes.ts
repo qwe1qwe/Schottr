@@ -2,8 +2,10 @@ import { all, one, run, tx, nowIso, fromDbTime } from '../../db/index.ts';
 import { nextNumber } from '../../lib/numbering.ts';
 import { html, nl2br, selected, type SafeHtml } from '../../lib/html.ts';
 import { isSphere, sphereLabel, SPHERES } from '../../lib/nonprofit.ts';
-import { addDays, formatDate, monthEnd, monthLabel, today } from '../../lib/dates.ts';
-import { formatMoney, formatQuantity, formatRate, formatAmount } from '../../lib/money.ts';
+import { accountsOf, bookLinked, cashbookEnabled, getAccount, linkedEntry, unlink } from '../cashbook/repo.ts';
+import { accountSelect } from '../cashbook/routes.ts';
+import { addDays, formatDate, isIsoDate, monthEnd, monthLabel, today } from '../../lib/dates.ts';
+import { formatMoney, formatQuantity, formatRate, formatAmount, parseDecimal } from '../../lib/money.ts';
 import { unitShort } from '../../lib/units.ts';
 import { attachment, idParam, notFound, readForm, redirectWith, str, tenantOf, userOf, UserError } from '../../lib/http.ts';
 import { badge, csrfField, empty, page } from '../../views/layout.ts';
@@ -299,6 +301,10 @@ function register(app: App, kind: Kind) {
     const dunnings = kind === 'invoice' ? await dunningSection(c, t, doc) : '';
     const versions = kind === 'invoice' ? await versionsSection(doc.id) : '';
     const canReopen = kind === 'invoice' && !!doc.finalized_at && !(await reopenBlocker(doc as any));
+    // Kassenbuch (Vereine): Zahlungseingang einem Konto zuordnen
+    const cashAccounts = kind === 'invoice' && doc.finalized_at && doc.type_code !== '381' && cashbookEnabled(t) ? await accountsOf(t.id) : [];
+    const payment = kind === 'invoice' && doc.finalized_at ? await linkedEntry('invoice', doc.id) : undefined;
+    const paymentAccount = payment ? await getAccount(t.id, payment.account_id) : undefined;
 
     let actions: SafeHtml;
     if (kind === 'quote') {
@@ -320,7 +326,10 @@ function register(app: App, kind: Kind) {
         <a class="btn" href="${base}/${doc.id}/pdf" target="_blank">ZUGFeRD-PDF (Industrie)</a>
         ${hasXml ? html`<a class="btn" href="${base}/${doc.id}/xrechnung.xml">XRechnung (Öffentlicher Sektor)</a>` : ''}
         ${doc.type_code !== '381' && doc.status !== 'cancelled'
-          ? postButton(c, `${base}/${doc.id}/paid`, doc.status === 'paid' ? 'Als offen markieren' : 'Als bezahlt markieren', doc.status === 'paid' ? 'btn ghost' : 'btn primary')
+          ? (doc.status !== 'paid' && cashAccounts.length
+              ? ''
+              : postButton(c, `${base}/${doc.id}/paid`, doc.status === 'paid' ? 'Als offen markieren' : 'Als bezahlt markieren', doc.status === 'paid' ? 'btn ghost' : 'btn primary',
+                  payment ? 'Wieder als offen markieren? Die Buchung im Kassenbuch wird entfernt.' : undefined))
           : ''}`;
     }
 
@@ -334,6 +343,7 @@ function register(app: App, kind: Kind) {
     if (kind === 'invoice' && doc.due_date && doc.type_code !== '381') meta.push(['Fällig am', formatDate(doc.due_date)]);
     if (data.skonto) meta.push(['Skonto', `${formatRate(data.skonto.percent)} bis ${formatDate(data.skonto.date)} (${formatMoney(data.skonto.amount)})`]);
     if (doc.paid_at) meta.push(['Bezahlt am', formatDate(doc.paid_at)]);
+    if (payment) meta.push(['Zahlungseingang', html`${formatMoney(payment.amount)} auf <a href="/cashbook?account=${payment.account_id}">${paymentAccount?.name ?? 'Konto'}</a>`]);
     if (data.orderReference) meta.push(['Bestellnummer', data.orderReference]);
     if (data.buyerReference) meta.push(['Käuferreferenz', data.buyerReference]);
     meta.push(['Steuer', TAX_MODES.find((m) => m.value === doc.tax_mode)?.label ?? doc.tax_mode]);
@@ -371,6 +381,20 @@ function register(app: App, kind: Kind) {
       <section class="card">
         <dl class="dl cols">${meta.map(([l, v]) => html`<dt>${l}</dt><dd>${v}</dd>`)}</dl>
       </section>
+      ${cashAccounts.length && doc.status === 'open'
+        ? html`<section class="card">
+            <h2>Zahlungseingang</h2>
+            <form method="post" action="${base}/${doc.id}/paid" class="inline-form">
+              ${csrfField(c)}
+              <label>Bezahlt am <input type="date" name="paid_at" value="${today()}" max="${today()}" required></label>
+              <label>Konto ${accountSelect(cashAccounts, cashAccounts.find((a) => a.kind === 'bank')?.id)}</label>
+              <label>Betrag (€) <input name="amount" class="num" inputmode="decimal" value="${formatAmount(dueAmount(data)).replace(/\./g, '')}" required>
+                </label>
+              <button class="btn primary">Als bezahlt buchen</button>
+            </form>
+            <p class="muted small">Weicht der Betrag ab (z. B. Skonto), den tatsächlich eingegangenen Betrag eintragen.</p>
+          </section>`
+        : ''}
       ${data.intro ? html`<p class="prose">${nl2br(data.intro)}</p>` : ''}
       ${data.items.length ? itemsTable(data) : html`<p class="muted">Noch keine Positionen.</p>`}
       ${data.outro ? html`<p class="prose">${nl2br(data.outro)}</p>` : ''}
@@ -512,8 +536,20 @@ function register(app: App, kind: Kind) {
       const doc = await getDoc(t.id, kind, idParam(c)) ?? notFound();
       if (!doc.finalized_at || doc.status === 'cancelled') notFound();
       const paid = doc.status !== 'paid';
-      await run('UPDATE documents SET status = ?, paid_at = ?, updated_at = ? WHERE id = ?', paid ? 'paid' : 'open', paid ? today() : null, nowIso(), doc.id);
-      return redirectWith(c, `${base}/${doc.id}`, 'ok', paid ? 'Als bezahlt markiert.' : 'Wieder als offen markiert.');
+      const form = await readForm(c);
+      const date = str(form, 'paid_at') || today();
+      if (!isIsoDate(date)) throw new UserError('Ungültiges Datum.');
+      const accountId = Number(str(form, 'account_id')) || 0;
+      if (!paid) await unlink(t, 'invoice', doc.id);
+      await tx(async () => {
+        await run('UPDATE documents SET status = ?, paid_at = ?, updated_at = ? WHERE id = ?', paid ? 'paid' : 'open', paid ? date : null, nowIso(), doc.id);
+        if (paid && accountId) {
+          const amount = parseDecimal(str(form, 'amount'), 2);
+          if (amount === null || amount <= 0) throw new UserError('Bitte den eingegangenen Betrag angeben.');
+          await bookLinked(t, 'invoice', doc.id, { account_id: accountId, entry_date: date, amount, text: '' }, userOf(c).id);
+        }
+      });
+      return redirectWith(c, `${base}/${doc.id}`, 'ok', paid ? (accountId ? 'Als bezahlt gebucht.' : 'Als bezahlt markiert.') : 'Wieder als offen markiert.');
     });
 
     app.post(`${base}/:id/cancel`, async (c) => {

@@ -6,6 +6,8 @@ import type { Tenant } from '../types.ts';
  * die Vorsteuer steuert der BU-Schlüssel im DATEV-Export). Abweichende Konten lassen sich
  * in den Einstellungen festlegen, z. B. „buero=4930, software=4964“.
  */
+type Category = { key: string; label: string; skr03: string; skr04: string; association?: true };
+
 export const EXPENSE_CATEGORIES = [
   { key: 'ware', label: 'Waren & Material', skr03: '3200', skr04: '5200' },
   { key: 'fremd', label: 'Fremdleistungen', skr03: '3100', skr04: '5900' },
@@ -19,9 +21,27 @@ export const EXPENSE_CATEGORIES = [
   { key: 'beratung', label: 'Beratung & Buchführung', skr03: '4950', skr04: '6825' },
   { key: 'versicherung', label: 'Versicherungen & Beiträge', skr03: '4360', skr04: '6400' },
   { key: 'sonstiges', label: 'Sonstiges', skr03: '4900', skr04: '6300' },
-] as const;
+  // nur bei Vereinen zur Auswahl (Konten an SKR03/04 angelehnt – mit der Kanzlei abstimmen, bei SKR49 abweichend)
+  { key: 'vereinsbetrieb', label: 'Sport-/Übungsbetrieb: Geräte, Ausrüstung, Noten', skr03: '4980', skr04: '6850', association: true },
+  { key: 'uebungsleiter', label: 'Trainer, Übungsleiter & Dirigenten', skr03: '4190', skr04: '6030', association: true },
+  { key: 'halle', label: 'Hallen-, Platz- & Raummiete', skr03: '4210', skr04: '6310', association: true },
+  { key: 'spielbetrieb', label: 'Wettkampf & Spielbetrieb: Startgelder, Schiedsrichter', skr03: '4980', skr04: '6850', association: true },
+  { key: 'verband', label: 'Verbandsbeiträge, GEMA & Abgaben', skr03: '4380', skr04: '6420', association: true },
+  { key: 'bewirtung', label: 'Getränke & Speisen (Einkauf für Verkauf)', skr03: '3200', skr04: '5200', association: true },
+  { key: 'veranstaltung', label: 'Veranstaltungen & Feste', skr03: '4900', skr04: '6300', association: true },
+  { key: 'vereinsheim', label: 'Vereinsheim: Instandhaltung & Nebenkosten', skr03: '4260', skr04: '6335', association: true },
+  { key: 'jugend', label: 'Jugendarbeit', skr03: '4900', skr04: '6300', association: true },
+  { key: 'ehrungen', label: 'Ehrungen, Geschenke & Mitgliederpflege', skr03: '4900', skr04: '6300', association: true },
+] as const satisfies readonly Category[];
 
 export type ExpenseCategory = (typeof EXPENSE_CATEGORIES)[number]['key'];
+
+/** Kostenarten zur Auswahl: Vereine bekommen zusätzlich ihre eigenen (oben einsortiert) */
+export function categoriesFor(t: Pick<Tenant, 'org_type'>): readonly Category[] {
+  const all = EXPENSE_CATEGORIES as readonly Category[];
+  if (t.org_type !== 'association') return all.filter((c) => !c.association);
+  return [...all.filter((c) => c.association), ...all.filter((c) => !c.association)];
+}
 export const DEFAULT_CATEGORY: ExpenseCategory = 'sonstiges';
 
 export function isExpenseCategory(v: string): v is ExpenseCategory {

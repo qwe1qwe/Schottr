@@ -47,6 +47,8 @@ export interface Tenant {
   npo_membership_deductible: number;
   npo_signer: string;
   donation_receipt_number_format: string;
+  /** Kassenbuch abgeschlossen bis einschließlich (keine Änderungen mehr) */
+  cashbook_locked_until: string | null;
   payment_days: number;
   quote_valid_days: number;
   quote_number_format: string;

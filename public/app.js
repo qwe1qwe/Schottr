@@ -138,6 +138,25 @@
     sync();
   });
 
+  /* ---------- Kassenzählung: Summen je Stückelung und gesamt ---------- */
+  document.querySelectorAll('[data-count-form]').forEach((form) => {
+    const eur = new Intl.NumberFormat('de-DE', { style: 'currency', currency: 'EUR' });
+    const total = form.querySelector('[data-count-total]');
+    const sync = () => {
+      let sum = 0;
+      form.querySelectorAll('[data-denom]').forEach((input) => {
+        const n = Math.max(0, Math.floor(Number(input.value) || 0));
+        const cents = n * Number(input.dataset.denom);
+        sum += cents;
+        const cell = input.closest('tr')?.querySelector('[data-denom-sum]');
+        if (cell) cell.textContent = n ? eur.format(cents / 100) : '–';
+      });
+      if (total) total.textContent = eur.format(sum / 100);
+    };
+    form.addEventListener('input', sync);
+    sync();
+  });
+
   /* ---------- Kacheln mit Umschalter (z. B. Lieferanten / Verbindlichkeiten) ---------- */
   document.querySelectorAll('[data-tabs]').forEach((box, n) => {
     const key = `schottr:tab:${location.pathname}:${n}`;

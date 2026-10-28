@@ -1,3 +1,4 @@
+import { isSphere } from '../../lib/nonprofit.ts';
 import { all, one, run, tx, nowIso } from '../../db/index.ts';
 import { addDays, isIsoDate, today } from '../../lib/dates.ts';
 import { UserError, list, str, type Form } from '../../lib/http.ts';
@@ -28,6 +29,8 @@ export interface Purchase {
   service_date: string | null;
   description: string;
   category: string;
+  /** Tätigkeitsbereich (gemeinnützige Vereine), leer = Vorgabe */
+  sphere: string;
   currency: string;
   net_total: number;
   tax_total: number;
@@ -262,6 +265,7 @@ export interface PurchaseInput {
   due_date: string | null;
   description: string;
   category: string;
+  sphere: string;
   is_credit: boolean;
   paid_at: string | null;
   taxes: PurchaseTax[];
@@ -297,6 +301,7 @@ export function parsePurchaseForm(form: Form, locked: boolean): PurchaseInput {
     due_date: optDate('due_date', 'Fällig am'),
     description: str(form, 'description', 300),
     category: isExpenseCategory(category) ? category : DEFAULT_CATEGORY,
+    sphere: isSphere(str(form, 'sphere')) ? str(form, 'sphere') : '',
     is_credit: str(form, 'is_credit') === '1',
     paid_at: optDate('paid_at', 'Bezahlt am'),
     taxes: [],
@@ -359,6 +364,7 @@ export async function savePurchase(t: Tenant, userId: number, existing: Purchase
     const common = {
       description: input.description,
       category: input.category,
+      sphere: input.sphere,
       due_date: input.due_date,
       paid_at: input.paid_at,
       status,
@@ -432,6 +438,7 @@ export function emptyInput(contact?: Contact): PurchaseInput {
     due_date: null,
     description: '',
     category: contact && isExpenseCategory(contact.expense_category) ? contact.expense_category : DEFAULT_CATEGORY,
+    sphere: '',
     is_credit: false,
     paid_at: null,
     taxes: [],
@@ -447,6 +454,7 @@ export function purchaseToInput(p: Purchase, taxes: PurchaseTax[]): PurchaseInpu
     due_date: p.due_date,
     description: p.description,
     category: p.category,
+    sphere: p.sphere,
     is_credit: !!p.is_credit,
     paid_at: p.paid_at,
     taxes,

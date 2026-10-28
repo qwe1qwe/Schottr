@@ -1,4 +1,6 @@
-import { all, one } from '../../db/index.ts';
+import { all, one, tx } from '../../db/index.ts';
+import { accountsOf, assertOpen, bookLinked, cashbookEnabled, linkedEntry, unlink, type CashAccount } from '../cashbook/repo.ts';
+import { accountSelect } from '../cashbook/routes.ts';
 import { audit } from '../../lib/audit.ts';
 import { formatDate, today } from '../../lib/dates.ts';
 import { checked, html, selected, type SafeHtml } from '../../lib/html.ts';
@@ -74,7 +76,7 @@ async function donorOptions(tenantId: number, includeId = 0): Promise<Contact[]>
   );
 }
 
-function donationForm(c: Ctx, t: Tenant, action: string, d: Partial<DonationInput>, contacts: Contact[]): SafeHtml {
+function donationForm(c: Ctx, t: Tenant, action: string, d: Partial<DonationInput>, contacts: Contact[], cash: { accounts: CashAccount[]; selected?: number | null } = { accounts: [] }): SafeHtml {
   const kind = d.kind ?? 'money';
   return html`<form method="post" action="${action}" class="card stack" data-donation-form>
     ${csrfField(c)}
@@ -93,6 +95,11 @@ function donationForm(c: Ctx, t: Tenant, action: string, d: Partial<DonationInpu
       <label>Datum der Zuwendung <input type="date" name="donation_date" value="${d.donation_date ?? today()}" max="${today()}" required></label>
       <label><span data-kind-show="money membership">Betrag (€)</span><span data-kind-show="goods">Wert der Sachzuwendung (€)</span>
         <input name="amount" class="num" inputmode="decimal" required value="${d.amount ? formatAmount(d.amount).replace(/\./g, '') : ''}" placeholder="0,00"></label>
+      ${cash.accounts.length
+        ? html`<label data-kind-show="money membership">Eingegangen auf
+            ${accountSelect(cash.accounts, cash.selected, 'account_id', { optional: '– noch keinem Konto zuordnen –' })}
+            <small class="muted">bucht den Eingang im Kassenbuch</small></label><span data-kind-show="money membership"></span>`
+        : ''}
       <label class="check span-2" data-kind-show="money membership"><input type="checkbox" name="waiver" value="1"${checked(d.waiver)}>
         Verzicht auf Erstattung von Aufwendungen (Aufwandsspende) – nur bei einem vorher vereinbarten Erstattungsanspruch</label>
       <div class="span-2 stack" data-kind-show="goods">
@@ -126,6 +133,23 @@ function receiptTable(rows: (Receipt & { contact_label: string })[]): SafeHtml {
       <td>${r.status === 'cancelled' ? html`<span class="badge badge-cancelled">Storniert</span>` : html`<span class="badge badge-settled">Ausgestellt</span>`}</td>
       <td class="right num">${formatMoney(r.total)}</td>
     </tr>`)}</tbody></table></div>`;
+}
+
+/** Konten fürs Formular (nur mit Kassenbuch) und das bisher gebuchte Konto */
+async function cashOptions(t: Tenant, donationId?: number) {
+  if (!cashbookEnabled(t)) return { accounts: [] };
+  const entry = donationId ? await linkedEntry('donation', donationId) : undefined;
+  return { accounts: await accountsOf(t.id), selected: entry?.account_id ?? null };
+}
+
+/** Geld- und Beitragseingänge im Kassenbuch buchen bzw. entfernen */
+async function syncCash(t: Tenant, donationId: number, d: DonationInput, accountId: number, userId: number) {
+  if (!cashbookEnabled(t)) return;
+  if (accountId && d.kind !== 'goods') {
+    await bookLinked(t, 'donation', donationId, { account_id: accountId, entry_date: d.donation_date, amount: d.amount, text: d.note }, userId);
+  } else {
+    await unlink(t, 'donation', donationId);
+  }
 }
 
 const yearOf = (q: string | undefined, fallback: number) => (q && /^\d{4}$/.test(q) ? Number(q) : fallback);
@@ -189,14 +213,21 @@ function register(app: App) {
     return page(c, {
       title: 'Zuwendung erfassen',
       back: { href: '/donations', label: 'Spenden' },
-      body: donationForm(c, t, '/donations', { contact_id: contactId || undefined }, await donorOptions(t.id)),
+      body: donationForm(c, t, '/donations', { contact_id: contactId || undefined }, await donorOptions(t.id), await cashOptions(t)),
     });
   });
 
   app.post('/donations', async (c) => {
     const t = npoTenant(c);
-    const input = await parseDonation(await readForm(c), t.id);
-    const id = await createDonation(t, input, userOf(c).id);
+    const form = await readForm(c);
+    const input = await parseDonation(form, t.id);
+    const accountId = Number(str(form, 'account_id')) || 0;
+    if (accountId) assertOpen(t, input.donation_date);
+    const id = await tx(async () => {
+      const newId = await createDonation(t, input, userOf(c).id);
+      await syncCash(t, newId, input, accountId, userOf(c).id);
+      return newId;
+    });
     return redirectWith(c, `/donations/${id}`, 'ok', 'Zuwendung gespeichert.');
   });
 
@@ -290,6 +321,7 @@ function register(app: App) {
     const receipt = d.receipt_id ? await getReceipt(t.id, d.receipt_id) : undefined;
     const year = Number(d.donation_date.slice(0, 4));
     const canConfirm = !d.receipt_id && confirmable(t, d);
+    const payment = cashbookEnabled(t) ? await linkedEntry('donation', d.id) : undefined;
     return page(c, {
       title: `${DONATION_KINDS[d.kind]} vom ${formatDate(d.donation_date)}`,
       back: { href: `/donations?year=${year}`, label: 'Spenden' },
@@ -308,6 +340,7 @@ function register(app: App) {
         ${d.kind === 'goods' ? html`<dt>Bezeichnung</dt><dd>${d.description}</dd>
           <dt>Herkunft</dt><dd>${{ business: 'Betriebsvermögen', private: 'Privatvermögen', unknown: 'keine Angabe', '': '' }[d.goods_origin]}${d.goods_documents ? ' · Unterlagen zur Wertermittlung liegen vor' : ''}</dd>` : ''}
         ${d.note ? html`<dt>Notiz</dt><dd>${d.note}</dd>` : ''}
+        ${payment ? html`<dt>Eingang</dt><dd><a href="/cashbook?account=${payment.account_id}">im Kassenbuch gebucht</a> am ${formatDate(payment.entry_date)}</dd>` : ''}
         <dt>Bestätigung</dt><dd>${receipt
           ? html`<a href="/donations/receipts/${receipt.id}">${RECEIPT_KIND_LABEL[receipt.kind]} ${receipt.number}</a> vom ${formatDate(receipt.issue_date)}`
           : donationStatus(t, d)}</dd>
@@ -328,20 +361,27 @@ function register(app: App) {
     return page(c, {
       title: 'Zuwendung bearbeiten',
       back: { href: `/donations/${d.id}`, label: 'Zuwendung' },
-      body: donationForm(c, t, `/donations/${d.id}`, d, await donorOptions(t.id, d.contact_id)),
+      body: donationForm(c, t, `/donations/${d.id}`, d, await donorOptions(t.id, d.contact_id), await cashOptions(t, d.id)),
     });
   });
 
   app.post('/donations/:id', async (c) => {
     const t = npoTenant(c);
     const d = await getDonation(t.id, idParam(c)) ?? notFound();
-    await updateDonation(d, await parseDonation(await readForm(c), t.id));
+    const form = await readForm(c);
+    const input = await parseDonation(form, t.id);
+    await tx(async () => {
+      await updateDonation(d, input);
+      await syncCash(t, d.id, input, Number(str(form, 'account_id')) || 0, userOf(c).id);
+    });
     return redirectWith(c, `/donations/${d.id}`, 'ok', 'Zuwendung gespeichert.');
   });
 
   app.post('/donations/:id/delete', async (c) => {
     const t = npoTenant(c);
     const d = await getDonation(t.id, idParam(c)) ?? notFound();
+    if (d.receipt_id) throw new UserError('Bestätigte Zuwendungen können nicht gelöscht werden. Erst die Bestätigung stornieren.');
+    await unlink(t, 'donation', d.id);
     await deleteDonation(d);
     return redirectWith(c, `/donations?year=${d.donation_date.slice(0, 4)}`, 'ok', 'Zuwendung gelöscht.');
   });

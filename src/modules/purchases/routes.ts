@@ -1,4 +1,7 @@
-import { all, one } from '../../db/index.ts';
+import { sphereLabel } from '../../lib/nonprofit.ts';
+import { accountsOf, bookLinked, cashbookEnabled, getAccount, linkedEntry, unlink } from '../cashbook/repo.ts';
+import { accountSelect } from '../cashbook/routes.ts';
+import { all, one, tx } from '../../db/index.ts';
 import { audit } from '../../lib/audit.ts';
 import { formatDate, isIsoDate, monthEnd, monthLabel, today } from '../../lib/dates.ts';
 import { readStoredFile } from '../../lib/files.ts';
@@ -6,7 +9,7 @@ import { categoryLabel } from '../../lib/expenses.ts';
 import { html, type SafeHtml } from '../../lib/html.ts';
 import { attachment, idParam, notFound, readForm, redirectWith, str, tenantOf, userOf, UserError } from '../../lib/http.ts';
 import { formatIban } from '../../lib/validate.ts';
-import { formatMoney } from '../../lib/money.ts';
+import { formatAmount, formatMoney, parseDecimal } from '../../lib/money.ts';
 import { csrfField, empty, page } from '../../views/layout.ts';
 import { EInvoiceError, readEInvoice } from '../../einvoice/parse.ts';
 import { contactLabel, getContact, supplierOptions } from '../contacts.ts';
@@ -163,7 +166,7 @@ function register(app: App) {
     return page(c, {
       title: 'Eingangsrechnung erfassen',
       back: { href: '/purchases', label: 'Eingangsrechnungen' },
-      body: purchaseForm(c, '/purchases', emptyInput(contact), await supplierOptions(t.id, contact?.id), { smallBusiness: !!t.small_business }),
+      body: purchaseForm(c, '/purchases', emptyInput(contact), await supplierOptions(t.id, contact?.id), { smallBusiness: !!t.small_business, defaultSphere: t.nonprofit ? t.default_sphere : null }),
     });
   });
 
@@ -199,6 +202,10 @@ function register(app: App) {
     meta.push(['Fällig am', p.due_date ? formatDate(p.due_date) : 'sofort']);
     if (p.paid_at) meta.push(['Bezahlt am', formatDate(p.paid_at)]);
     meta.push(['Kostenart', categoryLabel(p.category)]);
+    if (t.nonprofit) meta.push(['Bereich', sphereLabel(p.sphere || t.default_sphere)]);
+    const payment = await linkedEntry('purchase', p.id);
+    const cashAccounts = cashbookEnabled(t) ? await accountsOf(t.id) : [];
+    if (payment) meta.push(['Zahlung', html`${formatMoney(-payment.amount)} von <a href="/cashbook?account=${payment.account_id}">${(await getAccount(t.id, payment.account_id))?.name ?? 'Konto'}</a>`]);
     if (p.description) meta.push(['Beschreibung', p.description]);
     if (p.iban) meta.push(['Bankverbindung', `${formatIban(p.iban)}${info?.bic ? ` · ${info.bic}` : ''}`]);
     if (p.payment_reference && p.status === 'open') meta.push(['Verwendungszweck', p.payment_reference]);
@@ -214,10 +221,12 @@ function register(app: App) {
         ${p.file_path ? html`<a class="btn" href="/purchases/${p.id}/file">Datei herunterladen</a>` : ''}
         <a class="btn" href="/purchases/${p.id}/edit">Bearbeiten</a>
         ${p.status === 'paid'
-          ? postButton(c, `/purchases/${p.id}/open`, 'Als offen markieren', 'btn ghost')
+          ? postButton(c, `/purchases/${p.id}/open`, 'Als offen markieren', 'btn ghost', payment ? 'Wieder als offen markieren? Die Buchung im Kassenbuch wird entfernt.' : undefined)
           : html`<form method="post" action="/purchases/${p.id}/paid" class="inline paid-form">${csrfField(c)}
               <input type="date" name="paid_at" value="${today()}" aria-label="Bezahlt am" required>
-              <button class="btn primary">Als bezahlt markieren</button></form>`}`,
+              ${cashAccounts.length ? html`${accountSelect(cashAccounts, cashAccounts.find((a) => a.kind === 'bank')?.id)}
+                <input name="amount" class="num amount-input" inputmode="decimal" aria-label="Betrag" value="${formatAmount(payable(p)).replace(/\./g, '')}">` : ''}
+              <button class="btn primary">${cashAccounts.length ? 'Als bezahlt buchen' : 'Als bezahlt markieren'}</button></form>`}`,
       body: html`
       <div class="status-line">${purchaseBadge(st)}${p.is_credit ? html` <span class="tag">Gutschrift</span>` : ''}
         ${p.status === 'open' ? html`<span class="subject">zu zahlen: ${formatMoney(payable(p))}</span>` : ''}</div>
@@ -247,6 +256,7 @@ function register(app: App) {
       body: html`
       ${purchaseForm(c, `/purchases/${p.id}`, purchaseToInput(p, taxes), await supplierOptions(t.id, p.contact_id), {
         locked, taxes, preview: p.file_path && p.file_mime !== 'application/xml' ? previewFrame(p) : undefined, smallBusiness: !!t.small_business,
+        defaultSphere: t.nonprofit ? t.default_sphere : null,
       })}
       ${draft
         ? html`<div class="danger-zone">${postButton(c, `/purchases/${p.id}/delete`, 'Beleg verwerfen', 'btn danger', 'Hochgeladenen Beleg verwerfen?')}</div>`
@@ -259,7 +269,13 @@ function register(app: App) {
     const p = (await getPurchase(t.id, idParam(c))) ?? notFound();
     try {
       const input = parsePurchaseForm(await readForm(c), !!p.einvoice_format);
+      // Kassenbuch: Zahlung entfernen bzw. Datum nachziehen, wenn „Bezahlt am“ geändert wurde
+      const payment = await linkedEntry('purchase', p.id);
+      if (payment && !input.paid_at) await unlink(t, 'purchase', p.id);
       await savePurchase(t, userOf(c).id, p, input);
+      if (payment && input.paid_at && input.paid_at !== payment.entry_date) {
+        await bookLinked(t, 'purchase', p.id, { account_id: payment.account_id, entry_date: input.paid_at, amount: payment.amount, text: payment.text }, userOf(c).id);
+      }
       if (p.status !== 'draft') await audit(c, 'purchase.update', `${purchaseTitle(p)} (ID ${p.id})`);
       return redirectWith(c, `/purchases/${p.id}`, 'ok', 'Eingangsrechnung gespeichert.');
     } catch (err) {
@@ -272,15 +288,25 @@ function register(app: App) {
     const t = tenantOf(c);
     const p = (await getPurchase(t.id, idParam(c))) ?? notFound();
     if (p.status === 'draft') return redirectWith(c, `/purchases/${p.id}/edit`, 'error', 'Bitte zuerst die Angaben erfassen.');
-    const date = str(await readForm(c), 'paid_at') || today();
+    const form = await readForm(c);
+    const date = str(form, 'paid_at') || today();
     if (!isIsoDate(date)) return redirectWith(c, `/purchases/${p.id}`, 'error', 'Ungültiges Datum.');
-    await setPaid(p, date);
-    return redirectWith(c, `/purchases/${p.id}`, 'ok', 'Als bezahlt markiert.');
+    const accountId = Number(str(form, 'account_id')) || 0;
+    await tx(async () => {
+      await setPaid(p, date);
+      if (accountId) {
+        const amount = parseDecimal(str(form, 'amount'), 2);
+        if (amount === null || amount <= 0) throw new UserError('Bitte den gezahlten Betrag angeben.');
+        await bookLinked(t, 'purchase', p.id, { account_id: accountId, entry_date: date, amount: p.is_credit ? amount : -amount, text: '' }, userOf(c).id);
+      }
+    });
+    return redirectWith(c, `/purchases/${p.id}`, 'ok', accountId ? 'Als bezahlt gebucht.' : 'Als bezahlt markiert.');
   });
 
   app.post('/purchases/:id/open', async (c) => {
     const t = tenantOf(c);
     const p = (await getPurchase(t.id, idParam(c))) ?? notFound();
+    await unlink(t, 'purchase', p.id);
     await setPaid(p, null);
     return redirectWith(c, `/purchases/${p.id}`, 'ok', 'Wieder als offen markiert.');
   });
@@ -288,6 +314,7 @@ function register(app: App) {
   app.post('/purchases/:id/delete', async (c) => {
     const t = tenantOf(c);
     const p = (await getPurchase(t.id, idParam(c))) ?? notFound();
+    await unlink(t, 'purchase', p.id);
     await deletePurchase(p);
     await audit(c, 'purchase.delete', `${purchaseTitle(p)} (${p.file_name || 'ohne Datei'}, ${formatMoney(p.gross_total)})`);
     return redirectWith(c, '/purchases', 'ok', p.status === 'draft' ? 'Beleg verworfen.' : 'Eingangsrechnung gelöscht.');

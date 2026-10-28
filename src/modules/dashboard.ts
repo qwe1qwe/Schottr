@@ -14,6 +14,7 @@ import { purchaseBadge, purchaseStatus } from './purchases/views.ts';
 import { dueOf, payable, type Purchase } from './purchases/repo.ts';
 import { isSphere, nonprofitLimits, NONPROFIT_ALLOWANCE, SPHERES, type Sphere } from '../lib/nonprofit.ts';
 import { donationTotals } from './donations/repo.ts';
+import { cashbookCard } from './cashbook/routes.ts';
 import type { Module, Tenant } from '../types.ts';
 
 /**
@@ -357,6 +358,7 @@ export const dashboardModule: Module = {
       const liab = await openLiabilities(t.id);
       const ku = t.small_business ? await smallBusinessLimits(t, Number(year)) : null;
       const npo = t.nonprofit ? await nonprofitLimitsCard(t, Number(year)) : null;
+      const cash = await cashbookCard(t);
       const drafts = await all(
         `SELECT d.*, COALESCE(NULLIF(c.company, ''), c.name) contact_label FROM documents d JOIN contacts c ON c.id = d.contact_id
          WHERE d.tenant_id = ? AND d.kind = 'invoice' AND d.status = 'draft' ORDER BY d.updated_at DESC LIMIT 10`, t.id,
@@ -393,6 +395,7 @@ export const dashboardModule: Module = {
             <strong>${formatMoney(revenue.s)}</strong><small>${revenue.n} Rechnung(en)</small>
           </div>
         </div>
+        ${cash ?? ''}
         ${chart}
         ${result}
         <div class="dash-grid">${customers}${suppliers}</div>
