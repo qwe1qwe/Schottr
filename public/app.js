@@ -311,7 +311,8 @@
     // Neuer Lieferant nur, wenn keiner gewählt ist; Kostenart des Lieferanten vorschlagen
     const supplier = pform.querySelector('[data-supplier]');
     const newSupplier = pform.querySelector('[data-new-supplier]');
-    const category = pform.querySelector('[data-category]');
+    // select[...] – die Lieferanten-Optionen tragen selbst ein data-category-Attribut
+    const category = pform.querySelector('select[data-category]');
     if (supplier && newSupplier) {
       const sync = (fromUser) => {
         newSupplier.hidden = !!supplier.value;
