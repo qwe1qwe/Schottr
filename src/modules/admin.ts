@@ -10,7 +10,7 @@ import { formatMoney } from '../lib/money.ts';
 import { csrfField, page, empty } from '../views/layout.ts';
 import { config } from '../config.ts';
 import { createTenant, emailSchema, passwordSchema, tenantOptions } from './auth.ts';
-import { orgSelect } from '../lib/nonprofit.ts';
+import { orgFields } from '../lib/nonprofit.ts';
 import type { App, Ctx, Module } from '../types.ts';
 
 /**
@@ -153,7 +153,7 @@ function register(app: App) {
       body: html`<form method="post" action="/admin/tenants" class="card narrow stack">
         ${csrfField(c)}
         <label>Name der Firma bzw. des Vereins <input name="name" required maxlength="200"></label>
-        ${orgSelect()}
+        ${orgFields()}
         <label>Inhaber (E-Mail eines bestehenden Kontos) <input type="email" name="owner" required></label>
         <label class="check"><input type="checkbox" name="small_business" value="1"> Kleinunternehmer nach § 19 UStG</label>
         <button class="btn primary">Anlegen</button>

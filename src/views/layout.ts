@@ -123,6 +123,7 @@ export function barePage(
 <title>${title} · Schottr</title>
 <link rel="stylesheet" href="/static/app.css?v=${ASSET_VERSION}">
 <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<script src="/static/app.js?v=${ASSET_VERSION}" defer></script>
 </head>
 <body class="bare">
 <main class="auth-card">

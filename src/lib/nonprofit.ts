@@ -1,4 +1,4 @@
-import { html, selected, type SafeHtml } from './html.ts';
+import { html, raw, selected, type SafeHtml } from './html.ts';
 import { str, type Form } from './http.ts';
 
 /**
@@ -56,18 +56,23 @@ export function nonprofitLimits(year: number) {
 /** Freibetrag für Vereine und Stiftungen (§ 24 KStG, § 11 Abs. 1 GewStG), in Cent */
 export const NONPROFIT_ALLOWANCE = 5_000_00;
 
-/** Auswahl der Organisationsform beim Anlegen eines Mandanten */
-export function orgSelect(value: string = 'company'): SafeHtml {
+/**
+ * Organisationsform beim Anlegen eines Mandanten: Art (Unternehmen oder Verein) und – nur bei
+ * Vereinen – das Häkchen „gemeinnützig“. Die Gemeinnützigkeit ist ein eigener Status wie die
+ * Kleinunternehmerregelung: Sie kann wegfallen oder neu hinzukommen, ohne dass sich die Art ändert.
+ */
+export function orgFields(values: { org_type?: string; nonprofit?: string } = {}): SafeHtml {
   return html`<label>Art
-    <select name="org">
-      <option value="company"${selected('company', value)}>Unternehmen / Selbstständig</option>
-      <option value="association"${selected('association', value)}>Verein (e. V. oder nicht eingetragen)</option>
-      <option value="nonprofit"${selected('nonprofit', value)}>Gemeinnütziger Verein (§§ 51 ff. AO)</option>
-    </select></label>`;
+    <select name="org_type">
+      <option value="company"${selected('company', values.org_type ?? 'company')}>Unternehmen / Selbstständig</option>
+      <option value="association"${selected('association', values.org_type ?? 'company')}>Verein (e. V. oder nicht eingetragen)</option>
+    </select></label>
+  <label class="check" data-show-if="org_type=association"><input type="checkbox" name="nonprofit" value="1"${values.nonprofit === '1' ? raw(' checked') : ''}>
+    Gemeinnützig (steuerbegünstigt nach §§ 51 ff. AO)</label>`;
 }
 
-/** Liest die Auswahl aus orgSelect() */
+/** Liest orgFields(): gemeinnützig gibt es nur bei Vereinen */
 export function orgFromForm(form: Form): { orgType: OrgType; nonprofit: boolean } {
-  const v = str(form, 'org');
-  return { orgType: v === 'association' || v === 'nonprofit' ? 'association' : 'company', nonprofit: v === 'nonprofit' };
+  const orgType: OrgType = str(form, 'org_type') === 'association' ? 'association' : 'company';
+  return { orgType, nonprofit: orgType === 'association' && str(form, 'nonprofit') === '1' };
 }

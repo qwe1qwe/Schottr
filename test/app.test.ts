@@ -832,7 +832,7 @@ test('Nachweise aus der Datenbank werden in die Dateiablage verschoben', opts, a
 
 test('Gemeinnütziger Verein: Bereich je Rechnung, Grenzen in der Übersicht, Vorstand auf dem Beleg', opts, async () => {
   await refreshCsrf();
-  let res = await req('/tenants', { form: { name: 'Musikverein Teststadt e. V.', org: 'nonprofit' } });
+  let res = await req('/tenants', { form: { name: 'Musikverein Teststadt e. V.', org_type: 'association', nonprofit: '1' } });
   assert.equal(location(res), '/settings');
   const t = (await one("SELECT * FROM tenants WHERE name = 'Musikverein Teststadt e. V.'"))!;
   assert.equal(t.org_type, 'association');

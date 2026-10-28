@@ -107,12 +107,24 @@
     });
   });
 
-  /* ---------- Bereiche nur bei angehaktem Kontrollkästchen zeigen (data-show-if="<name>") ---------- */
+  /*
+   * Bereiche nur unter Bedingungen zeigen: data-show-if="nonprofit" (Kontrollkästchen angehakt),
+   * "org_type=association" (Auswahl/Radio hat diesen Wert); mehrere Bedingungen mit Leerzeichen = alle.
+   */
   document.querySelectorAll('[data-show-if]').forEach((el) => {
-    const box = el.closest('form')?.querySelector(`input[type="checkbox"][name="${el.dataset.showIf}"]`);
-    if (!box) return;
-    const sync = () => (el.hidden = !box.checked);
-    box.addEventListener('change', sync);
+    const form = el.closest('form');
+    if (!form) return;
+    const conds = el.dataset.showIf.split(' ').map((c) => {
+      const [name, value] = c.split('=');
+      return { name, value, fields: [...form.querySelectorAll(`[name="${name}"]`)] };
+    });
+    if (conds.some((c) => !c.fields.length)) return;
+    const met = (c) => {
+      if (c.value === undefined) return c.fields.some((f) => f.checked);
+      return c.fields.some((f) => (f.type === 'radio' ? f.checked && f.value === c.value : f.value === c.value));
+    };
+    const sync = () => (el.hidden = !conds.every(met));
+    conds.forEach((c) => c.fields.forEach((f) => f.addEventListener('change', sync)));
     sync();
   });
 

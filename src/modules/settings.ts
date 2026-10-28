@@ -198,9 +198,9 @@ function register(app: App) {
               <label class="check"><input type="radio" name="org_type" value="company"${checked(t.org_type !== 'association')} ${owner ? '' : html`disabled`}> Unternehmen / Selbstständig</label>
               <label class="check"><input type="radio" name="org_type" value="association"${checked(t.org_type === 'association')} ${owner ? '' : html`disabled`}> Verein (e. V. oder nicht eingetragen)</label>
             </fieldset>
-            <label class="check"><input type="checkbox" name="nonprofit" value="1"${checked(t.nonprofit)} ${owner ? '' : html`disabled`}>
-              Gemeinnützig – steuerbegünstigt nach §§ 51 ff. AO (z. B. e. V., gGmbH, Stiftung)</label>
-            <div class="stack" data-show-if="nonprofit">
+            <label class="check" data-show-if="org_type=association"><input type="checkbox" name="nonprofit" value="1"${checked(t.nonprofit)} ${owner ? '' : html`disabled`}>
+              Gemeinnützig – steuerbegünstigt nach §§ 51 ff. AO</label>
+            <div class="stack" data-show-if="org_type=association nonprofit">
               <label>Bereich für neue Rechnungen
                 <select name="default_sphere" ${owner ? '' : html`disabled`}>${SPHERES.map((s) => html`<option value="${s.value}"${selected(s.value, t.default_sphere)}>${s.label}</option>`)}</select>
                 <small class="muted">Lässt sich je Rechnung ändern. Die Übersicht zeigt daraus die Grenzen für wirtschaftliche Geschäftsbetriebe (§ 64 Abs. 3 AO), sportliche Veranstaltungen (§ 67a AO) und die zeitnahe Mittelverwendung (§ 55 AO).</small>
@@ -208,7 +208,7 @@ function register(app: App) {
             </div>
           </div>
         </fieldset>
-        <fieldset class="card" id="zuwendungen" data-show-if="nonprofit">
+        <fieldset class="card" id="zuwendungen" data-show-if="org_type=association nonprofit">
           <legend>Zuwendungsbestätigungen</legend>
           <p class="muted small">Angaben für Spendenquittungen nach amtlichem Muster – wie im Freistellungsbescheid (bzw. in der Anlage zum Körperschaftsteuerbescheid) oder im Bescheid nach § 60a AO. Als Steuernummer wird die oben eingetragene verwendet.</p>
           <div class="grid-2">
@@ -288,7 +288,8 @@ function register(app: App) {
     }
     v.small_business = str(form, 'small_business') === '1' ? 1 : 0;
     v.org_type = str(form, 'org_type') === 'association' ? 'association' : 'company';
-    v.nonprofit = str(form, 'nonprofit') === '1' ? 1 : 0;
+    // gemeinnützig gibt es nur bei Vereinen – beim Wechsel auf „Unternehmen“ entfällt der Status
+    v.nonprofit = v.org_type === 'association' && str(form, 'nonprofit') === '1' ? 1 : 0;
     const sphere = str(form, 'default_sphere');
     v.default_sphere = isSphere(sphere) ? sphere : t.default_sphere || 'business';
     v.npo_purposes = str(form, 'npo_purposes', 500);

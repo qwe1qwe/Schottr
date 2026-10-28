@@ -11,7 +11,7 @@ import {
 import { barePage, csrfField, page } from '../views/layout.ts';
 import { config } from '../config.ts';
 import { audit, getSetting } from '../lib/audit.ts';
-import { orgFromForm, orgSelect, type OrgType } from '../lib/nonprofit.ts';
+import { orgFromForm, orgFields, type OrgType } from '../lib/nonprofit.ts';
 import type { App, Module } from '../types.ts';
 
 /** Angaben zur Organisationsform aus den Anlegeformularen */
@@ -58,7 +58,7 @@ async function registerForm(values: Record<string, string> = {}) {
   ${first ? html`<p class="muted">Ersteinrichtung: Lege deinen Zugang und deinen ersten Mandanten (deine Firma) an.</p>` : ''}
   <form method="post" action="/register" class="stack">
     <label>Firma / Verein (Mandant) <input name="company" value="${values.company ?? ''}" required maxlength="200"></label>
-    ${orgSelect(values.org)}
+    ${orgFields(values)}
     <label>Dein Name <input name="name" value="${values.name ?? ''}" required maxlength="200" autocomplete="name"></label>
     <label>E-Mail <input type="email" name="email" value="${values.email ?? ''}" required autocomplete="username"></label>
     <label>Passwort <input type="password" name="password" required minlength="10" autocomplete="new-password">
@@ -122,7 +122,8 @@ function register(app: App) {
       company: str(form, 'company', 200),
       name: str(form, 'name', 200),
       email: str(form, 'email', 200).toLowerCase(),
-      org: str(form, 'org', 20),
+      org_type: str(form, 'org_type', 20),
+      nonprofit: str(form, 'nonprofit', 1),
     };
     const parsed = z
       .object({ company: z.string().min(1, 'Bitte einen Firmennamen angeben.'), name: z.string().min(1, 'Bitte deinen Namen angeben.'), email: emailSchema, password: passwordSchema })
@@ -228,7 +229,7 @@ function register(app: App) {
         <form method="post" action="/tenants" class="stack">
           ${csrfField(c)}
           <label>Name der Firma bzw. des Vereins <input name="name" required maxlength="200" autofocus></label>
-          ${orgSelect()}
+          ${orgFields()}
           <label class="check"><input type="checkbox" name="small_business" value="1"> Kleinunternehmer nach § 19 UStG</label>
           <button class="btn primary">Anlegen</button>
         </form></section>`,

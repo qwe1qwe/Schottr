@@ -1,6 +1,6 @@
 {
   "name": "schottr",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "description": "Schottr – schlanke Angebots- und Rechnungssoftware mit ZUGFeRD und XRechnung (MariaDB)",
   "private": true,
   "type": "module",
