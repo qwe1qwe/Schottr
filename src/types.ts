@@ -29,6 +29,12 @@ export interface Tenant {
   iban: string;
   bic: string;
   small_business: number;
+  /** Unternehmen oder Verein */
+  org_type: 'company' | 'association';
+  /** steuerbegünstigt nach §§ 51 ff. AO (gemeinnützig) */
+  nonprofit: number;
+  /** Vorgabe für den Tätigkeitsbereich neuer Rechnungen (siehe lib/nonprofit.ts) */
+  default_sphere: string;
   payment_days: number;
   quote_valid_days: number;
   quote_number_format: string;

@@ -1,6 +1,6 @@
 import { bpToDecimal, centsToDecimal, milliToDecimal } from '../lib/money.ts';
 import { toCiiDate } from '../lib/dates.ts';
-import { dueAmount, skontoCode, type DocumentData, type Party } from './model.ts';
+import { dueAmount, representativeLabel, skontoCode, type DocumentData, type Party } from './model.ts';
 
 /**
  * UN/CEFACT Cross Industry Invoice (CII D16B) nach EN 16931.
@@ -84,7 +84,7 @@ export function buildCii(d: DocumentData, profile: CiiProfile, attachments: CiiA
     el('ram:IncludedNote', [
       txt('ram:Content', [
         s.name,
-        s.managingDirectors ? `Geschäftsführer: ${s.managingDirectors}` : '',
+        s.managingDirectors ? `${representativeLabel(s)}: ${s.managingDirectors}` : '',
         s.registerCourt || s.registerNumber ? `${s.registerCourt} ${s.registerNumber}`.trim() : '',
       ].filter(Boolean).join(', ')),
       txt('ram:SubjectCode', 'REG'),

@@ -6,6 +6,8 @@ import { VAT_RATES, type TaxMode } from '../../lib/calc.ts';
 import { badge, csrfField } from '../../views/layout.ts';
 import { INVOICE_TYPES, SELECTABLE_TYPES } from '../../einvoice/model.ts';
 import type { Ctx } from '../../types.ts';
+import { tenantOf } from '../../lib/http.ts';
+import { SPHERES } from '../../lib/nonprofit.ts';
 import type { Contact } from '../contacts.ts';
 import type { Article } from '../articles.ts';
 import { proofPicker, type Proof } from '../proofs.ts';
@@ -75,6 +77,13 @@ function itemRow(it?: DraftInput['items'][number]): SafeHtml {
   </tr>`;
 }
 
+/** Tätigkeitsbereich für gemeinnützige Mandanten – intern, erscheint nicht auf dem Beleg */
+export function sphereSelect(value: string, name = 'sphere'): SafeHtml {
+  return html`<label>Bereich (Gemeinnützigkeit)
+    <select name="${name}">${SPHERES.map((s) => html`<option value="${s.value}" title="${s.hint}"${selected(s.value, value)}>${s.label}</option>`)}</select>
+    <small class="muted">nur intern – für die Grenzen in der Übersicht</small></label>`;
+}
+
 type PrepaymentOption = { id: number; contact_id: number; number: string; type_code: string; issue_date: string; net_total: number; tax_total: number; gross_total: number };
 
 export function documentForm(
@@ -82,6 +91,7 @@ export function documentForm(
   proofs: Proof[] = [],
 ): SafeHtml {
   const periodMode = !!(d.service_from || d.service_to);
+  const t = tenantOf(c);
   return html`
   <form method="post" action="${action}" class="doc-form" data-doc-form>
     ${csrfField(c)}
@@ -109,6 +119,7 @@ export function documentForm(
             <label>Skonto % <input name="skonto_percent" class="num" inputmode="decimal" value="${d.skonto_percent ? formatAmount(d.skonto_percent).replace(/,00$/, '') : ''}" placeholder="z. B. 2"></label>
             <label>Skonto bei Zahlung binnen … Tagen <input name="skonto_days" type="number" min="0" max="365" value="${d.skonto_days || ''}" placeholder="z. B. 10"></label>`
           : ''}
+        ${t.nonprofit ? sphereSelect(d.sphere || t.default_sphere) : ''}
       </div>
       ${kind === 'invoice'
         ? html`<div class="grid-3 service" data-service>

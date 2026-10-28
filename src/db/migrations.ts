@@ -488,4 +488,18 @@ export const migrations: { version: number; statements: string[] }[] = [
       ) ${TABLE}`,
     ],
   },
+  {
+    version: 8,
+    statements: [
+      // Vereine und gemeinnützige Körperschaften (§§ 51 ff. AO)
+      `ALTER TABLE tenants
+        ADD COLUMN org_type ENUM('company', 'association') NOT NULL DEFAULT 'company' AFTER small_business,
+        ADD COLUMN nonprofit TINYINT(1) NOT NULL DEFAULT 0 AFTER org_type,
+        ADD COLUMN default_sphere VARCHAR(10) NOT NULL DEFAULT 'business' AFTER nonprofit`,
+      // Tätigkeitsbereich einer Rechnung (ideell, asset, purpose, sport, business) – nur bei gemeinnützigen
+      // Mandanten gepflegt; leer = Vorgabe des Mandanten. Interne Zuordnung, darf auch nach dem
+      // Festschreiben geändert werden (steht nicht auf dem Beleg, daher nicht im Sperr-Trigger).
+      `ALTER TABLE documents ADD COLUMN sphere VARCHAR(10) NOT NULL DEFAULT '' AFTER exemption_reason`,
+    ],
+  },
 ];

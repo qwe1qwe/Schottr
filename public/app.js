@@ -107,6 +107,15 @@
     });
   });
 
+  /* ---------- Bereiche nur bei angehaktem Kontrollkästchen zeigen (data-show-if="<name>") ---------- */
+  document.querySelectorAll('[data-show-if]').forEach((el) => {
+    const box = el.closest('form')?.querySelector(`input[type="checkbox"][name="${el.dataset.showIf}"]`);
+    if (!box) return;
+    const sync = () => (el.hidden = !box.checked);
+    box.addEventListener('change', sync);
+    sync();
+  });
+
   /* ---------- Kacheln mit Umschalter (z. B. Lieferanten / Verbindlichkeiten) ---------- */
   document.querySelectorAll('[data-tabs]').forEach((box, n) => {
     const key = `schottr:tab:${location.pathname}:${n}`;

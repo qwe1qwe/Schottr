@@ -6,12 +6,16 @@ import {
 } from '../lib/auth.ts';
 import { html } from '../lib/html.ts';
 import {
-  readForm, str, setSessionCookie, clearSessionCookie, redirectWith, clientIp, userOf,
+  readForm, str, type Form, setSessionCookie, clearSessionCookie, redirectWith, clientIp, userOf,
 } from '../lib/http.ts';
 import { barePage, csrfField, page } from '../views/layout.ts';
 import { config } from '../config.ts';
 import { audit, getSetting } from '../lib/audit.ts';
+import { orgFromForm, orgSelect, type OrgType } from '../lib/nonprofit.ts';
 import type { App, Module } from '../types.ts';
+
+/** Angaben zur Organisationsform aus den Anlegeformularen */
+export const tenantOptions = (form: Form) => ({ smallBusiness: str(form, 'small_business') === '1', ...orgFromForm(form) });
 
 /**
  * Registrierung offen? Die Ersteinrichtung ist immer möglich. Danach entscheidet die
@@ -23,10 +27,12 @@ export async function registrationOpen(): Promise<boolean> {
   return setting === null ? config.allowRegistration : setting === '1';
 }
 
-export async function createTenant(name: string, ownerId: number, smallBusiness = false): Promise<number> {
+export async function createTenant(
+  name: string, ownerId: number, opts: { smallBusiness?: boolean; orgType?: OrgType; nonprofit?: boolean } = {},
+): Promise<number> {
   const res = await run(
-    'INSERT INTO tenants (name, small_business, created_at) VALUES (?, ?, ?)',
-    name, smallBusiness ? 1 : 0, nowIso(),
+    'INSERT INTO tenants (name, small_business, org_type, nonprofit, created_at) VALUES (?, ?, ?, ?, ?)',
+    name, opts.smallBusiness ? 1 : 0, opts.orgType ?? 'company', opts.nonprofit ? 1 : 0, nowIso(),
   );
   const tenantId = Number(res.insertId);
   await run('INSERT INTO memberships (user_id, tenant_id, role) VALUES (?, ?, ?)', ownerId, tenantId, 'owner');
@@ -51,7 +57,8 @@ async function registerForm(values: Record<string, string> = {}) {
   return html`
   ${first ? html`<p class="muted">Ersteinrichtung: Lege deinen Zugang und deinen ersten Mandanten (deine Firma) an.</p>` : ''}
   <form method="post" action="/register" class="stack">
-    <label>Firma / Mandant <input name="company" value="${values.company ?? ''}" required maxlength="200"></label>
+    <label>Firma / Verein (Mandant) <input name="company" value="${values.company ?? ''}" required maxlength="200"></label>
+    ${orgSelect(values.org)}
     <label>Dein Name <input name="name" value="${values.name ?? ''}" required maxlength="200" autocomplete="name"></label>
     <label>E-Mail <input type="email" name="email" value="${values.email ?? ''}" required autocomplete="username"></label>
     <label>Passwort <input type="password" name="password" required minlength="10" autocomplete="new-password">
@@ -115,6 +122,7 @@ function register(app: App) {
       company: str(form, 'company', 200),
       name: str(form, 'name', 200),
       email: str(form, 'email', 200).toLowerCase(),
+      org: str(form, 'org', 20),
     };
     const parsed = z
       .object({ company: z.string().min(1, 'Bitte einen Firmennamen angeben.'), name: z.string().min(1, 'Bitte deinen Namen angeben.'), email: emailSchema, password: passwordSchema })
@@ -134,7 +142,7 @@ function register(app: App) {
         values.email, values.name, hash, first ? 1 : 0, nowIso(),
       );
       const userId = Number(res.insertId);
-      const tenantId = await createTenant(values.company, userId, str(form, 'small_business') === '1');
+      const tenantId = await createTenant(values.company, userId, tenantOptions(form));
       await run('UPDATE tenants SET contact_name = ?, email = ? WHERE id = ?', values.name, values.email, tenantId);
       return { userId, tenantId };
     });
@@ -219,7 +227,8 @@ function register(app: App) {
       body: html`<section class="card narrow">
         <form method="post" action="/tenants" class="stack">
           ${csrfField(c)}
-          <label>Firmenname <input name="name" required maxlength="200" autofocus></label>
+          <label>Name der Firma bzw. des Vereins <input name="name" required maxlength="200" autofocus></label>
+          ${orgSelect()}
           <label class="check"><input type="checkbox" name="small_business" value="1"> Kleinunternehmer nach § 19 UStG</label>
           <button class="btn primary">Anlegen</button>
         </form></section>`,
@@ -231,7 +240,7 @@ function register(app: App) {
     const name = str(form, 'name', 200);
     if (!name) return redirectWith(c, '/tenants/new', 'error', 'Bitte einen Namen angeben.');
     const user = userOf(c);
-    const id = await tx(async () => await createTenant(name, user.id, str(form, 'small_business') === '1'));
+    const id = await tx(async () => await createTenant(name, user.id, tenantOptions(form)));
     await setSessionTenant(c.get('session')!.id, id);
     return redirectWith(c, '/settings', 'ok', `Mandant „${name}“ angelegt.`);
   });

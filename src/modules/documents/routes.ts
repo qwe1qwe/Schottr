@@ -1,6 +1,7 @@
 import { all, one, run, tx, nowIso, fromDbTime } from '../../db/index.ts';
 import { nextNumber } from '../../lib/numbering.ts';
-import { html, nl2br, type SafeHtml } from '../../lib/html.ts';
+import { html, nl2br, selected, type SafeHtml } from '../../lib/html.ts';
+import { isSphere, sphereLabel, SPHERES } from '../../lib/nonprofit.ts';
 import { addDays, formatDate, monthEnd, monthLabel, today } from '../../lib/dates.ts';
 import { formatMoney, formatQuantity, formatRate, formatAmount } from '../../lib/money.ts';
 import { unitShort } from '../../lib/units.ts';
@@ -53,6 +54,7 @@ async function newDraft(t: Tenant, kind: Kind, contactId: number): Promise<Draft
     order_reference: '',
     tax_mode: defaultTaxMode(t),
     exemption_reason: '',
+    sphere: t.nonprofit ? t.default_sphere : '',
     type_code: '380',
     skonto_percent: kind === 'invoice' ? t.skonto_percent : 0,
     skonto_days: kind === 'invoice' ? t.skonto_days : 0,
@@ -187,6 +189,20 @@ function register(app: App, kind: Kind) {
       where += ' AND d.finalized_at IS NOT NULL AND d.issue_date >= ? AND d.issue_date <= ?';
       params.push(`${month}-01`, monthEnd(month));
     }
+    // Jahr und Tätigkeitsbereich (aus der Gemeinnützigkeits-Kachel der Übersicht)
+    const yearParam = kind === 'invoice' && !month ? (c.req.query('year') ?? '') : '';
+    const year = /^\d{4}$/.test(yearParam) ? yearParam : '';
+    if (year) {
+      where += ' AND d.finalized_at IS NOT NULL AND substr(d.issue_date, 1, 4) = ?';
+      params.push(year);
+    }
+    const sphereParam = kind === 'invoice' && t.nonprofit ? (c.req.query('sphere') ?? '') : '';
+    const sphere = isSphere(sphereParam) ? sphereParam : '';
+    if (sphere) {
+      // ohne eigene Zuordnung gilt die Vorgabe des Mandanten
+      where += " AND COALESCE(NULLIF(d.sphere, ''), ?) = ?";
+      params.push(t.default_sphere, sphere);
+    }
     if (q) {
       where += ' AND (d.number LIKE ? OR d.subject LIKE ? OR c.company LIKE ? OR c.name LIKE ?)';
       params.push(like, like, like, like);
@@ -204,8 +220,21 @@ function register(app: App, kind: Kind) {
       const qs = new URLSearchParams();
       if (st) qs.set('status', st);
       if (month) qs.set('month', month);
+      if (year) qs.set('year', year);
+      if (sphere) qs.set('sphere', sphere);
       return `${base}${qs.size ? `?${qs}` : ''}`;
     };
+    /** Link ohne einen der Filter (für die Filter-Chips) */
+    const without = (key: 'month' | 'year' | 'sphere') => {
+      const qs = new URLSearchParams();
+      if (status) qs.set('status', status);
+      if (month && key !== 'month') qs.set('month', month);
+      if (year && key !== 'year') qs.set('year', year);
+      if (sphere && key !== 'sphere') qs.set('sphere', sphere);
+      return `${base}${qs.size ? `?${qs}` : ''}`;
+    };
+    const chip = (key: 'month' | 'year' | 'sphere', label: string) =>
+      html`<a class="filter-chip" href="${without(key)}" title="Filter entfernen">${label} <span aria-hidden="true">×</span><span class="sr-only">Filter entfernen</span></a>`;
     return page(c, {
       title: k.many,
       actions: html`<a class="btn primary" href="${base}/new">${kind === 'quote' ? 'Neues Angebot' : 'Neue Rechnung'}</a>`,
@@ -215,12 +244,13 @@ function register(app: App, kind: Kind) {
           (f) => html`<a href="${link(f.value)}" class="${status === f.value ? 'active' : ''}">${f.label}</a>`,
         )}</div>
         ${status ? html`<input type="hidden" name="status" value="${status}">` : ''}
-        ${month ? html`<input type="hidden" name="month" value="${month}">
-          <a class="filter-chip" href="${base}${status ? `?status=${status}` : ''}" title="Monatsfilter entfernen">${monthLabel(month)} <span aria-hidden="true">×</span><span class="sr-only">Filter entfernen</span></a>` : ''}
+        ${month ? html`<input type="hidden" name="month" value="${month}">${chip('month', monthLabel(month) ?? month)}` : ''}
+        ${year ? html`<input type="hidden" name="year" value="${year}">${chip('year', year)}` : ''}
+        ${sphere ? html`<input type="hidden" name="sphere" value="${sphere}">${chip('sphere', sphereLabel(sphere))}` : ''}
         <input type="search" name="q" value="${q}" placeholder="Suchen …" aria-label="Suchen">
       </form>
       ${rows.length
-        ? html`${documentTable(rows, kind)}<p class="muted small right">${rows.length} Beleg(e) · ${month ? `netto ${formatMoney(netSum)} · brutto ` : 'Summe '}${formatMoney(sum)}</p>`
+        ? html`${documentTable(rows, kind)}<p class="muted small right">${rows.length} Beleg(e) · ${month || year || sphere ? `netto ${formatMoney(netSum)} · brutto ` : 'Summe '}${formatMoney(sum)}</p>`
         : empty(`Keine ${k.many} gefunden.`, html`<a class="btn primary" href="${base}/new">${kind === 'quote' ? 'Angebot schreiben' : 'Rechnung schreiben'}</a>`)}`,
     });
   });
@@ -307,6 +337,15 @@ function register(app: App, kind: Kind) {
     if (data.orderReference) meta.push(['Bestellnummer', data.orderReference]);
     if (data.buyerReference) meta.push(['Käuferreferenz', data.buyerReference]);
     meta.push(['Steuer', TAX_MODES.find((m) => m.value === doc.tax_mode)?.label ?? doc.tax_mode]);
+    if (t.nonprofit) {
+      const label = sphereLabel(doc.sphere || t.default_sphere);
+      // festgeschriebene Rechnungen: Bereich bleibt änderbar (interne Zuordnung, nicht Teil des Belegs)
+      meta.push(['Bereich', doc.finalized_at
+        ? html`<form method="post" action="${base}/${doc.id}/sphere" class="inline sphere-form">${csrfField(c)}
+            <select name="sphere" aria-label="Bereich (Gemeinnützigkeit)">${SPHERES.map((s) => html`<option value="${s.value}" title="${s.hint}"${selected(s.value, doc.sphere || t.default_sphere)}>${s.label}</option>`)}</select>
+            <button class="btn small">Ändern</button></form>`
+        : label]);
+    }
     if (doc.finalized_at) meta.push(['Festgeschrieben', fromDbTime(doc.finalized_at).toLocaleString('de-DE', { timeZone: 'Europe/Berlin' })]);
 
     const titleText = kind === 'quote'
@@ -456,6 +495,16 @@ function register(app: App, kind: Kind) {
       const fin = await getDoc(t.id, kind, doc.id);
       await audit(c, doc.revision ? 'invoice.refinalize' : 'invoice.finalize', `${fin?.number}${doc.revision ? ` (Version ${doc.revision + 1})` : ''} · ${formatMoney(fin?.gross_total ?? 0)}`);
       return redirectWith(c, `${base}/${doc.id}`, 'ok', 'Rechnung festgeschrieben. ZUGFeRD-PDF und XRechnung stehen zum Download bereit.');
+    });
+
+    app.post(`${base}/:id/sphere`, async (c) => {
+      const t = tenantOf(c);
+      const doc = await getDoc(t.id, kind, idParam(c)) ?? notFound();
+      const sphere = str(await readForm(c), 'sphere');
+      if (!t.nonprofit || !isSphere(sphere)) return redirectWith(c, `${base}/${doc.id}`, 'error', 'Ungültiger Bereich.');
+      await run('UPDATE documents SET sphere = ?, updated_at = ? WHERE id = ?', sphere, nowIso(), doc.id);
+      await audit(c, 'document.sphere', `${doc.number ?? doc.id}: ${sphereLabel(sphere)}`);
+      return redirectWith(c, `${base}/${doc.id}`, 'ok', `Bereich auf „${sphereLabel(sphere)}“ gesetzt.`);
     });
 
     app.post(`${base}/:id/paid`, async (c) => {

@@ -32,7 +32,12 @@ export interface Seller extends Party {
   registerCourt: string;
   registerNumber: string;
   managingDirectors: string;
+  /** Vereine nennen ihren Vorstand statt der Geschäftsführung (fehlt in älteren Snapshots) */
+  orgType?: 'company' | 'association';
 }
+
+/** Bezeichnung der Vertretung: „Vorstand“ beim Verein, sonst Geschäftsführung */
+export const representativeLabel = (s: { orgType?: string }, company = 'Geschäftsführer') => (s.orgType === 'association' ? 'Vorstand' : company);
 
 export interface Buyer extends Party {
   customerNumber: string;
@@ -138,6 +143,7 @@ export function sellerFromTenant(t: Tenant): Seller {
     registerCourt: t.register_court,
     registerNumber: t.register_number,
     managingDirectors: t.managing_directors,
+    orgType: t.org_type === 'association' ? 'association' : 'company',
   };
 }
 

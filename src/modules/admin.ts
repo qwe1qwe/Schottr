@@ -9,7 +9,8 @@ import { idParam, notFound, readForm, redirectWith, str, userOf } from '../lib/h
 import { formatMoney } from '../lib/money.ts';
 import { csrfField, page, empty } from '../views/layout.ts';
 import { config } from '../config.ts';
-import { createTenant, emailSchema, passwordSchema } from './auth.ts';
+import { createTenant, emailSchema, passwordSchema, tenantOptions } from './auth.ts';
+import { orgSelect } from '../lib/nonprofit.ts';
 import type { App, Ctx, Module } from '../types.ts';
 
 /**
@@ -151,7 +152,8 @@ function register(app: App) {
       back: { href: '/admin/tenants', label: 'Mandanten' },
       body: html`<form method="post" action="/admin/tenants" class="card narrow stack">
         ${csrfField(c)}
-        <label>Firmenname <input name="name" required maxlength="200"></label>
+        <label>Name der Firma bzw. des Vereins <input name="name" required maxlength="200"></label>
+        ${orgSelect()}
         <label>Inhaber (E-Mail eines bestehenden Kontos) <input type="email" name="owner" required></label>
         <label class="check"><input type="checkbox" name="small_business" value="1"> Kleinunternehmer nach § 19 UStG</label>
         <button class="btn primary">Anlegen</button>
@@ -165,7 +167,7 @@ function register(app: App) {
     const owner = await one<{ id: number }>('SELECT id FROM users WHERE email = ?', str(form, 'owner', 200).toLowerCase());
     if (!name) return redirectWith(c, '/admin/tenants/new', 'error', 'Bitte einen Namen angeben.');
     if (!owner) return redirectWith(c, '/admin/tenants/new', 'error', 'Kein Konto mit dieser E-Mail-Adresse – bitte zuerst unter „Benutzer“ anlegen.');
-    const id = await tx(() => createTenant(name, owner.id, str(form, 'small_business') === '1'));
+    const id = await tx(() => createTenant(name, owner.id, tenantOptions(form)));
     await audit(c, 'admin.tenant.create', name, { tenantId: id });
     return redirectWith(c, `/admin/tenants/${id}`, 'ok', `Mandant „${name}“ angelegt.`);
   });

@@ -5,7 +5,7 @@ import { formatDate } from '../lib/dates.ts';
 import { formatAmount, formatMoney, formatQuantity, formatRate } from '../lib/money.ts';
 import { unitShort } from '../lib/units.ts';
 import { formatIban } from '../lib/validate.ts';
-import { INVOICE_TYPES, dueAmount, type DocumentData } from './model.ts';
+import { INVOICE_TYPES, dueAmount, representativeLabel, type DocumentData } from './model.ts';
 
 const FONT_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '../../assets/fonts');
 const FONTS = {
@@ -102,6 +102,7 @@ export interface LetterSeller extends LetterParty {
   registerCourt: string;
   registerNumber: string;
   managingDirectors: string;
+  orgType?: 'company' | 'association';
 }
 
 export interface LetterOptions {
@@ -240,7 +241,7 @@ export function startLetter(o: LetterOptions): Letter {
 
   const finish = () => {
     const footerCols = [
-      [s.name, s.street, [s.zip, s.city].join(' '), s.managingDirectors ? `Geschäftsführung: ${s.managingDirectors}` : ''],
+      [s.name, s.street, [s.zip, s.city].join(' '), s.managingDirectors ? `${representativeLabel(s, 'Geschäftsführung')}: ${s.managingDirectors}` : ''],
       [s.phone ? `Tel. ${s.phone}` : '', s.email, s.website, [s.registerCourt, s.registerNumber].filter(Boolean).join(' ')],
       [s.taxNumber ? `Steuernr. ${s.taxNumber}` : '', s.vatId ? `USt-IdNr. ${s.vatId}` : '', s.bankName, s.iban ? `IBAN ${formatIban(s.iban)}` : '', s.bic ? `BIC ${s.bic}` : ''],
     ].map((c) => c.filter(Boolean).join('\n'));

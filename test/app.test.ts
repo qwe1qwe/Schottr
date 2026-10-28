@@ -829,3 +829,110 @@ test('Nachweise aus der Datenbank werden in die Dateiablage verschoben', opts, a
   await req('/tenant/switch', { form: { tenant_id: String(first.id) } });
   assert.deepEqual(Buffer.from(await (await req(`/proofs/${row.id}/file`)).arrayBuffer()), data);
 });
+
+test('Gemeinnütziger Verein: Bereich je Rechnung, Grenzen in der Übersicht, Vorstand auf dem Beleg', opts, async () => {
+  await refreshCsrf();
+  let res = await req('/tenants', { form: { name: 'Musikverein Teststadt e. V.', org: 'nonprofit' } });
+  assert.equal(location(res), '/settings');
+  const t = (await one("SELECT * FROM tenants WHERE name = 'Musikverein Teststadt e. V.'"))!;
+  assert.equal(t.org_type, 'association');
+  assert.equal(t.nonprofit, 1);
+
+  // Einstellungen mit Vereins-Beschriftungen
+  let page = await (await req('/settings')).text();
+  assert.match(page, /<legend>Verein<\/legend>/);
+  assert.match(page, /Name des Vereins/);
+  assert.match(page, /Vorstand/);
+  assert.match(page, /name="nonprofit" value="1" checked/);
+
+  res = await req('/settings', {
+    form: {
+      name: 'Musikverein Teststadt e. V.', contact_name: 'Kai Kasse', street: 'Weg 3', zip: '12345', city: 'Teststadt', country: 'DE',
+      email: 'verein@example.com', phone: '0301234', website: '', tax_number: '12/345/99999', vat_id: '',
+      managing_directors: 'Vera Vorstand', register_court: 'Amtsgericht Teststadt', register_number: 'VR 1234', bank_name: 'Bank',
+      iban: 'DE02120300000000202051', bic: '', quote_number_format: 'AN-{YYYY}-{NNNN}', invoice_number_format: 'MV-{YYYY}-{NNNN}',
+      customer_number_format: 'K{NNNNN}', supplier_number_format: 'L{NNNNN}', payment_days: '14', quote_valid_days: '30',
+      org_type: 'association', nonprofit: '1', default_sphere: 'purpose',
+    },
+  });
+  assert.equal(location(res), '/settings');
+  assert.equal((await one('SELECT default_sphere FROM tenants WHERE id = ?', t.id))!.default_sphere, 'purpose');
+
+  res = await req('/contacts', { form: { company: 'Brauerei GmbH', street: 'Hopfenweg 1', zip: '54321', city: 'Ort', country: 'DE', email: 'b@example.com' } });
+  const contactId = location(res).split('/').pop()!;
+
+  // Formular zeigt den Bereich mit der Vorgabe
+  page = await (await req('/invoices/new')).text();
+  assert.match(page, /Bereich \(Gemeinnützigkeit\)/);
+  assert.match(page, /<option value="purpose"[^>]* selected>/);
+
+  const d = new Date().toISOString().slice(0, 10);
+  const year = d.slice(0, 4);
+  const invoice = async (sphere: string, price: string) => {
+    const r = await req('/invoices', {
+      form: {
+        contact_id: contactId, type_code: '380', issue_date: d, due_date: d, service_mode: 'date', service_date: d, sphere,
+        'item_title[]': 'Leistung', 'item_description[]': '', 'item_quantity[]': '1', 'item_unit[]': 'LS', 'item_price[]': price, 'item_vat[]': '1900',
+      },
+    });
+    const id = location(r).split('/').pop()!;
+    assert.match(id, /^\d+$/);
+    await req(`/invoices/${id}/finalize`, { form: {} });
+    const doc = (await one('SELECT * FROM documents WHERE id = ?', Number(id)))!;
+    assert.ok(doc.finalized_at, 'festgeschrieben');
+    assert.equal(doc.sphere, sphere);
+    return doc;
+  };
+  // Sponsoring 42.000 € brutto (wirtschaftlicher Geschäftsbetrieb) und 1.190 € brutto ideeller Bereich
+  const sponsoring = await invoice('business', '35294,12');
+  const beitrag = await invoice('ideell', '1000');
+  assert.equal(sponsoring.gross_total, 4200000);
+
+  // Vorstand statt Geschäftsführer im XML
+  const xml = await (await req(`/invoices/${sponsoring.id}/xrechnung.xml`)).text();
+  assert.match(xml, /Vorstand: Vera Vorstand/);
+  assert.doesNotMatch(xml, /Geschäftsführer/);
+
+  // Übersicht: Grenze § 64 Abs. 3 AO, 42.000 € ≥ 80 % von 50.000 € → Warnung
+  page = await (await req('/')).text();
+  assert.match(page, /Gemeinnützigkeit \d{4}/);
+  assert.match(page, /§ 64 Abs\. 3 AO/);
+  assert.match(page, /aria-valuemax="5000000" aria-valuenow="4200000"/);
+  assert.match(page, /ku-status ku-warn"><strong>Achtung:<\/strong> nur noch/);
+  assert.match(page, /aria-valuemax="10000000" aria-valuenow="4319000"/, 'Einnahmen gesamt gegen 100.000 €');
+  assert.match(page, new RegExp(`href="/invoices\\?year=${year}&amp;sphere=ideell"`));
+  assert.doesNotMatch(page, /Sportliche Veranstaltungen \d{4}/, 'ohne Sporteinnahmen keine Sportzeile');
+
+  // Liste nach Jahr und Bereich filtern
+  const list = await (await req(`/invoices?year=${year}&sphere=ideell`)).text();
+  assert.match(list, new RegExp(`href="/invoices/${beitrag.id}"`));
+  assert.doesNotMatch(list, new RegExp(`href="/invoices/${sponsoring.id}"`));
+
+  // Bereich nach dem Festschreiben ändern: Sponsoring war doch Zweckbetrieb
+  res = await req(`/invoices/${sponsoring.id}/sphere`, { form: { sphere: 'purpose' } });
+  assert.equal(location(res), `/invoices/${sponsoring.id}`);
+  assert.equal((await one('SELECT sphere FROM documents WHERE id = ?', sponsoring.id))!.sphere, 'purpose');
+  page = await (await req('/')).text();
+  assert.match(page, /aria-valuemax="5000000" aria-valuenow="0"/);
+
+  // Sportliche Veranstaltungen über 50.000 € zählen zum wirtschaftlichen Geschäftsbetrieb
+  await run("UPDATE documents SET sphere = 'sport' WHERE id = ?", sponsoring.id);
+  await invoice('sport', '9000'); // + 10.710 € → 52.710 € Sport
+  page = await (await req('/')).text();
+  assert.match(page, /Sportliche Veranstaltungen \d{4} \(§ 67a AO\)/);
+  assert.match(page, /inkl\. Sport/);
+  assert.match(page, /aria-valuemax="5000000" aria-valuenow="5271000"/);
+
+  // Kleinunternehmergrenze ohne ideellen Bereich (netto)
+  await run('UPDATE tenants SET small_business = 1 WHERE id = ?', t.id);
+  page = await (await req('/')).text();
+  assert.match(page, /Kleinunternehmergrenze/);
+  assert.match(page, /aria-valuemax="10000000" aria-valuenow="4429412"/, '35.294,12 € + 9.000 € netto, ohne die 1.000 € Beitrag');
+  assert.match(page, /\(ohne ideellen Bereich\)/);
+
+  // ohne Gemeinnützigkeit keine Kachel und kein Bereichsfeld
+  await run('UPDATE tenants SET nonprofit = 0, small_business = 0 WHERE id = ?', t.id);
+  page = await (await req('/')).text();
+  assert.doesNotMatch(page, /Gemeinnützigkeit \d{4}/);
+  assert.doesNotMatch(await (await req('/invoices/new')).text(), /Bereich \(Gemeinnützigkeit\)/);
+});

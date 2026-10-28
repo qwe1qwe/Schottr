@@ -9,6 +9,7 @@ import { writeProofLinks } from '../proofs.ts';
 import { FINAL_TYPES, SELECTABLE_TYPES, type Prepayment } from '../../einvoice/model.ts';
 import type { Tenant } from '../../types.ts';
 import { getContact, isCustomer } from '../contacts.ts';
+import { isSphere } from '../../lib/nonprofit.ts';
 
 export type Kind = 'quote' | 'invoice';
 
@@ -33,6 +34,8 @@ export interface Doc {
   order_reference: string;
   tax_mode: TaxMode;
   exemption_reason: string;
+  /** Tätigkeitsbereich bei gemeinnützigen Mandanten (lib/nonprofit.ts), sonst leer */
+  sphere: string;
   currency: string;
   net_total: number;
   tax_total: number;
@@ -65,7 +68,7 @@ export interface Item {
 }
 
 const DOC_COLUMNS =
-  'id, tenant_id, kind, type_code, number, status, contact_id, issue_date, valid_until, due_date, service_date, service_from, service_to, subject, intro, outro, buyer_reference, order_reference, tax_mode, exemption_reason, currency, net_total, tax_total, gross_total, prepaid_total, revision, skonto_percent, skonto_days, source_quote_id, corrects_id, snapshot, finalized_at, paid_at, created_at, updated_at';
+  'id, tenant_id, kind, type_code, number, status, contact_id, issue_date, valid_until, due_date, service_date, service_from, service_to, subject, intro, outro, buyer_reference, order_reference, tax_mode, exemption_reason, sphere, currency, net_total, tax_total, gross_total, prepaid_total, revision, skonto_percent, skonto_days, source_quote_id, corrects_id, snapshot, finalized_at, paid_at, created_at, updated_at';
 
 export async function getDoc(tenantId: number, kind: Kind, id: number): Promise<Doc | undefined> {
   return await one<Doc>(`SELECT ${DOC_COLUMNS} FROM documents WHERE tenant_id = ? AND kind = ? AND id = ?`, tenantId, kind, id);
@@ -105,6 +108,8 @@ export interface DraftInput {
   order_reference: string;
   tax_mode: TaxMode;
   exemption_reason: string;
+  /** Tätigkeitsbereich (nur gemeinnützige Mandanten) */
+  sphere: string;
   /** BT-3 – nur Rechnungen */
   type_code: string;
   skonto_percent: number;
@@ -170,6 +175,7 @@ export async function parseDraft(form: Form, kind: Kind, tenantId: number): Prom
     tax_mode: (['standard', 'small_business', 'reverse_charge', 'exempt'].includes(str(form, 'tax_mode'))
       ? str(form, 'tax_mode') : 'standard') as TaxMode,
     exemption_reason: str(form, 'exemption_reason', 300),
+    sphere: isSphere(str(form, 'sphere')) ? str(form, 'sphere') : '',
     type_code: '380',
     skonto_percent: 0,
     skonto_days: 0,
@@ -283,11 +289,11 @@ export async function createDraft(t: Tenant, kind: Kind, input: DraftInput, user
     const res = await run(
       `INSERT INTO documents (tenant_id, kind, type_code, number, status, contact_id, issue_date, valid_until, due_date,
         service_date, service_from, service_to, subject, intro, outro, buyer_reference, order_reference, tax_mode,
-        exemption_reason, skonto_percent, skonto_days, source_quote_id, corrects_id, created_by, created_at, updated_at)
-       VALUES (?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        exemption_reason, sphere, skonto_percent, skonto_days, source_quote_id, corrects_id, created_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       t.id, kind, extra.type_code ?? (kind === 'invoice' ? input.type_code : '380'), number, input.contact_id, input.issue_date, input.valid_until, input.due_date,
       input.service_date, input.service_from, input.service_to, input.subject, input.intro, input.outro,
-      input.buyer_reference, input.order_reference, input.tax_mode, input.exemption_reason,
+      input.buyer_reference, input.order_reference, input.tax_mode, input.exemption_reason, input.sphere,
       input.skonto_percent, input.skonto_days, extra.source_quote_id ?? null, extra.corrects_id ?? null, userId, now, now,
     );
     const id = Number(res.insertId);
@@ -311,11 +317,11 @@ export async function updateDraft(t: Tenant, doc: Doc, input: DraftInput) {
     await run(
       `UPDATE documents SET contact_id = ?, issue_date = ?, valid_until = ?, due_date = ?, service_date = ?, service_from = ?,
         service_to = ?, subject = ?, intro = ?, outro = ?, buyer_reference = ?, order_reference = ?, tax_mode = ?,
-        exemption_reason = ?, type_code = ?, skonto_percent = ?, skonto_days = ?, net_total = ?, tax_total = ?, gross_total = ?,
+        exemption_reason = ?, sphere = ?, type_code = ?, skonto_percent = ?, skonto_days = ?, net_total = ?, tax_total = ?, gross_total = ?,
         prepaid_total = ?, updated_at = ? WHERE id = ?`,
       input.contact_id, input.issue_date, input.valid_until, input.due_date, input.service_date, input.service_from,
       input.service_to, input.subject, input.intro, input.outro, input.buyer_reference, input.order_reference,
-      input.tax_mode, input.exemption_reason, typeCode, input.skonto_percent, input.skonto_days,
+      input.tax_mode, input.exemption_reason, input.sphere, typeCode, input.skonto_percent, input.skonto_days,
       totals.net, totals.tax, totals.gross, prepaid, nowIso(), doc.id,
     );
   });
@@ -337,6 +343,7 @@ export function docToInput(doc: Doc, items: Item[]): DraftInput {
     order_reference: doc.order_reference,
     tax_mode: doc.tax_mode,
     exemption_reason: doc.exemption_reason,
+    sphere: doc.sphere,
     type_code: doc.type_code,
     skonto_percent: doc.skonto_percent,
     skonto_days: doc.skonto_days,

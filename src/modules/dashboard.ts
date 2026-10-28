@@ -12,15 +12,19 @@ import { userOf } from '../lib/http.ts';
 import { openLiabilities } from './purchases/routes.ts';
 import { purchaseBadge, purchaseStatus } from './purchases/views.ts';
 import { dueOf, payable, type Purchase } from './purchases/repo.ts';
+import { isSphere, nonprofitLimits, NONPROFIT_ALLOWANCE, SPHERES, type Sphere } from '../lib/nonprofit.ts';
 import type { Module, Tenant } from '../types.ts';
 
 /**
  * Netto-Umsatz festgeschriebener Rechnungen. Stornos zählen negativ; bei Teilschluss- und
  * Schlussrechnungen werden die bereits als Teilrechnung erfassten Beträge abgezogen (sonst doppelt).
  */
-const REVENUE = `COALESCE(SUM(CASE WHEN documents.type_code = '381' THEN -documents.net_total ELSE documents.net_total -
-  (SELECT COALESCE(SUM(p.net_total), 0) FROM document_prepayments x JOIN documents p ON p.id = x.prepaid_id WHERE x.document_id = documents.id)
+const revenueSql = (col: 'net_total' | 'gross_total') => `COALESCE(SUM(CASE WHEN documents.type_code = '381' THEN -documents.${col} ELSE documents.${col} -
+  (SELECT COALESCE(SUM(p.${col}), 0) FROM document_prepayments x JOIN documents p ON p.id = x.prepaid_id WHERE x.document_id = documents.id)
 END), 0)`;
+const REVENUE = revenueSql('net_total');
+/** Wie REVENUE, aber brutto – die Grenzen der Abgabenordnung beziehen sich auf Einnahmen einschließlich Umsatzsteuer */
+const GROSS_REVENUE = revenueSql('gross_total');
 
 const MONTHS = MONTH_NAMES;
 
@@ -37,12 +41,16 @@ const COST = (t: Pick<Tenant, 'small_business'>) => {
 const KU_PREV_YEAR_LIMIT = 25_000_00;
 const KU_CURRENT_YEAR_LIMIT = 100_000_00;
 
-/** Netto-Umsatz eines Jahres aus festgeschriebenen Rechnungen */
-async function yearRevenue(tenantId: number, year: string | number): Promise<{ n: number; s: number }> {
+/**
+ * Netto-Umsatz eines Jahres aus festgeschriebenen Rechnungen. Bei gemeinnützigen Mandanten
+ * (Vorgabe-Bereich übergeben) bleibt der ideelle Bereich außen vor – er ist nicht unternehmerisch.
+ */
+async function yearRevenue(tenantId: number, year: string | number, nonprofitDefault: string | null = null): Promise<{ n: number; s: number }> {
   const r = await one<{ n: number; s: number | string }>(
     `SELECT COUNT(*) n, ${REVENUE} s FROM documents
-     WHERE tenant_id = ? AND kind = 'invoice' AND finalized_at IS NOT NULL AND substr(issue_date, 1, 4) = ?`,
-    tenantId, String(year),
+     WHERE tenant_id = ? AND kind = 'invoice' AND finalized_at IS NOT NULL AND substr(issue_date, 1, 4) = ?
+       ${nonprofitDefault !== null ? "AND COALESCE(NULLIF(sphere, ''), ?) <> 'ideell'" : ''}`,
+    tenantId, String(year), ...(nonprofitDefault !== null ? [nonprofitDefault] : []),
   );
   return { n: Number(r?.n ?? 0), s: Number(r?.s ?? 0) };
 }
@@ -215,9 +223,10 @@ async function supplierCard(t: Tenant, todayIso: string) {
 }
 
 /** Kleinunternehmergrenze nach § 19 UStG – nur wenn die Regelung aktiv ist */
-async function smallBusinessLimits(tenantId: number, year: number) {
-  const prev = await yearRevenue(tenantId, year - 1);
-  const cur = await yearRevenue(tenantId, year);
+async function smallBusinessLimits(t: Tenant, year: number) {
+  const npo = t.nonprofit ? t.default_sphere : null;
+  const prev = await yearRevenue(t.id, year - 1, npo);
+  const cur = await yearRevenue(t.id, year, npo);
   const prevOver = prev.s > KU_PREV_YEAR_LIMIT;
   const next = year + 1;
   // Zustand: unter 80 % der 25.000-€-Grenze ok, darüber Warnung, über 25.000 € Folgejahr betroffen, über 100.000 € sofort
@@ -238,7 +247,79 @@ async function smallBusinessLimits(tenantId: number, year: number) {
     <p class="small ku-status ku-${state}">${status}</p>
     <p class="small ${prevOver ? 'danger-text' : 'muted'}">Vorjahr ${year - 1}: ${formatMoney(prev.s)}
       ${prevOver ? ` – über ${formatMoney(KU_PREV_YEAR_LIMIT)}, die Kleinunternehmerregelung ist ${year} nicht anwendbar.` : ` – innerhalb der Grenze von ${formatMoney(KU_PREV_YEAR_LIMIT)}.`}</p>
-    <p class="muted small">Berechnet aus den festgeschriebenen Rechnungen in Schottr. Maßgeblich ist dein gesamter Umsatz – Umsätze außerhalb von Schottr zählen mit.</p>
+    <p class="muted small">Berechnet aus den festgeschriebenen Rechnungen in Schottr${t.nonprofit ? ' (ohne ideellen Bereich)' : ''}. Maßgeblich ist dein gesamter Umsatz – Umsätze außerhalb von Schottr zählen mit.</p>
+  </section>`;
+}
+
+/** Einnahmen (brutto) je Tätigkeitsbereich eines Jahres; Rechnungen ohne Zuordnung zählen zum Vorgabe-Bereich */
+async function sphereRevenue(t: Tenant, year: number): Promise<Record<Sphere, { n: number; s: number }>> {
+  const rows = await all<{ sp: string; n: number; s: number | string }>(
+    `SELECT COALESCE(NULLIF(sphere, ''), ?) sp, COUNT(*) n, ${GROSS_REVENUE} s FROM documents
+     WHERE tenant_id = ? AND kind = 'invoice' AND finalized_at IS NOT NULL AND substr(issue_date, 1, 4) = ?
+     GROUP BY sp`,
+    t.default_sphere || 'business', t.id, String(year),
+  );
+  const out = Object.fromEntries(SPHERES.map((x) => [x.value, { n: 0, s: 0 }])) as Record<Sphere, { n: number; s: number }>;
+  for (const r of rows) if (isSphere(String(r.sp))) out[r.sp as Sphere] = { n: Number(r.n), s: Number(r.s) };
+  return out;
+}
+
+/**
+ * Wirtschaftliche Geschäftsbetriebe eines Jahres (brutto). Sportliche Veranstaltungen über der
+ * Zweckbetriebsgrenze des § 67a AO sind selbst ein wirtschaftlicher Geschäftsbetrieb und zählen dann mit.
+ */
+function businessIncome(r: Record<Sphere, { s: number }>, year: number) {
+  const sportOver = r.sport.s > nonprofitLimits(year).sport;
+  return { s: r.business.s + (sportOver ? r.sport.s : 0), sportOver };
+}
+
+/** Grenzen für gemeinnützige Körperschaften (§ 64 Abs. 3, § 67a, § 55 Abs. 1 Nr. 5 AO) – nur wenn aktiviert */
+async function nonprofitLimitsCard(t: Tenant, year: number) {
+  const lim = nonprofitLimits(year);
+  const cur = await sphereRevenue(t, year);
+  const prev = await sphereRevenue(t, year - 1);
+  const biz = businessIncome(cur, year);
+  const prevBiz = businessIncome(prev, year - 1);
+  const prevLim = nonprofitLimits(year - 1);
+  const total = SPHERES.reduce((a, x) => a + cur[x.value].s, 0);
+  const euro = (v: number) => formatMoney(v).replace(/,00(?=\s?€)/, '');
+  const level = (v: number, max: number) => (v > max ? 'danger' : v >= max * 0.8 ? 'warn' : 'ok') as 'ok' | 'warn' | 'danger';
+
+  const bizState = level(biz.s, lim.business);
+  const bizStatus = bizState === 'danger'
+    ? html`<strong>${euro(lim.business)} überschritten:</strong> Der Gewinn der wirtschaftlichen Geschäftsbetriebe ist ${year} körperschaft- und gewerbesteuerpflichtig –
+        bei Vereinen und Stiftungen nach Abzug eines Freibetrags von je ${euro(NONPROFIT_ALLOWANCE)} (§ 24 KStG, § 11 GewStG). Am besten mit dem Steuerberater sprechen.`
+    : html`${bizState === 'warn' ? html`<strong>Achtung:</strong> nur noch` : 'Noch'} <strong>${formatMoney(lim.business - biz.s)}</strong> bis ${euro(lim.business)} –
+        bleiben die Einnahmen darunter, fällt auf den Gewinn der wirtschaftlichen Geschäftsbetriebe keine Körperschaft- und Gewerbesteuer an.`;
+
+  const sportState = level(cur.sport.s, lim.sport);
+  const sport = cur.sport.s > 0 || prev.sport.s > 0
+    ? html`${meter(cur.sport.s, lim.sport, { label: `Sportliche Veranstaltungen ${year} (§ 67a AO)`, state: sportState })}
+      <p class="small ku-status ku-${sportState}">${sportState === 'danger'
+        ? html`<strong>${euro(lim.sport)} überschritten:</strong> Die sportlichen Veranstaltungen sind ${year} ein steuerpflichtiger wirtschaftlicher Geschäftsbetrieb
+            und zählen oben mit – es sei denn, der Verein hat nach § 67a Abs. 2 AO auf die Zweckbetriebsgrenze verzichtet.`
+        : html`Bis ${euro(lim.sport)} (einschl. USt.) gelten sportliche Veranstaltungen als Zweckbetrieb – noch ${formatMoney(lim.sport - cur.sport.s)}.`}</p>`
+    : '';
+
+  const fundsState = total > lim.funds ? 'over' : 'ok';
+  return html`<section class="card ku npo">
+    <h2>Gemeinnützigkeit ${year} <span class="muted small">Grenzen nach der Abgabenordnung</span></h2>
+    ${meter(biz.s, lim.business, { label: html`Wirtschaftliche Geschäftsbetriebe ${year} (§ 64 Abs. 3 AO)${biz.sportOver ? ' inkl. Sport' : ''}`, state: bizState })}
+    <p class="small ku-status ku-${bizState}">${bizStatus}</p>
+    ${sport}
+    ${meter(total, lim.funds, { label: `Einnahmen ${year} gesamt (§ 55 Abs. 1 Nr. 5 AO)`, state: fundsState === 'over' ? 'warn' : 'ok' })}
+    <p class="small ku-status ku-${fundsState}">${fundsState === 'over'
+      ? html`<strong>Über ${euro(lim.funds)}:</strong> Die Mittel müssen zeitnah – spätestens bis Ende des übernächsten Jahres – für die satzungsmäßigen Zwecke verwendet werden.`
+      : html`Bis ${euro(lim.funds)} Einnahmen im Jahr entfällt die Pflicht zur zeitnahen Mittelverwendung.
+          Spenden, Mitgliedsbeiträge und Zuschüsse ohne Rechnung zählen mit.`}</p>
+    <ul class="plain npo-split small">${SPHERES.map((x) => html`<li>
+      <a href="/invoices?year=${year}&amp;sphere=${x.value}" title="${x.hint}">${x.label}</a>
+      <span class="muted">${cur[x.value].n} Rechnung(en)</span>
+      <strong class="num">${formatMoney(cur[x.value].s)}</strong></li>`)}</ul>
+    <p class="small ${prevBiz.s > prevLim.business ? 'danger-text' : 'muted'}">Vorjahr ${year - 1}: ${formatMoney(prevBiz.s)} in wirtschaftlichen Geschäftsbetrieben
+      ${prevBiz.s > prevLim.business ? ` – über der Grenze von ${euro(prevLim.business)}.` : ` – innerhalb der Grenze von ${euro(prevLim.business)}.`}</p>
+    <p class="muted small">Brutto aus den festgeschriebenen Rechnungen in Schottr (Stornos abgezogen), zugeordnet nach dem Bereich der Rechnung.
+      Einnahmen ohne Rechnung – etwa Barverkäufe beim Vereinsfest – zählen mit. Keine Steuerberatung.</p>
   </section>`;
 }
 
@@ -267,7 +348,8 @@ export const dashboardModule: Module = {
       const customers = await topCustomers(t.id, d);
       const suppliers = await supplierCard(t, d);
       const liab = await openLiabilities(t.id);
-      const ku = t.small_business ? await smallBusinessLimits(t.id, Number(year)) : null;
+      const ku = t.small_business ? await smallBusinessLimits(t, Number(year)) : null;
+      const npo = t.nonprofit ? await nonprofitLimitsCard(t, Number(year)) : null;
       const drafts = await all(
         `SELECT d.*, COALESCE(NULLIF(c.company, ''), c.name) contact_label FROM documents d JOIN contacts c ON c.id = d.contact_id
          WHERE d.tenant_id = ? AND d.kind = 'invoice' AND d.status = 'draft' ORDER BY d.updated_at DESC LIMIT 10`, t.id,
@@ -307,7 +389,7 @@ export const dashboardModule: Module = {
         ${chart}
         ${result}
         <div class="dash-grid">${customers}${suppliers}</div>
-        ${ku ? html`<div class="dash-grid single">${ku}</div>` : ''}
+        ${ku || npo ? html`<div class="dash-grid ${ku && npo ? '' : 'single'}">${npo ?? ''}${ku ?? ''}</div>` : ''}
         ${drafts.length ? html`<h2 class="section-title">Rechnungsentwürfe</h2>${documentTable(drafts, 'invoice')}` : ''}
         <h2 class="section-title">Offene Rechnungen</h2>
         ${openList.length ? documentTable(openList, 'invoice') : html`<p class="muted">Keine offenen Rechnungen. 🎉</p>`}`,

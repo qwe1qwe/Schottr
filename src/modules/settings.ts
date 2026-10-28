@@ -12,16 +12,22 @@ import { isValidBic, isValidEmail, isValidIban, isValidVatId, normalizeIban, nor
 import { csrfField, page } from '../views/layout.ts';
 import { emailSchema, passwordSchema } from './auth.ts';
 import { EXPENSE_CATEGORIES } from '../lib/expenses.ts';
+import { isSphere, SPHERES } from '../lib/nonprofit.ts';
 import type { App, Ctx, Module, Tenant } from '../types.ts';
 
-type Field = { key: keyof Tenant; label: string; type?: string; max?: number; hint?: string; textarea?: boolean; options?: [string, string][]; min?: number; max2?: number };
+type Field = {
+  key: keyof Tenant; label: string; type?: string; max?: number; hint?: string; textarea?: boolean; options?: [string, string][]; min?: number; max2?: number;
+  /** abweichende Beschriftung für Vereine */
+  assoc?: { label?: string; hint?: string };
+};
 
-const sections: { title: string; text?: string; fields: Field[] }[] = [
+const sections: { title: string; assocTitle?: string; text?: string; fields: Field[] }[] = [
   {
     title: 'Firma',
+    assocTitle: 'Verein',
     fields: [
-      { key: 'name', label: 'Firmenname', max: 200 },
-      { key: 'contact_name', label: 'Ansprechpartner / Inhaber', max: 200, hint: 'Pflicht für XRechnung (Verkäuferkontakt)' },
+      { key: 'name', label: 'Firmenname', max: 200, assoc: { label: 'Name des Vereins', hint: 'wie im Vereinsregister, z. B. Musterverein e. V.' } },
+      { key: 'contact_name', label: 'Ansprechpartner / Inhaber', max: 200, hint: 'Pflicht für XRechnung (Verkäuferkontakt)', assoc: { label: 'Ansprechpartner (z. B. Kassenwart)' } },
       { key: 'street', label: 'Straße und Hausnummer', max: 200 },
       { key: 'zip', label: 'PLZ', max: 10 },
       { key: 'city', label: 'Ort', max: 100 },
@@ -42,9 +48,10 @@ const sections: { title: string; text?: string; fields: Field[] }[] = [
     fields: [
       { key: 'tax_number', label: 'Steuernummer', max: 30 },
       { key: 'vat_id', label: 'USt-IdNr. (optional)', max: 20, hint: 'z. B. DE123456789 – nur nötig, wenn vorhanden oder für Reverse Charge' },
-      { key: 'managing_directors', label: 'Geschäftsführer', max: 200, hint: 'bei GmbH/UG Pflichtangabe (§ 35a GmbHG)' },
-      { key: 'register_court', label: 'Registergericht', max: 100, hint: 'z. B. Amtsgericht München' },
-      { key: 'register_number', label: 'Registernummer', max: 50, hint: 'z. B. HRB 123456' },
+      { key: 'managing_directors', label: 'Geschäftsführer', max: 200, hint: 'bei GmbH/UG Pflichtangabe (§ 35a GmbHG)',
+        assoc: { label: 'Vorstand', hint: 'vertretungsberechtigte Vorstandsmitglieder (§ 26 BGB) – erscheint als „Vorstand“ auf den Belegen' } },
+      { key: 'register_court', label: 'Registergericht', max: 100, hint: 'z. B. Amtsgericht München', assoc: { hint: 'Amtsgericht des Vereinsregisters – leer lassen bei nicht eingetragenen Vereinen' } },
+      { key: 'register_number', label: 'Registernummer', max: 50, hint: 'z. B. HRB 123456', assoc: { hint: 'z. B. VR 1234' } },
     ],
   },
   {
@@ -113,7 +120,8 @@ const sections: { title: string; text?: string; fields: Field[] }[] = [
   },
 ];
 
-function field(t: Tenant, f: Field, disabled: boolean): SafeHtml {
+function field(t: Tenant, f0: Field, disabled: boolean): SafeHtml {
+  const f = t.org_type === 'association' && f0.assoc ? { ...f0, ...f0.assoc } : f0;
   const value = t[f.key] as string | number;
   const attrs = html`name="${f.key}" ${f.max ? html`maxlength="${f.max}"` : ''} ${disabled ? html`disabled` : ''}`;
   if (f.options) {
@@ -132,7 +140,7 @@ function field(t: Tenant, f: Field, disabled: boolean): SafeHtml {
 /** Prüft die Firmendaten und liefert Fehlermeldungen. */
 export function tenantProblems(t: Tenant): string[] {
   const p: string[] = [];
-  if (!t.name) p.push('Firmenname');
+  if (!t.name) p.push(t.org_type === 'association' ? 'Vereinsname' : 'Firmenname');
   if (!t.street || !t.zip || !t.city) p.push('vollständige Anschrift');
   if (!t.tax_number && !t.vat_id) p.push(t.small_business ? 'Steuernummer' : 'Steuernummer (oder alternativ USt-IdNr.)');
   if (!t.iban) p.push('IBAN');
@@ -177,15 +185,34 @@ function register(app: App) {
         ${csrfField(c)}
         ${sections.map(
           (s) => html`<fieldset class="card">
-            <legend>${s.title}</legend>
+            <legend>${t.org_type === 'association' ? (s.assocTitle ?? s.title) : s.title}</legend>
             ${s.text ? html`<p class="muted small">${s.text}</p>` : ''}
             <div class="grid-2">${s.fields.map((f) => field(t, f, !owner))}</div>
           </fieldset>`,
         )}
         <fieldset class="card">
+          <legend>Organisation</legend>
+          <div class="stack">
+            <fieldset class="inline-radio">
+              <legend class="sr-only">Art</legend>
+              <label class="check"><input type="radio" name="org_type" value="company"${checked(t.org_type !== 'association')} ${owner ? '' : html`disabled`}> Unternehmen / Selbstständig</label>
+              <label class="check"><input type="radio" name="org_type" value="association"${checked(t.org_type === 'association')} ${owner ? '' : html`disabled`}> Verein (e. V. oder nicht eingetragen)</label>
+            </fieldset>
+            <label class="check"><input type="checkbox" name="nonprofit" value="1"${checked(t.nonprofit)} ${owner ? '' : html`disabled`}>
+              Gemeinnützig – steuerbegünstigt nach §§ 51 ff. AO (z. B. e. V., gGmbH, Stiftung)</label>
+            <div class="stack" data-show-if="nonprofit">
+              <label>Bereich für neue Rechnungen
+                <select name="default_sphere" ${owner ? '' : html`disabled`}>${SPHERES.map((s) => html`<option value="${s.value}"${selected(s.value, t.default_sphere)}>${s.label}</option>`)}</select>
+                <small class="muted">Lässt sich je Rechnung ändern. Die Übersicht zeigt daraus die Grenzen für wirtschaftliche Geschäftsbetriebe (§ 64 Abs. 3 AO), sportliche Veranstaltungen (§ 67a AO) und die zeitnahe Mittelverwendung (§ 55 AO).</small>
+              </label>
+            </div>
+          </div>
+        </fieldset>
+        <fieldset class="card">
           <legend>Umsatzsteuer</legend>
           <label class="check"><input type="checkbox" name="small_business" value="1"${checked(t.small_business)} ${owner ? '' : html`disabled`}>
             Kleinunternehmer nach § 19 UStG (keine Umsatzsteuer ausweisen)</label>
+          ${t.nonprofit ? html`<p class="muted small">Auch Vereine können Kleinunternehmer sein. Für die Grenze zählen nur die unternehmerischen Umsätze – Rechnungen aus dem ideellen Bereich bleiben außen vor.</p>` : ''}
         </fieldset>
         ${owner ? html`<div class="form-actions"><button class="btn primary">Speichern</button></div>` : ''}
       </form>`,
@@ -235,9 +262,13 @@ function register(app: App) {
       v[k] = fee ?? 0;
     }
     v.small_business = str(form, 'small_business') === '1' ? 1 : 0;
+    v.org_type = str(form, 'org_type') === 'association' ? 'association' : 'company';
+    v.nonprofit = str(form, 'nonprofit') === '1' ? 1 : 0;
+    const sphere = str(form, 'default_sphere');
+    v.default_sphere = isSphere(sphere) ? sphere : t.default_sphere || 'business';
 
     const errors: string[] = [...errors0];
-    if (!v.name) errors.push('Firmenname darf nicht leer sein.');
+    if (!v.name) errors.push(v.org_type === 'association' ? 'Der Vereinsname darf nicht leer sein.' : 'Firmenname darf nicht leer sein.');
     if (!isCountryCode(String(v.country))) errors.push('Land bitte als zweistelligen ISO-Code (z. B. DE).');
     if (v.iban && !isValidIban(String(v.iban))) errors.push('Die IBAN ist ungültig.');
     if (v.bic && !isValidBic(String(v.bic))) errors.push('Die BIC ist ungültig.');
