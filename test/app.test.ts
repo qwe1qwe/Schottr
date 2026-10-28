@@ -1132,7 +1132,7 @@ test('Kassenbuch: Konten, Zuordnung, Umbuchung, Kassenzählung, Abschluss, Steue
 
   // Kasse: 50 + 25 − 119 − 20 + 200 = 136 € Buchbestand; gezählt 2×100 + 1×20 + 3×2 = 226 € → 90 € Getränkeverkauf
   assert.equal(await balance(kasse), 13600);
-  r = await req('/cashbook/count', { form: { account_id: String(kasse), count_date: today, d_10000: '2', d_2000: '1', d_200: '3', text: 'Getränkeverkauf Probenabende', sphere: 'business', vat_rate: '1900', note: 'gezählt von Kai' } });
+  r = await req('/cashbook/count', { form: { account_id: String(kasse), count_date: today, count_mode: 'denominations', d_10000: '2', d_2000: '1', d_200: '3', text: 'Getränkeverkauf Probenabende', sphere: 'business', vat_rate: '1900', note: 'gezählt von Kai' } });
   const count = (await one('SELECT * FROM cash_counts WHERE account_id = ?', kasse))!;
   assert.equal(count.counted, 22600);
   assert.equal(count.book_balance, 13600);
@@ -1151,6 +1151,20 @@ test('Kassenbuch: Konten, Zuordnung, Umbuchung, Kassenzählung, Abschluss, Steue
   assert.match(page, /Getränkeverkauf Probenabende/);
   assert.match(page, /226,00.€/);
   assert.ok([...page.matchAll(/class="chart-bar balance-day/g)].length >= 300, 'ein Tag je Trefferfläche');
+
+  // Zählung nur mit Gesamtsumme: 200,50 € statt 226,00 € → Fehlbetrag 25,50 €
+  r = await req('/cashbook/count', { form: { account_id: String(kasse), count_date: today, count_mode: 'total', counted_total: '200,50', text: '', vat_rate: '0' } });
+  const count2 = (await one('SELECT * FROM cash_counts WHERE account_id = ? ORDER BY id DESC LIMIT 1', kasse))!;
+  assert.equal(count2.counted, 20050);
+  assert.equal(count2.denominations, '{}');
+  assert.equal(count2.difference, -2550);
+  assert.equal((await one('SELECT text FROM cash_entries WHERE count_id = ?', count2.id))!.text, 'Kassenfehlbetrag lt. Kassenzählung');
+  assert.equal(await balance(kasse), 20050);
+  page = await (await req(`/cashbook/counts?account=${kasse}`)).text();
+  assert.match(page, /nur Gesamtsumme/);
+  // ohne Summe → Fehler, nichts gespeichert
+  r = await req('/cashbook/count', { form: { account_id: String(kasse), count_date: today, count_mode: 'total', counted_total: '' } });
+  assert.equal((await all('SELECT id FROM cash_counts WHERE account_id = ?', kasse)).length, 2);
 
   // Steuerbüro-Paket
   r = await req(`/export/package?year=${year}`);

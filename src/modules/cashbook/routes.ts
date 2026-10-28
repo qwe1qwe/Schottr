@@ -478,7 +478,15 @@ function register(app: App) {
         </div>
         <p class="muted small">Buchbestand heute: <strong>${formatMoney(book)}</strong>${last ? html` · letzte Zählung ${formatDate(last.count_date)}: ${formatMoney(last.counted)}` : ''}.
           Die Differenz zwischen gezähltem Bestand und Buchbestand am Zähltag wird gebucht – z. B. als Einnahmen aus dem Getränkeverkauf, für die es keine Einzelbelege gibt.</p>
-        <table class="table count-table">
+        <fieldset class="inline-radio">
+          <legend>Erfassen als</legend>
+          <label class="check"><input type="radio" name="count_mode" value="total" checked> Gesamtsumme</label>
+          <label class="check"><input type="radio" name="count_mode" value="denominations"> nach Stückelung (Scheine und Münzen)</label>
+        </fieldset>
+        <label data-show-if="count_mode=total">Gezählter Bestand (€)
+          <input name="counted_total" class="num" inputmode="decimal" placeholder="0,00" aria-describedby="count-hint">
+          <small class="muted" id="count-hint">Gesamter Kasseninhalt am Zähltag – nicht nur die Einnahmen seit der letzten Zählung.</small></label>
+        <table class="table count-table" data-show-if="count_mode=denominations">
           <thead><tr><th>Stückelung</th><th class="w-qty">Anzahl</th><th class="right">Summe</th></tr></thead>
           <tbody>${DENOMINATIONS.map((d) => html`<tr>
             <td>${d >= 500 ? `${d / 100} €-Schein` : d >= 100 ? `${d / 100} €-Münze` : `${d} Cent`}</td>
@@ -502,15 +510,23 @@ function register(app: App) {
     const form = await readForm(c);
     const a = await getAccount(t.id, Number(str(form, 'account_id'))) ?? notFound();
     const denominations: Record<string, number> = {};
-    for (const d of DENOMINATIONS) {
-      const n = Number(str(form, `d_${d}`) || 0);
-      if (!Number.isInteger(n) || n < 0 || n > 1e6) throw new UserError('Bitte bei der Stückelung nur ganze Zahlen eintragen.');
-      if (n) denominations[d] = n;
+    let counted: number | undefined;
+    if (str(form, 'count_mode') === 'denominations') {
+      for (const d of DENOMINATIONS) {
+        const n = Number(str(form, `d_${d}`) || 0);
+        if (!Number.isInteger(n) || n < 0 || n > 1e6) throw new UserError('Bitte bei der Stückelung nur ganze Zahlen eintragen.');
+        if (n) denominations[d] = n;
+      }
+      if (!Object.keys(denominations).length) throw new UserError('Bitte die Anzahl der Scheine und Münzen eintragen – oder „Gesamtsumme“ wählen.');
+    } else {
+      const v = parseDecimal(str(form, 'counted_total'), 2);
+      if (v === null || v < 0 || v > 1e12) throw new UserError('Bitte den gezählten Gesamtbestand in Euro angeben (0 ist erlaubt).');
+      counted = v;
     }
     const sphere = str(form, 'sphere');
     const vat = Number(str(form, 'vat_rate') || 0);
     const { difference } = await saveCount(t, a, {
-      date: str(form, 'count_date'), denominations, note: str(form, 'note', 300), text: str(form, 'text', 300),
+      date: str(form, 'count_date'), denominations, counted, note: str(form, 'note', 300), text: str(form, 'text', 300),
       sphere: t.nonprofit && isSphere(sphere) ? sphere : '', vat_rate: t.small_business ? 0 : [0, 700, 1900].includes(vat) ? vat : 0,
     }, userOf(c).id);
     await audit(c, 'cashbook.count', `${a.name}: Differenz ${formatMoney(difference)}`);
@@ -537,7 +553,7 @@ function register(app: App) {
               const den = JSON.parse(k.denominations) as Record<string, number>;
               return html`<tr>
                 <td>${formatDate(k.count_date)}${k.note ? html`<div class="muted small">${k.note}</div>` : ''}</td>
-                <td class="small">${Object.entries(den).sort((a, b) => Number(b[0]) - Number(a[0])).map(([d, n]) => `${n} × ${formatMoney(Number(d))}`).join(', ') || '–'}</td>
+                <td class="small">${Object.entries(den).sort((a, b) => Number(b[0]) - Number(a[0])).map(([d, n]) => `${n} × ${formatMoney(Number(d))}`).join(', ') || html`<span class="muted">nur Gesamtsumme</span>`}</td>
                 <td class="right num">${formatMoney(k.book_balance)}</td>
                 <td class="right num">${formatMoney(k.counted)}</td>
                 <td class="right">${money(k.difference)}</td>

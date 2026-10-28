@@ -263,7 +263,7 @@ export async function lastCount(accountId: number) {
  * negativ als Fehlbetrag bzw. Ausgaben ohne Beleg.
  */
 export async function saveCount(
-  t: Tenant, a: CashAccount, input: { date: string; denominations: Record<string, number>; note: string; text: string; sphere: string; vat_rate: number },
+  t: Tenant, a: CashAccount, input: { date: string; denominations: Record<string, number>; counted?: number; note: string; text: string; sphere: string; vat_rate: number },
   userId: number,
 ): Promise<{ id: number; difference: number }> {
   if (a.kind !== 'cash') throw new UserError('Geldzählungen gibt es nur für Bargeldkassen.');
@@ -271,7 +271,10 @@ export async function saveCount(
   if (input.date > today()) throw new UserError('Die Zählung liegt in der Zukunft.');
   const last = await lastCount(a.id);
   if (last && input.date < last.count_date) throw new UserError(`Es gibt schon eine spätere Zählung (${formatDate(last.count_date)}).`);
-  const counted = DENOMINATIONS.reduce((s, d) => s + d * (input.denominations[d] ?? 0), 0);
+  // gezählter Bestand: aus der Stückelung oder – wenn nur die Summe bekannt ist – direkt angegeben
+  const fromDenominations = DENOMINATIONS.reduce((s, d) => s + d * (input.denominations[d] ?? 0), 0);
+  const counted = Object.keys(input.denominations).length ? fromDenominations : input.counted ?? 0;
+  if (counted < 0) throw new UserError('Der gezählte Bestand kann nicht negativ sein.');
   const book = await balanceAt(a, input.date);
   const difference = counted - book;
   const now = nowIso();
