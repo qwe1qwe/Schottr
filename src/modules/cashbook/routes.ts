@@ -22,7 +22,7 @@ import {
 
 function cbTenant(c: Ctx): Tenant {
   const t = tenantOf(c);
-  if (!cashbookEnabled(t)) throw new UserError('Das Kassenbuch gibt es für Vereine (Einstellungen → Organisation → Art „Verein“).');
+  if (!cashbookEnabled(t)) throw new UserError('Das Kassenbuch gibt es für Vereine (Firmendaten → Organisation → Art „Verein“).');
   return t;
 }
 
@@ -906,6 +906,6 @@ function register(app: App) {
 
 export const cashbookModule: Module = {
   name: 'cashbook',
-  nav: { label: 'Kassenbuch', href: '/cashbook', order: 34, visible: (t) => cashbookEnabled(t) },
+  nav: { label: 'Kassenbuch', href: '/cashbook', order: 20, group: 'finance', icon: 'cashbook', visible: (t) => cashbookEnabled(t) },
   register,
 };

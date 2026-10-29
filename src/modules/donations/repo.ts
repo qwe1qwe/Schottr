@@ -124,7 +124,7 @@ export async function deleteDonation(existing: Donation) {
  */
 async function issue(t: Tenant, contactId: number, kind: ReceiptKind, donations: Donation[], userId: number, issueDate = today()): Promise<number> {
   const problems = receiptProblems(t, issueDate);
-  if (problems.length) throw new UserError(`Zuwendungsbestätigung nicht möglich: ${problems.join(' ')} (Einstellungen → Zuwendungsbestätigungen)`);
+  if (problems.length) throw new UserError(`Zuwendungsbestätigung nicht möglich: ${problems.join(' ')} (Vereinsdaten → Zuwendungsbestätigungen)`);
   const contact = await getContact(t.id, contactId);
   if (!contact) throw new UserError('Der Zuwendende wurde nicht gefunden.');
   if (!contact.street || !contact.city) throw new UserError(`Für ${contact.company || contact.name} fehlt die Anschrift – sie gehört auf die Bestätigung.`);

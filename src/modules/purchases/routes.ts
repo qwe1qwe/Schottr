@@ -397,7 +397,7 @@ export async function openLiabilities(tenantId: number) {
 
 export const purchasesModule: Module = {
   name: 'purchases',
-  nav: { label: 'Eingangsrechnungen', href: '/purchases', order: 31 },
+  nav: { label: 'Eingangsrechnungen', href: '/purchases', order: 10, group: 'purchase', icon: 'purchases' },
   register,
 };
 

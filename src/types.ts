@@ -1,3 +1,4 @@
+import type { IconName } from './views/icons.ts';
 import type { Context, Hono } from 'hono';
 import type { Session } from './lib/auth.ts';
 
@@ -94,6 +95,29 @@ export type AppEnv = {
 export type Ctx = Context<AppEnv>;
 export type App = Hono<AppEnv>;
 
+/** Gruppen der Seitenleiste, in dieser Reihenfolge; zwischen den Gruppen steht eine Trennlinie */
+export const NAV_GROUPS = [
+  { id: 'start', label: '' },
+  { id: 'sales', label: 'Verkauf' },
+  { id: 'purchase', label: 'Einkauf' },
+  { id: 'finance', label: 'Finanzen' },
+  { id: 'manage', label: 'Verwaltung' },
+] as const;
+export type NavGroup = (typeof NAV_GROUPS)[number]['id'];
+
+export interface NavItem {
+  /** Fester Text oder abhängig vom Mandanten (z. B. „Firmendaten“ / „Vereinsdaten“) */
+  label: string | ((t: Tenant) => string);
+  href: string;
+  /** Reihenfolge innerhalb der Gruppe */
+  order: number;
+  group?: NavGroup;
+  /** Name aus src/views/icons.ts */
+  icon?: IconName;
+  /** Menüeintrag nur für passende Mandanten zeigen (z. B. Spenden nur bei gemeinnützigen) */
+  visible?: (t: Tenant) => boolean;
+}
+
 /**
  * Ein Modul bringt eigene Routen und optional einen Menüeintrag mit.
  * Neue Funktionen (z. B. Zeiterfassung, Mahnwesen) werden als weiteres Modul
@@ -101,7 +125,6 @@ export type App = Hono<AppEnv>;
  */
 export interface Module {
   name: string;
-  /** visible: Menüeintrag nur für passende Mandanten zeigen (z. B. Spenden nur bei gemeinnützigen) */
-  nav?: { label: string; href: string; order: number; visible?: (t: Tenant) => boolean };
+  nav?: NavItem;
   register(app: App): void;
 }

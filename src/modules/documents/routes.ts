@@ -8,6 +8,7 @@ import { addDays, formatDate, isIsoDate, monthEnd, monthLabel, paidPeriod, today
 import { formatMoney, formatQuantity, formatRate, formatAmount, parseDecimal } from '../../lib/money.ts';
 import { unitShort } from '../../lib/units.ts';
 import { attachment, idParam, notFound, readForm, redirectWith, str, tenantOf, userOf, UserError } from '../../lib/http.ts';
+import { orgDataLabel } from '../settings.ts';
 import { badge, csrfField, empty, page } from '../../views/layout.ts';
 import { buildCii, type CiiAttachment } from '../../einvoice/cii.ts';
 import { renderPdf } from '../../einvoice/pdf.ts';
@@ -385,8 +386,8 @@ function register(app: App, kind: Kind) {
             Nach dem Bearbeiten bitte <strong>erneut festschreiben</strong> – bis dahin gilt sie als Entwurf.</div>`
         : ''}
       ${problems.length
-        ? html`<div class="notice"><strong>Vor dem Festschreiben noch erledigen:</strong><ul>${problems.map((p) => html`<li>${p}</li>`)}</ul>
-            ${problems.some((p) => p.includes('Einstellungen')) ? html`<a href="/settings">Zu den Einstellungen</a>` : ''}</div>`
+        ? html`<div class="notice"><strong>Vor dem Festschreiben noch erledigen:</strong><ul>${problems.map((p) => html`<li>${tenantOf(c).org_type === 'association' ? p.replaceAll('Firmendaten', 'Vereinsdaten').replace('der Firma', 'des Vereins') : p}</li>`)}</ul>
+            ${problems.some((p) => p.includes('Firmendaten')) ? html`<a href="/settings">Zu den ${orgDataLabel(tenantOf(c))}</a>` : ''}</div>`
         : ''}
       ${xrWarnings.length ? html`<div class="notice soft">${xrWarnings.join(' ')} Ohne sie wird nur die ZUGFeRD-Rechnung (Industrie) erzeugt, keine XRechnung (Öffentlicher Sektor).</div>` : ''}
       <section class="card">
@@ -615,13 +616,13 @@ function register(app: App, kind: Kind) {
 
 export const quotesModule: Module = {
   name: 'quotes',
-  nav: { label: 'Angebote', href: '/quotes', order: 20 },
+  nav: { label: 'Angebote', href: '/quotes', order: 10, group: 'sales', icon: 'quotes' },
   register: (app) => register(app, 'quote'),
 };
 
 export const invoicesModule: Module = {
   name: 'invoices',
-  nav: { label: 'Rechnungen', href: '/invoices', order: 30 },
+  nav: { label: 'Rechnungen', href: '/invoices', order: 20, group: 'sales', icon: 'invoices' },
   register: (app) => register(app, 'invoice'),
 };
 

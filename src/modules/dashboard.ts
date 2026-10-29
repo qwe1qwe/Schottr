@@ -426,7 +426,7 @@ async function nonprofitLimitsCard(t: Tenant, year: number) {
 
 export const dashboardModule: Module = {
   name: 'dashboard',
-  nav: { label: 'Übersicht', href: '/', order: 0 },
+  nav: { label: 'Übersicht', href: '/', order: 0, group: 'start', icon: 'dashboard' },
   register(app) {
     app.get('/', async (c) => {
       const t = tenantOf(c);

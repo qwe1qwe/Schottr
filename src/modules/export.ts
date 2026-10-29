@@ -10,6 +10,7 @@ import { html as h } from '../lib/html.ts';
 import { formatDate, isIsoDate, today } from '../lib/dates.ts';
 import { html } from '../lib/html.ts';
 import { attachment, tenantOf, userOf } from '../lib/http.ts';
+import { orgDataLabel } from './settings.ts';
 import { formatAmount, formatMoney } from '../lib/money.ts';
 import { createZip } from '../lib/zip.ts';
 import { inboxCount } from './inbox/repo.ts';
@@ -235,7 +236,7 @@ function register(app: App) {
             SKR${t.datev_skr}, Erlöse 19 % ${acc['19']}, 7 % ${acc['7']}.
             Eingangsrechnungen: ${t.datev_creditor_mode === 'individual' ? `Kreditor je Lieferant ab ${t.datev_creditor_account}` : `Sammelkreditor ${t.datev_creditor_account}`},
             Aufwandskonto je Kostenart, ${t.small_business ? 'brutto ohne Vorsteuer (Kleinunternehmer)' : 'Vorsteuer per BU-Schlüssel 9/8'}.</p>
-          ${!datevReady ? html`<div class="notice">Bitte zuerst Berater- und Mandantennummer unter <a href="/settings">Einstellungen → DATEV-Export</a> eintragen.</div>` : ''}
+          ${!datevReady ? html`<div class="notice">Bitte zuerst Berater- und Mandantennummer unter <a href="/settings">${orgDataLabel(tenantOf(c))} → DATEV-Export</a> eintragen.</div>` : ''}
           ${!sameYear ? html`<div class="notice">Ein DATEV-Stapel darf nur ein Wirtschaftsjahr umfassen – bitte den Zeitraum auf ein Jahr begrenzen.</div>` : ''}
           ${datevReady && sameYear && any
             ? html`<form method="get" action="/export/datev" class="stack">
@@ -447,6 +448,6 @@ function register(app: App) {
 
 export const exportModule: Module = {
   name: 'export',
-  nav: { label: 'Export', href: '/export', order: 40 },
+  nav: { label: 'Export', href: '/export', order: 40, group: 'finance', icon: 'export' },
   register,
 };

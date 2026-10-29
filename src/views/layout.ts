@@ -4,7 +4,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { html, raw, type SafeHtml, selected } from '../lib/html.ts';
 import { takeFlash } from '../lib/http.ts';
-import type { Ctx, Module } from '../types.ts';
+import { NAV_GROUPS, type Ctx, type NavItem, type Tenant, type User } from '../types.ts';
+import { icon } from './icons.ts';
 
 /** Versionskennung der statischen Dateien – erzwingt nach Updates das Neuladen im Browser */
 const ASSET_VERSION = crypto
@@ -13,9 +14,27 @@ const ASSET_VERSION = crypto
   .digest('hex')
   .slice(0, 10);
 
-let navItems: NonNullable<Module['nav']>[] = [];
-export function setNav(items: NonNullable<Module['nav']>[]) {
-  navItems = [...items].sort((a, b) => a.order - b.order);
+let navItems: NavItem[] = [];
+export function setNav(items: NavItem[]) {
+  navItems = [...items];
+}
+
+/** Menüeinträge nach Gruppen; die Administration hängt als letzter Eintrag an „Verwaltung“ */
+function navGroups(tenant: Tenant, user: User) {
+  const groupOf = (n: NavItem) => n.group ?? 'start';
+  const items: NavItem[] = navItems.filter((n) => !n.visible || n.visible(tenant));
+  if (user.is_admin) items.push({ label: 'Administration', href: '/admin', order: 1000, group: 'manage', icon: 'admin' });
+  return NAV_GROUPS.map((g) => ({
+    ...g,
+    items: items.filter((n) => groupOf(n) === g.id).sort((a, b) => a.order - b.order),
+  })).filter((g) => g.items.length);
+}
+
+/** Initialen für den Avatar: „Julia Maier“ → „JM“, sonst erster Buchstabe der E-Mail */
+function initials(user: User): string {
+  const parts = (user.name || '').trim().split(/\s+/).filter(Boolean);
+  const letters = parts.length > 1 ? parts[0][0] + parts[parts.length - 1][0] : (parts[0] || user.email || '?')[0];
+  return letters.toUpperCase();
 }
 
 export function csrfField(c: Ctx): SafeHtml {
@@ -62,29 +81,49 @@ export function page(c: Ctx, opts: PageOptions) {
         : ''}
     </div>
     <div class="sidebar-panel" id="main-menu">
-    ${tenant
-      ? html`<nav class="nav">
-          ${navItems.filter((n) => !n.visible || n.visible(tenant)).map(
-            (n) => html`<a href="${n.href}" class="${isActive(n.href) ? 'active' : ''}">${n.label}</a>`,
+    ${tenant && user
+      ? html`<nav class="nav" aria-label="Hauptmenü">
+          ${navGroups(tenant, user).map(
+            (g) => html`<div class="nav-group nav-group-${g.id}">
+              ${g.label ? html`<div class="nav-label">${g.label}</div>` : ''}
+              ${g.items.map((n) => {
+                const label = typeof n.label === 'function' ? n.label(tenant) : n.label;
+                const active = isActive(n.href);
+                return html`<a href="${n.href}" class="${active ? 'active' : ''}"${active ? raw(' aria-current="page"') : ''}>${icon(n.icon)}<span>${label}</span></a>`;
+              })}
+            </div>`,
           )}
         </nav>`
       : ''}
     ${user
       ? html`<div class="sidebar-foot">
           ${tenants.length > 1
-            ? html`<form method="post" action="/tenant/switch" class="tenant-switch">
+            ? html`<form method="post" action="/tenant/switch" class="tenant-box tenant-switch">
                 ${csrfField(c)}
-                <label for="tenant-select">Mandant</label>
-                <select id="tenant-select" name="tenant_id" data-autosubmit>
-                  ${tenants.map((t) => html`<option value="${t.id}"${selected(t.id, tenant?.id)}>${t.name}</option>`)}
-                </select>
+                <label for="tenant-select" class="tenant-label">Mandant</label>
+                <div class="tenant-select-wrap">
+                  <select id="tenant-select" name="tenant_id" data-autosubmit>
+                    ${tenants.map((t) => html`<option value="${t.id}"${selected(t.id, tenant?.id)}>${t.name}</option>`)}
+                  </select>
+                  ${icon('switch', 'icon tenant-select-icon')}
+                </div>
               </form>`
             : tenant
-              ? html`<div class="tenant-name" title="Mandant">${tenant.name}</div>`
+              ? html`<div class="tenant-box"><span class="tenant-label">Mandant</span><span class="tenant-name">${tenant.name}</span></div>`
               : ''}
-          ${user.is_admin ? html`<a href="/admin" class="admin-link ${path.startsWith('/admin') ? 'active' : ''}">Administration</a>` : ''}
-          <a href="/account" class="user-link">${user.name || user.email}</a>
-          <form method="post" action="/logout">${csrfField(c)}<button class="link">Abmelden</button></form>
+          <div class="user-box">
+            <a href="/account" class="user-card ${path.startsWith('/account') ? 'active' : ''}" title="Mein Konto">
+              <span class="avatar" aria-hidden="true">${initials(user)}</span>
+              <span class="user-text">
+                <span class="user-name">${user.name || user.email}</span>
+                <span class="user-sub">${user.name ? user.email : 'Mein Konto'}</span>
+              </span>
+            </a>
+            <form method="post" action="/logout" class="logout-form">
+              ${csrfField(c)}
+              <button class="icon-btn" title="Abmelden" aria-label="Abmelden">${icon('logout')}<span class="logout-text">Abmelden</span></button>
+            </form>
+          </div>
         </div>`
       : ''}
     </div>

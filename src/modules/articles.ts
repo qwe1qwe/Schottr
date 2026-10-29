@@ -158,6 +158,6 @@ function register(app: App) {
 
 export const articlesModule: Module = {
   name: 'articles',
-  nav: { label: 'Artikel', href: '/articles', order: 15 },
+  nav: { label: 'Artikel', href: '/articles', order: 15, group: 'start', icon: 'articles' },
   register,
 };

@@ -348,6 +348,6 @@ function register(app: App) {
 
 export const contactsModule: Module = {
   name: 'contacts',
-  nav: { label: 'Adressen', href: '/contacts', order: 10 },
+  nav: { label: 'Adressen', href: '/contacts', order: 10, group: 'start', icon: 'contacts' },
   register,
 };

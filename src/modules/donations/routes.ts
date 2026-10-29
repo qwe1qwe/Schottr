@@ -21,7 +21,7 @@ import { DONATION_KINDS, noticeValidUntil, receiptProblems, TEXT, type ReceiptDa
  */
 function npoTenant(c: Ctx): Tenant {
   const t = tenantOf(c);
-  if (!t.nonprofit) throw new UserError('Spenden und Zuwendungsbestätigungen gibt es nur für gemeinnützige Mandanten (Einstellungen → Organisation).');
+  if (!t.nonprofit) throw new UserError('Spenden und Zuwendungsbestätigungen gibt es nur für gemeinnützige Mandanten (Firmendaten → Organisation).');
   return t;
 }
 
@@ -54,7 +54,7 @@ function settingsNotice(t: Tenant): SafeHtml {
   const problems = receiptProblems(t, today());
   if (problems.length) {
     return html`<div class="notice"><strong>Für Zuwendungsbestätigungen fehlt noch etwas:</strong>
-      <ul>${problems.map((p) => html`<li>${p}</li>`)}</ul><a href="/settings#zuwendungen">Zu den Einstellungen</a></div>`;
+      <ul>${problems.map((p) => html`<li>${p}</li>`)}</ul><a href="/settings#zuwendungen">Zu den Vereinsdaten</a></div>`;
   }
   const valid = noticeValidUntil(t);
   if (valid && valid < addMonths(today(), 6)) {
@@ -398,6 +398,6 @@ function register(app: App) {
 
 export const donationsModule: Module = {
   name: 'donations',
-  nav: { label: 'Spenden', href: '/donations', order: 33, visible: (t) => !!t.nonprofit },
+  nav: { label: 'Spenden', href: '/donations', order: 10, group: 'finance', icon: 'donations', visible: (t) => !!t.nonprofit },
   register,
 };

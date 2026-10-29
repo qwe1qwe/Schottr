@@ -138,6 +138,11 @@ function field(t: Tenant, f0: Field, disabled: boolean): SafeHtml {
 }
 
 /** Prüft die Firmendaten und liefert Fehlermeldungen. */
+/** Menü- und Seitentitel der Mandanten-Stammdaten – bewusst nicht „Einstellungen“ (Verwechslung mit Administration und „Mein Konto“) */
+export function orgDataLabel(t: Pick<Tenant, 'org_type'>): string {
+  return t.org_type === 'association' ? 'Vereinsdaten' : 'Firmendaten';
+}
+
 export function tenantProblems(t: Tenant): string[] {
   const p: string[] = [];
   if (!t.name) p.push(t.org_type === 'association' ? 'Vereinsname' : 'Firmenname');
@@ -157,7 +162,7 @@ function register(app: App) {
     const problems = tenantProblems(t);
     const logo = await one<{ updated: string }>('SELECT UNIX_TIMESTAMP(updated_at) AS updated FROM tenant_logos WHERE tenant_id = ?', t.id);
     return page(c, {
-      title: 'Einstellungen',
+      title: orgDataLabel(t),
       actions: html`<a class="btn" href="/settings/users">Benutzer</a>`,
       body: html`
       ${problems.length
@@ -320,7 +325,7 @@ function register(app: App) {
       ...keys.map((k) => v[k]), isIsoDate(noticeDate) ? noticeDate : null, t.id,
     );
     await audit(c, 'settings.update');
-    return redirectWith(c, '/settings', 'ok', 'Einstellungen gespeichert.');
+    return redirectWith(c, '/settings', 'ok', `${orgDataLabel(t)} gespeichert.`);
   });
 
   app.get('/settings/logo', async (c) => {
@@ -372,7 +377,7 @@ function register(app: App) {
     const roleLabel = (r: string) => (r === 'owner' ? 'Inhaber' : 'Mitglied');
     return page(c, {
       title: 'Benutzer',
-      back: { href: '/settings', label: 'Einstellungen' },
+      back: { href: '/settings', label: orgDataLabel(t) },
       body: html`
       <section class="card flush">
         <table class="table">
@@ -462,7 +467,7 @@ function register(app: App) {
 
 export const settingsModule: Module = {
   name: 'settings',
-  nav: { label: 'Einstellungen', href: '/settings', order: 90 },
+  nav: { label: orgDataLabel, href: '/settings', order: 10, group: 'manage', icon: 'organization' },
   register,
 };
 

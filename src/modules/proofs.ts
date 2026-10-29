@@ -234,7 +234,7 @@ function register(app: App) {
 
 export const proofsModule: Module = {
   name: 'proofs',
-  nav: { label: 'Nachweise', href: '/proofs', order: 32 },
+  nav: { label: 'Nachweise', href: '/proofs', order: 40, group: 'sales', icon: 'proofs' },
   register,
 };
 

@@ -318,7 +318,7 @@ function register(app: App) {
 
 export const dunningModule: Module = {
   name: 'dunning',
-  nav: { label: 'Mahnwesen', href: '/dunning', order: 35 },
+  nav: { label: 'Mahnwesen', href: '/dunning', order: 35, group: 'sales', icon: 'dunning' },
   register,
 };
 

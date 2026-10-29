@@ -239,6 +239,6 @@ function register(app: App) {
 
 export const inboxModule: Module = {
   name: 'inbox',
-  nav: { label: 'Belege', href: '/inbox', order: 31.5 },
+  nav: { label: 'Belege', href: '/inbox', order: 20, group: 'purchase', icon: 'inbox' },
   register,
 };

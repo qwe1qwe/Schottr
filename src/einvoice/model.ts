@@ -273,10 +273,10 @@ export function checkInvoice(d: DocumentData): string[] {
   const s = d.seller;
   const b = d.buyer;
   if (!d.items.length) p.push('Die Rechnung hat keine Positionen.');
-  if (!s.name || !s.street || !s.zip || !s.city) p.push('Firmenanschrift unvollständig (Einstellungen).');
-  if (!s.taxNumber && !s.vatId) p.push('Steuernummer fehlt (Einstellungen). Alternativ genügt die USt-IdNr.');
-  if (!s.contactName || !s.phone || !s.email) p.push('Ansprechpartner, Telefon und E-Mail der Firma sind für XRechnung Pflicht (Einstellungen).');
-  if (!s.iban) p.push('IBAN fehlt (Einstellungen).');
+  if (!s.name || !s.street || !s.zip || !s.city) p.push('Firmenanschrift unvollständig (Firmendaten).');
+  if (!s.taxNumber && !s.vatId) p.push('Steuernummer fehlt (Firmendaten). Alternativ genügt die USt-IdNr.');
+  if (!s.contactName || !s.phone || !s.email) p.push('Ansprechpartner, Telefon und E-Mail der Firma sind für XRechnung Pflicht (Firmendaten).');
+  if (!s.iban) p.push('IBAN fehlt (Firmendaten).');
   if (!b.name || !b.street || !b.zip || !b.city) p.push('Anschrift des Kunden unvollständig.');
   if (!d.serviceDate && !(d.serviceFrom && d.serviceTo)) p.push('Leistungsdatum oder Leistungszeitraum fehlt (§ 14 Abs. 4 Nr. 6 UStG).');
   if (d.taxMode === 'reverse_charge' && !b.vatId) p.push('Für § 13b UStG wird die USt-IdNr. des Kunden benötigt.');
