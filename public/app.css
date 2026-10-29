@@ -250,6 +250,35 @@ input.num { text-align: right; }
 .photo-capture .btn { cursor: pointer; }
 .photo-capture.busy { opacity: .6; pointer-events: none; }
 .capture-cta { display: none; }
+/* Übersicht: zusammengefasste Kennzahlen */
+.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); gap: 1rem; margin-bottom: 1rem; align-items: stretch; }
+.kpi { margin: 0; display: flex; flex-direction: column; gap: .45rem; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 1rem 1.1rem; box-shadow: var(--shadow); min-width: 0; }
+.kpi h2, .kpi-head { margin: 0 0 .1rem; font-size: .8rem; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+.kpi h2 a { color: inherit; text-decoration: none; }
+.kpi h2 a:hover { color: var(--ink); }
+.kpi-head label { font-size: inherit; color: inherit; }
+.kpi-head span { text-transform: none; letter-spacing: 0; font-weight: 400; }
+.kpi-head select { text-transform: none; letter-spacing: 0; }
+.kpi-big + .kpi-list { margin-top: .4rem; }
+.kpi-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0 .75rem; color: var(--ink); text-decoration: none; padding: .35rem 0; border-top: 1px solid var(--line); }
+.kpi-row:first-of-type { border-top: 0; padding-top: 0; }
+.kpi-row strong { font-size: 1.05rem; font-variant-numeric: tabular-nums; }
+.kpi-row small { grid-column: 1 / -1; color: var(--muted); font-size: .78rem; }
+.kpi-row:hover .kpi-label { text-decoration: underline; }
+.kpi-alert { color: var(--danger); font-weight: 600; }
+.kpi-big { display: flex; flex-direction: column; gap: .1rem; color: var(--ink); text-decoration: none; }
+.kpi-big strong { font-size: 1.6rem; font-variant-numeric: tabular-nums; letter-spacing: -0.01em; line-height: 1.2; }
+.kpi-big small { color: var(--muted); }
+.kpi-list li { display: flex; justify-content: space-between; gap: .75rem; padding: .3rem 0; border-top: 1px solid var(--line); font-size: .9rem; }
+.kpi-list li:first-child { border-top: 0; }
+.kpi-list a { color: var(--ink); text-decoration: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kpi-list a:hover { text-decoration: underline; }
+.kpi.attention { border-color: var(--accent); box-shadow: inset 3px 0 0 var(--accent), var(--shadow); }
+.kpi.attention .kpi-big strong { color: var(--accent); }
+.kpi-action { margin-top: auto; align-self: flex-start; }
+.chart-tabs .chart.card, .chart-tabs .chart { border: 0; box-shadow: none; padding: 0; margin: 0; background: none; border-radius: 0; }
+.chart-tabs.js-tabs .chart-head h2 { display: none; }
+.chart-tabs { margin-bottom: 1rem; }
 .pdf-badge { display: grid; place-items: center; height: 8rem; border-radius: 6px; background: var(--surface-2); color: var(--danger); font-weight: 700; letter-spacing: .05em; }
 .has-file { color: var(--accent); font-weight: 600; }
 .sphere-field .sphere-hint { display: block; line-height: 1.4; }
@@ -710,6 +739,10 @@ ul.tight { margin: .35rem 0 0; padding-left: 1.2rem; }
 /* Handy: „Beleg erfassen“ ganz oben auf der Übersicht */
 @media (max-width: 860px) {
   .capture-cta { display: flex; flex-direction: column; gap: .4rem; margin-bottom: 1rem; }
+  .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .6rem; }
+  .kpi.wide { grid-column: 1 / -1; }
+  .kpi { padding: .85rem .95rem; }
+  .kpi-big strong { font-size: 1.3rem; }
   .capture-cta .btn.big { padding: 1rem; font-size: 1.1rem; justify-content: center; text-align: center; }
   .capture-inbox { align-self: center; font-size: .9rem; color: var(--muted); }
   .capture-inbox.has { color: var(--accent); font-weight: 600; }

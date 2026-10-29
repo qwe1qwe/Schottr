@@ -1256,7 +1256,8 @@ test('Kassenbuch: Konten, Zuordnung, Umbuchung, Kassenzählung, Abschluss, Steue
   assert.match(page, new RegExp(`<iframe src="/inbox/${inbox[0].id}/file\\?inline=1"`));
   assert.match(page, new RegExp(`<option value="${inbox[0].id}" selected>`));
   page = await (await req('/')).text();
-  assert.match(page, /1 nicht zugeordnet/);
+  assert.match(page, /<strong>1<\/strong><small>nicht zugeordnet<\/small>/);
+  assert.match(page, /Offene Posten/);
   r = await multipart('/cashbook/entries', { account_id: String(kasse), entry_date: today, direction: 'out', amount: '48,90', text: 'Getränke Sommerfest', vat_rate: '0', inbox_id: String(inbox[0].id) }, []);
   const drinks = (await one("SELECT * FROM cash_entries WHERE tenant_id = ? AND text = 'Getränke Sommerfest'", t.id))!;
   att = await all('SELECT * FROM cash_entry_files WHERE entry_id = ?', drinks.id);

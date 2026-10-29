@@ -14,7 +14,7 @@ import { purchaseBadge, purchaseStatus } from './purchases/views.ts';
 import { dueOf, payable, type Purchase } from './purchases/repo.ts';
 import { isSphere, nonprofitLimits, NONPROFIT_ALLOWANCE, SPHERES, type Sphere } from '../lib/nonprofit.ts';
 import { donationTotals } from './donations/repo.ts';
-import { cashbookCard, pendingCard } from './cashbook/routes.ts';
+import { cashbookDash, pendingCard } from './cashbook/routes.ts';
 import { cashbookEnabled, pendingDues } from './cashbook/repo.ts';
 import { inboxCount } from './inbox/repo.ts';
 import type { Module, Tenant } from '../types.ts';
@@ -410,7 +410,7 @@ export const dashboardModule: Module = {
       const liab = await openLiabilities(t.id);
       const ku = t.small_business ? await smallBusinessLimits(t, Number(year)) : null;
       const npo = t.nonprofit ? await nonprofitLimitsCard(t, Number(year)) : null;
-      const cash = await cashbookCard(t);
+      const cash = await cashbookDash(t);
       const pending = cashbookEnabled(t) ? pendingCard(c, await pendingDues(t), '/') : '';
       const drafts = await all(
         `SELECT d.*, COALESCE(NULLIF(c.company, ''), c.name) contact_label FROM documents d JOIN contacts c ON c.id = d.contact_id
@@ -425,44 +425,78 @@ export const dashboardModule: Module = {
       const problems = tenantProblems(t);
       const invites = await pendingInvitations(userOf(c).email);
       const inboxN = await inboxCount(t.id);
+      const costs = Number((await one<{ s: number | string }>(
+        `SELECT ${COST(t)} s FROM purchase_invoices p WHERE p.tenant_id = ? AND p.status <> 'draft' AND substr(p.issue_date, 1, 4) = ?`, t.id, selYear,
+      ))?.s ?? 0);
+      const toCapture = Number((await one<{ n: number }>("SELECT COUNT(*) n FROM purchase_invoices WHERE tenant_id = ? AND status = 'draft'", t.id))?.n ?? 0);
+      const n = (k: number, one_: string, many: string) => `${k} ${k === 1 ? one_ : many}`;
+      const row = (href: string, label: string, amount: number, sub: string, alert = '') => html`<a class="kpi-row" href="${href}">
+        <span class="kpi-label">${label}</span><strong class="num">${formatMoney(amount)}</strong>
+        <small>${sub}${alert ? html` · <span class="kpi-alert">${alert}</span>` : ''}</small></a>`;
+      const kpis = html`<div class="kpis">
+        <section class="kpi wide">
+          <h2>Offene Posten</h2>
+          ${row(overdue.n ? '/dunning' : '/invoices?status=open', 'Forderungen', open.s, n(open.n, 'Rechnung', 'Rechnungen'), overdue.n ? `${formatMoney(overdue.s)} überfällig` : '')}
+          ${row(`/purchases?status=${liab.overdueN ? 'overdue' : 'open'}`, 'Verbindlichkeiten', liab.s, n(liab.n, 'Eingangsrechnung', 'Eingangsrechnungen'), liab.overdueN ? `${formatMoney(liab.overdueS)} überfällig` : '')}
+          ${row('/quotes?status=sent', 'Angebote', quotes.s, `${quotes.n} offen`)}
+        </section>
+        <section class="kpi wide">
+          <form method="get" action="/" class="stat-year kpi-head">
+            <label for="revenue-year">Umsatz</label>
+            <select id="revenue-year" name="year" data-autosubmit>${years.map((y) => html`<option value="${y}"${selected(y, selYear)}>${y}</option>`)}</select>
+            <span>netto</span>
+            <noscript><button class="btn">OK</button></noscript>
+          </form>
+          <a class="kpi-big" href="/invoices?year=${selYear}"><strong class="num">${formatMoney(revenue.s)}</strong><small>${n(revenue.n, 'Rechnung', 'Rechnungen')}</small></a>
+          <ul class="plain kpi-list">
+            <li><a href="/purchases" title="Eingangsrechnungen netto nach Rechnungsdatum">Ausgaben</a><span class="num">${formatMoney(costs)}</span></li>
+            <li><span>Ergebnis</span><strong class="num ${revenue.s - costs < 0 ? 'kpi-alert' : ''}">${formatMoney(revenue.s - costs)}</strong></li>
+          </ul>
+        </section>
+        ${cash ? html`<section class="kpi">
+          <h2><a href="/cashbook">Konten</a></h2>
+          <a class="kpi-big" href="/cashbook"><strong class="num ${cash.total < 0 ? 'kpi-alert' : ''}">${formatMoney(cash.total)}</strong><small>${cash.list.length > 1 ? 'gesamt' : cash.list[0].name}</small></a>
+          ${cash.list.length > 1 ? html`<ul class="plain kpi-list">${cash.list.map((a) => html`<li><a href="/cashbook?account=${a.id}">${a.name}</a><span class="num ${a.balance < 0 ? 'kpi-alert' : ''}">${formatMoney(a.balance)}</span></li>`)}</ul>` : ''}
+        </section>` : ''}
+        <section class="kpi ${inboxN ? 'attention' : ''} ${cash ? '' : 'wide'}">
+          <h2><a href="/inbox">Belege</a></h2>
+          <a class="kpi-big" href="/inbox"><strong>${inboxN}</strong><small>nicht zugeordnet</small></a>
+          ${toCapture ? html`<a class="small" href="/purchases?status=draft">${n(toCapture, 'Eingangsrechnung', 'Eingangsrechnungen')} zu erfassen</a>` : ''}
+          <a class="btn small hide-mobile kpi-action" href="/capture">Beleg erfassen</a>
+        </section>
+      </div>`;
+      const charts = html`<section class="card dual chart-tabs" data-tabs>
+        <div class="dual-head">
+          <h2 data-tab-title>Verlauf</h2>
+          <div class="tabs small-tabs" role="tablist">
+            <button type="button" role="tab" data-tab="result" aria-selected="true">Ergebnis ${selYear}</button>
+            <button type="button" role="tab" data-tab="invoices" aria-selected="false" title="Festgeschriebene Rechnungen der letzten 24 Monate">Rechnungen</button>
+            ${cash ? html`<button type="button" role="tab" data-tab="balance" aria-selected="false">Kontostände</button>` : ''}
+          </div>
+        </div>
+        <div data-panel="result" role="tabpanel">${result}</div>
+        <div data-panel="invoices" role="tabpanel">${chart}</div>
+        ${cash ? html`<div data-panel="balance" role="tabpanel">${cash.chart}</div>` : ''}
+      </section>`;
       return page(c, {
         title: 'Übersicht',
-        actions: html`<a class="btn hide-mobile" href="/capture">Beleg erfassen</a><a class="btn" href="/quotes/new">Neues Angebot</a><a class="btn primary" href="/invoices/new">Neue Rechnung</a>`,
+        actions: html`<a class="btn" href="/quotes/new">Neues Angebot</a><a class="btn primary" href="/invoices/new">Neue Rechnung</a>`,
         body: html`
         <section class="capture-cta" aria-label="Beleg erfassen">
           <a class="btn primary big" href="/capture">📷 Beleg erfassen</a>
-          <a class="capture-inbox ${inboxN ? 'has' : ''}" href="/inbox">${inboxN ? `${inboxN} nicht zugeordnet` : 'Belegeingang'}</a>
         </section>
         ${invitationsBox(c, invites)}
-        ${inboxN ? html`<div class="notice soft hide-mobile"><a href="/inbox">${inboxN} Beleg(e)</a> im Belegeingang warten auf die Zuordnung.</div>` : ''}
         ${problems.length
           ? html`<div class="notice">Deine Firmendaten sind noch unvollständig – es fehlen: ${problems.join(", ")}. <a href="/settings">Jetzt ergänzen</a></div>`
           : ''}
-        <div class="stats">
-          <a class="stat" href="/invoices?status=open"><span>Offene Rechnungen</span><strong>${formatMoney(open.s)}</strong><small>${open.n} Beleg(e)</small></a>
-          <a class="stat ${overdue.n ? 'alert' : ''}" href="/dunning"><span>Überfällig</span><strong>${formatMoney(overdue.s)}</strong><small>${overdue.n} Beleg(e)</small></a>
-          <a class="stat" href="/quotes?status=sent"><span>Offene Angebote</span><strong>${formatMoney(quotes.s)}</strong><small>${quotes.n} Beleg(e)</small></a>
-          <a class="stat ${liab.overdueN ? 'alert' : ''}" href="/purchases?status=${liab.overdueN ? 'overdue' : 'open'}"><span>Verbindlichkeiten</span><strong>${formatMoney(liab.s)}</strong>
-            <small>${liab.n} offen${liab.overdueN ? ` · ${liab.overdueN} überfällig (${formatMoney(liab.overdueS)})` : ''}</small></a>
-          <div class="stat">
-            <form method="get" action="/" class="stat-year">
-              <label for="revenue-year">Umsatz</label>
-              <select id="revenue-year" name="year" data-autosubmit>${years.map((y) => html`<option value="${y}"${selected(y, selYear)}>${y}</option>`)}</select>
-              <span>(netto)</span>
-              <noscript><button class="btn">OK</button></noscript>
-            </form>
-            <strong>${formatMoney(revenue.s)}</strong><small>${revenue.n} Rechnung(en)</small>
-          </div>
-        </div>
+        ${kpis}
         ${pending}
-        ${cash ?? ''}
-        ${chart}
-        ${result}
+        ${charts}
         <div class="dash-grid">${customers}${suppliers}</div>
         ${ku || npo ? html`<div class="dash-grid ${ku && npo ? '' : 'single'}">${npo ?? ''}${ku ?? ''}</div>` : ''}
-        ${drafts.length ? html`<h2 class="section-title">Rechnungsentwürfe</h2>${documentTable(drafts, 'invoice')}` : ''}
         <h2 class="section-title">Offene Rechnungen</h2>
-        ${openList.length ? documentTable(openList, 'invoice') : html`<p class="muted">Keine offenen Rechnungen. 🎉</p>`}`,
+        ${openList.length ? documentTable(openList, 'invoice') : html`<p class="muted">Keine offenen Rechnungen. 🎉</p>`}
+        ${drafts.length ? html`<h2 class="section-title">Rechnungsentwürfe</h2>${documentTable(drafts, 'invoice')}` : ''}`,
       });
     });
   },

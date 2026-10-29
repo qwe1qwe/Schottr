@@ -287,25 +287,21 @@ const backTo = (c: Ctx, fallback: string) => {
 };
 
 /** Kachel für die Übersicht: Stände aller Konten und Verlauf der letzten 12 Monate */
-export async function cashbookCard(t: Tenant): Promise<SafeHtml | null> {
+/** Für die Übersicht: Kontostände und Verlauf (ohne Rahmen) */
+export async function cashbookDash(t: Tenant): Promise<{ list: { id: number; name: string; balance: number }[]; total: number; chart: SafeHtml } | null> {
   if (!cashbookEnabled(t)) return null;
   const list = await balances(t.id);
   if (!list.length) return null;
   const total = list.reduce((a, x) => a + x.balance, 0);
   const r = rangeOf(Number(today().slice(0, 4)));
   const points = await history(list, r.chartFrom, r.chartTo);
-  return html`<section class="card cash-card">
-    <div class="cash-balances">
-      ${list.map((a) => html`<a class="cash-balance" href="/cashbook?account=${a.id}"><span>${a.name}</span>${money(a.balance)}</a>`)}
-      ${list.length > 1 ? html`<a class="cash-balance total" href="/cashbook"><span>Gesamt</span>${money(total)}</a>` : ''}
-    </div>
-    ${balanceChart(points, {
-      caption: 'Kontostände',
-      summary: `Heute ${formatMoney(total)} – Maus über den Verlauf zeigt den Stand je Tag`,
-      emptyText: 'Noch keine Buchungen.',
-      bare: true,
-    })}
-  </section>`;
+  const chart = balanceChart(points, {
+    caption: 'Kontostände',
+    summary: `Heute ${formatMoney(total)} – Maus über den Verlauf zeigt den Stand je Tag`,
+    emptyText: 'Noch keine Buchungen.',
+    bare: true,
+  });
+  return { list, total, chart };
 }
 
 function register(app: App) {
