@@ -1191,6 +1191,9 @@ test('Kassenbuch: Konten, Zuordnung, Umbuchung, Kassenzählung, Abschluss, Steue
   // Kostenart bei freien Buchungen
   r = await req('/cashbook/entries', { form: { account_id: String(bank), entry_date: today, direction: 'out', amount: '120', text: 'Beitrag Landesverband', category: 'verband', vat_rate: '0' } });
   assert.equal((await one("SELECT category FROM cash_entries WHERE tenant_id = ? AND text = 'Beitrag Landesverband'", t.id))!.category, 'verband');
+  // Einnahmen haben keine Kostenart – auch wenn eine mitgeschickt wird
+  r = await req('/cashbook/entries', { form: { account_id: String(kasse), entry_date: today, direction: 'in', amount: '5', text: 'Kuchenverkauf', category: 'verband', vat_rate: '0' } });
+  assert.equal((await one("SELECT category FROM cash_entries WHERE tenant_id = ? AND text = 'Kuchenverkauf'", t.id))!.category, '');
 
   // Dauerauftrag: Miete am 3. jeden Monats seit Jahresbeginn
   r = await req('/cashbook/recurring', { form: { direction: 'out', text: 'Miete Vereinsheim', account_id: String(bank), amount: '350', rhythm: 'monthly',

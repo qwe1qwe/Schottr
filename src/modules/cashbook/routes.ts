@@ -94,12 +94,13 @@ function parseEntry(form: Form, t: Tenant): EntryInput {
     receipt_ref: str(form, 'receipt_ref', 100),
     sphere: t.nonprofit && isSphere(sphere) ? sphere : '',
     vat_rate: t.small_business ? 0 : [0, 700, 1900].includes(vat) ? vat : 0,
-    category: isExpenseCategory(str(form, 'category')) ? str(form, 'category') : '',
+    category: str(form, 'direction') === 'out' && isExpenseCategory(str(form, 'category')) ? str(form, 'category') : '',
   };
 }
 
+/** Kostenart – nur bei Ausgaben (wird bei Einnahmen ausgeblendet und nicht gespeichert) */
 function categoryField(c: Ctx, value: string): SafeHtml {
-  return html`<label>Kostenart <select name="category">${categoryOptions(c, value, '– keine (z. B. bei Einnahmen) –')}</select></label>`;
+  return html`<label data-show-if="direction=out">Kostenart <select name="category">${categoryOptions(c, value, '– keine –')}</select></label>`;
 }
 
 function sphereField(t: Tenant, value: string, name = 'sphere'): SafeHtml {
@@ -212,7 +213,7 @@ function parseRecurring(form: Form, t: Tenant, isNew: boolean) {
     amount: str(form, 'direction') === 'in' ? amount! : -amount!,
     rhythm, start_date: start, end_date: end || null, text,
     receipt_ref: str(form, 'receipt_ref', 100),
-    category: isExpenseCategory(str(form, 'category')) ? str(form, 'category') : '',
+    category: str(form, 'direction') !== 'in' && isExpenseCategory(str(form, 'category')) ? str(form, 'category') : '',
     sphere: t.nonprofit && isSphere(sphere) ? sphere : '',
     vat_rate: t.small_business ? 0 : [0, 700, 1900].includes(vat) ? vat : 0,
     active: isNew || str(form, 'active') === '1' ? 1 : 0,
