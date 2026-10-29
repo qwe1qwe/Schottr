@@ -7,7 +7,7 @@ import { badge, csrfField } from '../../views/layout.ts';
 import { INVOICE_TYPES, SELECTABLE_TYPES } from '../../einvoice/model.ts';
 import type { Ctx } from '../../types.ts';
 import { tenantOf } from '../../lib/http.ts';
-import { SPHERES } from '../../lib/nonprofit.ts';
+import { sphereSelect as nonprofitSphereSelect } from '../../lib/nonprofit.ts';
 import type { Contact } from '../contacts.ts';
 import type { Article } from '../articles.ts';
 import { proofPicker, type Proof } from '../proofs.ts';
@@ -79,9 +79,7 @@ function itemRow(it?: DraftInput['items'][number]): SafeHtml {
 
 /** Tätigkeitsbereich für gemeinnützige Mandanten – intern, erscheint nicht auf dem Beleg */
 export function sphereSelect(value: string, name = 'sphere'): SafeHtml {
-  return html`<label>Bereich (Gemeinnützigkeit)
-    <select name="${name}">${SPHERES.map((s) => html`<option value="${s.value}" title="${s.hint}"${selected(s.value, value)}>${s.label}</option>`)}</select>
-    <small class="muted">nur intern – für die Grenzen in der Übersicht</small></label>`;
+  return nonprofitSphereSelect({ name, value, note: 'nur intern – erscheint nicht auf dem Beleg' });
 }
 
 type PrepaymentOption = { id: number; contact_id: number; number: string; type_code: string; issue_date: string; net_total: number; tax_total: number; gross_total: number };

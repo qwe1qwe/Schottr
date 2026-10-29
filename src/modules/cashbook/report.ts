@@ -2,6 +2,7 @@ import { all, one } from '../../db/index.ts';
 import { formatDate } from '../../lib/dates.ts';
 import { formatAmount, formatMoney } from '../../lib/money.ts';
 import { SPHERES, sphereLabel } from '../../lib/nonprofit.ts';
+import { categoryLabel } from '../../lib/expenses.ts';
 import { renderTablePdf, type TableSection } from '../../lib/tablepdf.ts';
 import type { Tenant } from '../../types.ts';
 import { DENOMINATIONS, SOURCE_LABELS, accountsOf, entriesOf, entrySphere, type CashAccount, type CashCount, type EntryRow } from './repo.ts';
@@ -51,16 +52,16 @@ export async function accountReports(t: Tenant, from: string, to: string): Promi
 }
 
 export function cashbookCsv(t: Tenant, rep: AccountReport): string {
-  const head = ['Datum', 'Konto', 'Art', 'Buchungstext', 'Beleg', 'Bereich', 'USt-Satz', 'darin USt', 'Einnahme', 'Ausgabe', 'Saldo'];
-  const lines: (string | number)[][] = [['', rep.account.name, '', 'Anfangsbestand', '', '', '', '', '', '', num(rep.opening)]];
+  const head = ['Datum', 'Konto', 'Art', 'Buchungstext', 'Beleg', 'Kostenart', 'Bereich', 'USt-Satz', 'darin USt', 'Einnahme', 'Ausgabe', 'Saldo'];
+  const lines: (string | number)[][] = [['', rep.account.name, '', 'Anfangsbestand', '', '', '', '', '', '', '', num(rep.opening)]];
   for (const r of rep.rows) {
     lines.push([
-      formatDate(r.entry_date), rep.account.name, SOURCE_LABELS[r.source], entryLabel(r) + (r.ref_label && r.text ? ` – ${r.text}` : ''), r.receipt_ref,
-      sphereText(t, r), r.vat_rate ? `${r.vat_rate / 100} %` : '', r.vat_rate ? num(vatOf(Math.abs(r.amount), r.vat_rate)) : '',
+      formatDate(r.entry_date), rep.account.name, r.recurring_id ? 'Dauerauftrag' : SOURCE_LABELS[r.source], entryLabel(r) + (r.ref_label && r.text ? ` – ${r.text}` : ''), r.receipt_ref,
+      r.category || r.ref_category ? categoryLabel(r.category || r.ref_category!) : '', sphereText(t, r), r.vat_rate ? `${r.vat_rate / 100} %` : '', r.vat_rate ? num(vatOf(Math.abs(r.amount), r.vat_rate)) : '',
       r.amount > 0 ? num(r.amount) : '', r.amount < 0 ? num(-r.amount) : '', num(r.balance),
     ]);
   }
-  lines.push(['', rep.account.name, '', 'Endbestand', '', '', '', '', num(rep.income), num(rep.expense), num(rep.closing)]);
+  lines.push(['', rep.account.name, '', 'Endbestand', '', '', '', '', '', num(rep.income), num(rep.expense), num(rep.closing)]);
   return csv(head, lines);
 }
 
@@ -76,7 +77,7 @@ export function cashbookPdf(t: Tenant, rep: AccountReport, from: string, to: str
       ...rep.rows.map((r) => ({
         cells: [
           formatDate(r.entry_date),
-          `${entryLabel(r)}${r.ref_label && r.text ? ` – ${r.text}` : ''} (${SOURCE_LABELS[r.source]}${r.vat_rate ? `, inkl. ${r.vat_rate / 100} % USt.` : ''})`,
+          `${entryLabel(r)}${r.ref_label && r.text ? ` – ${r.text}` : ''} (${r.recurring_id ? 'Dauerauftrag' : SOURCE_LABELS[r.source]}${r.category || r.ref_category ? `, ${categoryLabel(r.category || r.ref_category!)}` : ''}${r.vat_rate ? `, inkl. ${r.vat_rate / 100} % USt.` : ''})`,
           r.receipt_ref, ...(t.nonprofit ? [SPHERES.find((s) => s.value === entrySphere(r, t.default_sphere))?.short ?? ''] : []),
           r.amount > 0 ? formatMoney(r.amount) : '', r.amount < 0 ? formatMoney(-r.amount) : '', formatMoney(r.balance),
         ],

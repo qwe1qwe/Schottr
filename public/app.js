@@ -157,6 +157,24 @@
     sync();
   });
 
+  /* ---------- Bereich (Gemeinnützigkeit): Erklärung als Tooltip und Text zum gewählten Bereich ---------- */
+  document.querySelectorAll('[data-sphere-select]').forEach((select) => {
+    const hint = select.closest('label')?.querySelector('[data-sphere-hint]');
+    const sync = () => {
+      const o = select.selectedOptions[0];
+      if (!o) return;
+      select.title = `${o.dataset.hint} Beispiele: ${o.dataset.examples}`;
+      if (hint) {
+        hint.replaceChildren();
+        const strong = document.createElement('strong');
+        strong.textContent = o.dataset.hint;
+        hint.append(strong, ` z. B. ${o.dataset.examples}`);
+      }
+    };
+    select.addEventListener('change', sync);
+    sync();
+  });
+
   /* ---------- Kacheln mit Umschalter (z. B. Lieferanten / Verbindlichkeiten) ---------- */
   document.querySelectorAll('[data-tabs]').forEach((box, n) => {
     const key = `schottr:tab:${location.pathname}:${n}`;
@@ -321,6 +339,20 @@
       };
       supplier.addEventListener('change', () => sync(true));
       sync(false);
+    }
+
+    // Kassenbuch: Konto nur zeigen und verlangen, wenn „Bezahlt am“ gesetzt ist
+    const paidAt = pform.querySelector('[data-paid-at]');
+    const paidAccount = pform.querySelector('[data-paid-account]');
+    if (paidAt && paidAccount) {
+      const select = paidAccount.querySelector('select');
+      const syncPaid = () => {
+        paidAccount.hidden = !paidAt.value;
+        select.required = !!paidAt.value;
+      };
+      paidAt.addEventListener('input', syncPaid);
+      paidAt.addEventListener('change', syncPaid);
+      syncPaid();
     }
 
     const rowsBody = pform.querySelector('[data-tax-rows] tbody');

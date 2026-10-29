@@ -1,4 +1,4 @@
-import { SPHERES } from '../../lib/nonprofit.ts';
+import { sphereSelect } from '../../lib/nonprofit.ts';
 import { html, raw, selected, checked, type SafeHtml } from '../../lib/html.ts';
 import { formatDate, today } from '../../lib/dates.ts';
 import { formatAmount, formatMoney, formatQuantity, formatRate } from '../../lib/money.ts';
@@ -41,7 +41,7 @@ export function purchaseTitle(p: Pick<Purchase, 'number' | 'status' | 'file_name
 export function purchaseTable(rows: any[], showSupplier = true): SafeHtml {
   return html`<div class="card flush"><table class="table">
     <thead><tr>
-      <th>Rechnungsnr.</th><th>Datum</th>${showSupplier ? html`<th>Lieferant</th>` : ''}<th>Kostenart</th>
+      <th>Rechnungsnr.</th><th>Datum</th>${showSupplier ? html`<th>Lieferant</th>` : ''}<th>Beschreibung</th><th>Kostenart</th>
       <th>Status</th><th>Fällig</th><th class="right">Brutto</th>
     </tr></thead>
     <tbody>${rows.map((p) => {
@@ -51,6 +51,7 @@ export function purchaseTable(rows: any[], showSupplier = true): SafeHtml {
           ${p.is_credit ? html` <span class="tag">Gutschrift</span>` : ''}${p.einvoice_format ? html` <span class="tag info" title="${p.einvoice_format}">E-Rechnung</span>` : ''}</td>
         <td>${formatDate(p.issue_date)}</td>
         ${showSupplier ? html`<td>${p.contact_label ?? html`<span class="muted">–</span>`}</td>` : ''}
+        <td class="truncate desc-col" title="${p.description}">${p.description || html`<span class="muted">–</span>`}</td>
         <td>${p.status === 'draft' ? '' : categoryLabel(p.category)}</td>
         <td>${purchaseBadge(st)}</td>
         <td>${p.status === 'open' ? formatDate(dueOf(p)) : ''}</td>
@@ -90,19 +91,24 @@ function taxRowHtml(t?: PurchaseTax): SafeHtml {
 }
 
 /** Kostenarten: bei Vereinen zuerst die Vereins-Kostenarten, dann die allgemeinen (als Gruppen) */
-function categoryOptions(c: Ctx, current: string): SafeHtml {
+export function categoryOptions(c: Ctx, current: string, empty?: string): SafeHtml {
   const list = categoriesFor(tenantOf(c));
   const option = (x: { key: string; label: string }) => html`<option value="${x.key}"${selected(x.key, current)}>${x.label}</option>`;
   const missing = EXPENSE_CATEGORIES.find((x) => x.key === current && !list.some((y) => y.key === current));
   const assoc = list.filter((x) => x.association);
-  if (!assoc.length) return html`${list.map(option)}${missing ? option(missing) : ''}`;
-  return html`<optgroup label="Verein">${assoc.map(option)}</optgroup>
+  const none = empty ? html`<option value=""${selected('', current)}>${empty}</option>` : '';
+  if (!assoc.length) return html`${none}${list.map(option)}${missing ? option(missing) : ''}`;
+  return html`${none}<optgroup label="Verein">${assoc.map(option)}</optgroup>
     <optgroup label="Allgemein">${list.filter((x) => !x.association).map(option)}${missing ? option(missing) : ''}</optgroup>`;
 }
 
 export function purchaseForm(
   c: Ctx, action: string, d: PurchaseInput, suppliers: Contact[],
-  opts: { locked?: Purchase; taxes?: PurchaseTax[]; preview?: SafeHtml; smallBusiness?: boolean; defaultSphere?: string | null } = {},
+  opts: {
+    locked?: Purchase; taxes?: PurchaseTax[]; preview?: SafeHtml; smallBusiness?: boolean; defaultSphere?: string | null;
+    /** Kassenbuch: Konten zur Auswahl, wenn „Bezahlt am“ gesetzt ist */
+    accounts?: { id: number; name: string; kind: string }[]; paidAccountId?: number | null;
+  } = {},
 ): SafeHtml {
   const locked = opts.locked;
   const fields = html`
@@ -128,14 +134,21 @@ export function purchaseForm(
           <select name="category" data-category>${categoryOptions(c, d.category)}</select>
         </label>
         ${opts.defaultSphere
-          ? html`<label>Bereich (Gemeinnützigkeit)
-              <select name="sphere">${SPHERES.map((s) => html`<option value="${s.value}" title="${s.hint}"${selected(s.value, d.sphere || opts.defaultSphere)}>${s.label}</option>`)}</select></label>`
+          ? html`<div class="span-2">${sphereSelect({ value: d.sphere || opts.defaultSphere })}</div>`
           : ''}
         <label>Fällig am <input type="date" name="due_date" value="${d.due_date ?? ''}">
           <small class="muted">leer = sofort fällig</small></label>
         <label class="span-2">Beschreibung <input name="description" value="${d.description}" maxlength="300" placeholder="optional, z. B. Druckerpapier, Hosting Oktober"></label>
-        <label>Bezahlt am <input type="date" name="paid_at" value="${d.paid_at ?? ''}">
+        <label>Bezahlt am <input type="date" name="paid_at" value="${d.paid_at ?? ''}" data-paid-at>
           <small class="muted">leer = noch offen</small></label>
+        ${opts.accounts?.length
+          ? html`<label data-paid-account>Bezahlt von Konto
+              <select name="paid_account_id">
+                <option value="">– Konto wählen –</option>
+                ${opts.accounts.map((a) => html`<option value="${a.id}"${selected(a.id, opts.paidAccountId ?? '')}>${a.name}</option>`)}
+              </select>
+              <small class="muted">Pflicht, sobald „Bezahlt am“ gesetzt ist – die Zahlung wird im Kassenbuch gebucht.</small></label>`
+          : ''}
         ${locked ? '' : html`<label class="check"><input type="checkbox" name="is_credit" value="1"${checked(d.is_credit)}> Gutschrift / Rechnungskorrektur zu meinen Gunsten</label>`}
       </div>
     </section>

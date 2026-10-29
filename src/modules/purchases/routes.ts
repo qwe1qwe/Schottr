@@ -7,7 +7,7 @@ import { formatDate, isIsoDate, monthEnd, monthLabel, today } from '../../lib/da
 import { readStoredFile } from '../../lib/files.ts';
 import { categoryLabel } from '../../lib/expenses.ts';
 import { html, type SafeHtml } from '../../lib/html.ts';
-import { attachment, idParam, notFound, readForm, redirectWith, str, tenantOf, userOf, UserError } from '../../lib/http.ts';
+import { attachment, idParam, notFound, readForm, redirectWith, str, tenantOf, userOf, UserError, type Form } from '../../lib/http.ts';
 import { formatIban } from '../../lib/validate.ts';
 import { formatAmount, formatMoney, parseDecimal } from '../../lib/money.ts';
 import { csrfField, empty, page } from '../../views/layout.ts';
@@ -20,7 +20,7 @@ import {
 import {
   einvoiceDetails, previewFrame, purchaseBadge, purchaseForm, purchaseStatus, purchaseTable, purchaseTitle, taxSummary, uploadCard,
 } from './views.ts';
-import type { App, Ctx, Module } from '../../types.ts';
+import type { App, Ctx, Module, Tenant } from '../../types.ts';
 
 const FILTERS = [
   { value: '', label: 'Alle' },
@@ -29,6 +29,25 @@ const FILTERS = [
   { value: 'overdue', label: 'Überfällig' },
   { value: 'paid', label: 'Bezahlt' },
 ];
+
+/** Mit Kassenbuch: bei „Bezahlt am“ muss ein Konto gewählt sein */
+async function requiredAccount(t: Tenant, paidAt: string | null, form: Form): Promise<number> {
+  if (!paidAt || !cashbookEnabled(t)) return 0;
+  const accounts = await accountsOf(t.id);
+  if (!accounts.length) return 0;
+  const id = Number(str(form, 'paid_account_id')) || 0;
+  if (!accounts.some((a) => a.id === id)) throw new UserError('Bitte das Konto wählen, von dem die Rechnung bezahlt wurde.');
+  return id;
+}
+
+/** Zahlung im Kassenbuch buchen; ein bereits gebuchter (z. B. um Skonto geminderter) Betrag bleibt erhalten */
+async function syncPayment(t: Tenant, id: number, paidAt: string | null, accountId: number, userId: number) {
+  if (!paidAt || !accountId) return;
+  const p = (await getPurchase(t.id, id))!;
+  const existing = await linkedEntry('purchase', id);
+  const amount = existing?.amount ?? (p.is_credit ? 1 : -1) * payable(p);
+  await bookLinked(t, 'purchase', id, { account_id: accountId, entry_date: paidAt, amount, text: existing?.text ?? '' }, userId);
+}
 
 function postButton(c: Ctx, action: string, label: string, cls = 'btn', confirm?: string): SafeHtml {
   return html`<form method="post" action="${action}" class="inline" ${confirm ? html`data-confirm="${confirm}"` : ''}>${csrfField(c)}<button class="${cls}">${label}</button></form>`;
@@ -166,15 +185,24 @@ function register(app: App) {
     return page(c, {
       title: 'Eingangsrechnung erfassen',
       back: { href: '/purchases', label: 'Eingangsrechnungen' },
-      body: purchaseForm(c, '/purchases', emptyInput(contact), await supplierOptions(t.id, contact?.id), { smallBusiness: !!t.small_business, defaultSphere: t.nonprofit ? t.default_sphere : null }),
+      body: purchaseForm(c, '/purchases', emptyInput(contact), await supplierOptions(t.id, contact?.id), {
+        smallBusiness: !!t.small_business, defaultSphere: t.nonprofit ? t.default_sphere : null,
+        accounts: cashbookEnabled(t) ? await accountsOf(t.id) : [],
+      }),
     });
   });
 
   app.post('/purchases', async (c) => {
     const t = tenantOf(c);
     try {
-      const input = parsePurchaseForm(await readForm(c), false);
-      const id = await savePurchase(t, userOf(c).id, null, input);
+      const form = await readForm(c);
+      const input = parsePurchaseForm(form, false);
+      const accountId = await requiredAccount(t, input.paid_at, form);
+      const id = await tx(async () => {
+        const newId = await savePurchase(t, userOf(c).id, null, input);
+        await syncPayment(t, newId, input.paid_at, accountId, userOf(c).id);
+        return newId;
+      });
       return redirectWith(c, `/purchases/${id}`, 'ok', 'Eingangsrechnung gespeichert.');
     } catch (err) {
       if (err instanceof UserError) return redirectWith(c, '/purchases/new', 'error', err.message);
@@ -257,6 +285,7 @@ function register(app: App) {
       ${purchaseForm(c, `/purchases/${p.id}`, purchaseToInput(p, taxes), await supplierOptions(t.id, p.contact_id), {
         locked, taxes, preview: p.file_path && p.file_mime !== 'application/xml' ? previewFrame(p) : undefined, smallBusiness: !!t.small_business,
         defaultSphere: t.nonprofit ? t.default_sphere : null,
+        accounts: cashbookEnabled(t) ? await accountsOf(t.id) : [], paidAccountId: (await linkedEntry('purchase', p.id))?.account_id ?? null,
       })}
       ${draft
         ? html`<div class="danger-zone">${postButton(c, `/purchases/${p.id}/delete`, 'Beleg verwerfen', 'btn danger', 'Hochgeladenen Beleg verwerfen?')}</div>`
@@ -268,14 +297,15 @@ function register(app: App) {
     const t = tenantOf(c);
     const p = (await getPurchase(t.id, idParam(c))) ?? notFound();
     try {
-      const input = parsePurchaseForm(await readForm(c), !!p.einvoice_format);
-      // Kassenbuch: Zahlung entfernen bzw. Datum nachziehen, wenn „Bezahlt am“ geändert wurde
-      const payment = await linkedEntry('purchase', p.id);
-      if (payment && !input.paid_at) await unlink(t, 'purchase', p.id);
-      await savePurchase(t, userOf(c).id, p, input);
-      if (payment && input.paid_at && input.paid_at !== payment.entry_date) {
-        await bookLinked(t, 'purchase', p.id, { account_id: payment.account_id, entry_date: input.paid_at, amount: payment.amount, text: payment.text }, userOf(c).id);
-      }
+      const form = await readForm(c);
+      const input = parsePurchaseForm(form, !!p.einvoice_format);
+      const accountId = await requiredAccount(t, input.paid_at, form);
+      // Kassenbuch: Zahlung entfernen, buchen bzw. Datum/Konto nachziehen
+      if (!input.paid_at) await unlink(t, 'purchase', p.id);
+      await tx(async () => {
+        await savePurchase(t, userOf(c).id, p, input);
+        await syncPayment(t, p.id, input.paid_at, accountId, userOf(c).id);
+      });
       if (p.status !== 'draft') await audit(c, 'purchase.update', `${purchaseTitle(p)} (ID ${p.id})`);
       return redirectWith(c, `/purchases/${p.id}`, 'ok', 'Eingangsrechnung gespeichert.');
     } catch (err) {

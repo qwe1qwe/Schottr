@@ -928,7 +928,7 @@ test('Gemeinnütziger Verein: Bereich je Rechnung, Grenzen in der Übersicht, Vo
   page = await (await req('/')).text();
   assert.match(page, /Kleinunternehmergrenze/);
   assert.match(page, /aria-valuemax="10000000" aria-valuenow="4429412"/, '35.294,12 € + 9.000 € netto, ohne die 1.000 € Beitrag');
-  assert.match(page, /\(ohne ideellen Bereich\)/);
+  assert.match(page, /, ohne ideellen Bereich\./);
 
   // ohne Gemeinnützigkeit keine Kachel und kein Bereichsfeld
   await run('UPDATE tenants SET nonprofit = 0, small_business = 0 WHERE id = ?', t.id);
@@ -1165,6 +1165,58 @@ test('Kassenbuch: Konten, Zuordnung, Umbuchung, Kassenzählung, Abschluss, Steue
   // ohne Summe → Fehler, nichts gespeichert
   r = await req('/cashbook/count', { form: { account_id: String(kasse), count_date: today, count_mode: 'total', counted_total: '' } });
   assert.equal((await all('SELECT id FROM cash_counts WHERE account_id = ?', kasse)).length, 2);
+
+  // Gemeinnützigkeits-Kachel: Barumsatz aus der Kassenzählung zählt im wirtschaftlichen Geschäftsbetrieb mit
+  page = await (await req('/')).text();
+  assert.match(page, /bar ohne Rechnung 90,00.€/);
+
+  // Eingangsrechnung mit „Bezahlt am“: Konto ist Pflicht und wird gebucht
+  const purchaseCount = async () => Number((await one('SELECT COUNT(*) n FROM purchase_invoices WHERE tenant_id = ?', t.id))!.n);
+  const before = await purchaseCount();
+  const pform = { new_supplier: 'Druckerei Klein', issue_date: today, paid_at: today, description: 'Plakate Sommerfest', 'tax_rate[]': '1900', 'tax_net[]': '', 'tax_tax[]': '', 'tax_gross[]': '59,50' };
+  r = await req('/purchases', { form: pform });
+  assert.equal(await purchaseCount(), before, 'ohne Konto nicht gespeichert');
+  r = await req('/purchases', { form: { ...pform, paid_account_id: String(bank) } });
+  const druck = Number(location(r).split('/').pop());
+  assert.equal((await one('SELECT amount FROM cash_entries WHERE purchase_id = ?', druck))!.amount, -5950);
+  // Beschreibung in der Tabelle
+  page = await (await req('/purchases')).text();
+  assert.match(page, /Plakate Sommerfest/);
+
+  // Lieferanten-Kachel: Jahr oder alle Jahre, größte Rechnungen auch bezahlte
+  page = await (await req('/?sp=all')).text();
+  assert.match(page, /<option value="all" selected>Alle Jahre<\/option>/);
+  assert.match(page, /class="liability-name">Druckerei Klein/);
+
+  // Kostenart bei freien Buchungen
+  r = await req('/cashbook/entries', { form: { account_id: String(bank), entry_date: today, direction: 'out', amount: '120', text: 'Beitrag Landesverband', category: 'verband', vat_rate: '0' } });
+  assert.equal((await one("SELECT category FROM cash_entries WHERE tenant_id = ? AND text = 'Beitrag Landesverband'", t.id))!.category, 'verband');
+
+  // Dauerauftrag: Miete am 3. jeden Monats seit Jahresbeginn
+  r = await req('/cashbook/recurring', { form: { direction: 'out', text: 'Miete Vereinsheim', account_id: String(bank), amount: '350', rhythm: 'monthly',
+    start_date: `${year}-01-03`, end_date: '', receipt_ref: 'Mietvertrag vom 01.12.2025', category: 'halle', sphere: 'ideell', vat_rate: '0' } });
+  const rec = Number(location(r).split('/').pop());
+  assert.ok(rec > 0);
+  const dues = Array.from({ length: 12 }, (_, i) => `${year}-${String(i + 1).padStart(2, '0')}-03`).filter((d) => d <= today);
+  page = await (await req('/')).text();
+  assert.match(page, new RegExp(`Fällige Daueraufträge <span class="count">${dues.length}</span>`));
+  // ersten Termin buchen, zweiten überspringen, Rest auf einmal
+  r = await req(`/cashbook/recurring/${rec}/book?due=${dues[0]}&back=/`, { form: {} });
+  assert.equal(location(r), '/');
+  const first = (await one('SELECT * FROM cash_entries WHERE recurring_id = ? AND recurring_due = ?', rec, dues[0]))!;
+  assert.equal(first.amount, -35000);
+  assert.equal(first.category, 'halle');
+  assert.equal(first.text, `Miete Vereinsheim Januar ${year}`);
+  r = await req(`/cashbook/recurring/${rec}/book?due=${dues[0]}`, { form: {} });
+  assert.equal((await all('SELECT id FROM cash_entries WHERE recurring_id = ?', rec)).length, 1, 'nicht doppelt');
+  if (dues.length > 1) r = await req(`/cashbook/recurring/${rec}/skip?due=${dues[1]}`, { form: {} });
+  r = await req('/cashbook/recurring/book-all?back=/', { form: {} });
+  assert.equal((await all('SELECT id FROM cash_entries WHERE recurring_id = ?', rec)).length, Math.max(1, dues.length - 1));
+  page = await (await req('/')).text();
+  assert.doesNotMatch(page, /Fällige Daueraufträge/);
+  // zukünftige Termine lassen sich nicht vorab buchen
+  r = await req(`/cashbook/recurring/${rec}/book?due=${year + 1}-01-03`, { form: {} });
+  assert.equal(await one('SELECT 1 FROM cash_entries WHERE recurring_id = ? AND recurring_due = ?', rec, `${year + 1}-01-03`), undefined);
 
   // Steuerbüro-Paket
   r = await req(`/export/package?year=${year}`);

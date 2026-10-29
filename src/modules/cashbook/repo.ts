@@ -41,6 +41,10 @@ export interface CashEntry {
   receipt_ref: string;
   sphere: string;
   vat_rate: number;
+  /** Kostenart (freie Buchungen, siehe lib/expenses.ts) */
+  category: string;
+  recurring_id: number | null;
+  recurring_due: string | null;
 }
 
 export interface CashCount {
@@ -152,6 +156,7 @@ export interface EntryInput {
   receipt_ref?: string;
   sphere?: string;
   vat_rate?: number;
+  category?: string;
 }
 
 async function checkAccount(t: Tenant, accountId: number, date: string): Promise<CashAccount> {
@@ -204,9 +209,9 @@ export async function createManual(t: Tenant, e: EntryInput, userId: number): Pr
   await checkAccount(t, e.account_id, e.entry_date);
   const now = nowIso();
   const res = await run(
-    `INSERT INTO cash_entries (tenant_id, account_id, entry_date, amount, source, text, receipt_ref, sphere, vat_rate, created_by, created_at, updated_at)
-     VALUES (?, ?, ?, ?, 'manual', ?, ?, ?, ?, ?, ?, ?)`,
-    t.id, e.account_id, e.entry_date, e.amount, e.text, e.receipt_ref ?? '', e.sphere ?? '', e.vat_rate ?? 0, userId, now, now,
+    `INSERT INTO cash_entries (tenant_id, account_id, entry_date, amount, source, text, receipt_ref, sphere, vat_rate, category, created_by, created_at, updated_at)
+     VALUES (?, ?, ?, ?, 'manual', ?, ?, ?, ?, ?, ?, ?, ?)`,
+    t.id, e.account_id, e.entry_date, e.amount, e.text, e.receipt_ref ?? '', e.sphere ?? '', e.vat_rate ?? 0, e.category ?? '', userId, now, now,
   );
   return Number(res.insertId);
 }
@@ -216,8 +221,8 @@ export async function updateManual(t: Tenant, entry: CashEntry, e: EntryInput): 
   assertOpen(t, entry.entry_date);
   await checkAccount(t, e.account_id, e.entry_date);
   await run(
-    'UPDATE cash_entries SET account_id = ?, entry_date = ?, amount = ?, text = ?, receipt_ref = ?, sphere = ?, vat_rate = ?, updated_at = ? WHERE id = ?',
-    e.account_id, e.entry_date, e.amount, e.text, e.receipt_ref ?? '', e.sphere ?? '', e.vat_rate ?? 0, nowIso(), entry.id,
+    'UPDATE cash_entries SET account_id = ?, entry_date = ?, amount = ?, text = ?, receipt_ref = ?, sphere = ?, vat_rate = ?, category = ?, updated_at = ? WHERE id = ?',
+    e.account_id, e.entry_date, e.amount, e.text, e.receipt_ref ?? '', e.sphere ?? '', e.vat_rate ?? 0, e.category ?? '', nowIso(), entry.id,
   );
 }
 
@@ -372,6 +377,7 @@ export interface EntryRow extends CashEntry {
   account_name: string;
   ref_label: string | null;
   ref_sphere: string | null;
+  ref_category: string | null;
 }
 
 /**
@@ -395,7 +401,8 @@ export async function entriesOf(accounts: CashAccount[], from: string, to: strin
          WHEN 'invoice' THEN (SELECT NULLIF(d.sphere, '') FROM documents d WHERE d.id = e.document_id)
          WHEN 'purchase' THEN (SELECT NULLIF(p.sphere, '') FROM purchase_invoices p WHERE p.id = e.purchase_id)
          WHEN 'donation' THEN 'ideell'
-         ELSE NULL END ref_sphere
+         ELSE NULL END ref_sphere,
+       IF(e.source = 'purchase', (SELECT p.category FROM purchase_invoices p WHERE p.id = e.purchase_id), NULL) ref_category
      FROM cash_entries e JOIN cash_accounts a ON a.id = e.account_id
      WHERE e.account_id IN (${ids.map(() => '?').join(',')}) AND e.entry_date BETWEEN ? AND ? ORDER BY e.entry_date, e.id`,
     ...ids, from, to,
@@ -414,4 +421,128 @@ export function entrySphere(e: Pick<EntryRow, 'source' | 'sphere' | 'ref_sphere'
   if (e.source === 'transfer') return '';
   if (e.source === 'donation') return 'ideell';
   return e.ref_sphere || e.sphere || defaultSphere;
+}
+
+/* ---------------- Daueraufträge ---------------- */
+
+export type Rhythm = 'monthly' | 'quarterly' | 'halfyearly' | 'yearly';
+export const RHYTHMS: Record<Rhythm, { label: string; months: number }> = {
+  monthly: { label: 'monatlich', months: 1 },
+  quarterly: { label: 'vierteljährlich', months: 3 },
+  halfyearly: { label: 'halbjährlich', months: 6 },
+  yearly: { label: 'jährlich', months: 12 },
+};
+
+export interface Recurring {
+  id: number;
+  tenant_id: number;
+  account_id: number;
+  amount: number;
+  rhythm: Rhythm;
+  start_date: string;
+  end_date: string | null;
+  text: string;
+  receipt_ref: string;
+  category: string;
+  sphere: string;
+  vat_rate: number;
+  active: number;
+}
+
+export async function recurringOf(tenantId: number): Promise<(Recurring & { account_name: string })[]> {
+  return all<Recurring & { account_name: string }>(
+    `SELECT r.*, a.name account_name FROM cash_recurring r JOIN cash_accounts a ON a.id = r.account_id
+     WHERE r.tenant_id = ? ORDER BY r.active DESC, r.text, r.id`,
+    tenantId,
+  );
+}
+
+export async function getRecurring(tenantId: number, id: number) {
+  return one<Recurring>('SELECT * FROM cash_recurring WHERE tenant_id = ? AND id = ?', tenantId, id);
+}
+
+/** n Monate nach dem Starttermin, Tag auf das Monatsende begrenzt (31.01. → 28./29.02.) */
+function addMonthsClamped(start: string, months: number): string {
+  const [y, m, d] = start.split('-').map(Number);
+  const idx = y * 12 + (m - 1) + months;
+  const yy = Math.floor(idx / 12);
+  const mm = idx % 12;
+  const last = new Date(Date.UTC(yy, mm + 1, 0)).getUTCDate();
+  return `${yy}-${String(mm + 1).padStart(2, '0')}-${String(Math.min(d, last)).padStart(2, '0')}`;
+}
+
+/** Termine eines Dauerauftrags von Beginn bis `until` (einschließlich), höchstens bis zum Ende */
+export function dueDates(r: Pick<Recurring, 'start_date' | 'end_date' | 'rhythm'>, until: string): string[] {
+  const out: string[] = [];
+  const step = RHYTHMS[r.rhythm].months;
+  for (let i = 0; i < 1200; i++) {
+    const d = addMonthsClamped(r.start_date, i * step);
+    if (d > until || (r.end_date && d > r.end_date)) break;
+    out.push(d);
+  }
+  return out;
+}
+
+/** Nächster Termin nach heute (für die Anzeige) */
+export function nextDue(r: Pick<Recurring, 'start_date' | 'end_date' | 'rhythm'>, after = today()): string | null {
+  const step = RHYTHMS[r.rhythm].months;
+  for (let i = 0; i < 1200; i++) {
+    const d = addMonthsClamped(r.start_date, i * step);
+    if (r.end_date && d > r.end_date) return null;
+    if (d > after) return d;
+  }
+  return null;
+}
+
+export interface PendingDue { recurring: Recurring & { account_name: string }; due: string }
+
+/**
+ * Fällige, noch nicht gebuchte Termine aller aktiven Daueraufträge bis heute – ohne übersprungene,
+ * ohne Termine vor der Kontoeröffnung und ohne abgeschlossene Zeiträume.
+ */
+export async function pendingDues(t: Tenant): Promise<PendingDue[]> {
+  const list = (await recurringOf(t.id)).filter((r) => r.active);
+  if (!list.length) return [];
+  const ids = list.map((r) => r.id);
+  const marks = new Set(
+    (await all<{ k: string }>(
+      `SELECT CONCAT(recurring_id, '|', recurring_due) k FROM cash_entries WHERE recurring_id IN (${ids.map(() => '?').join(',')})
+       UNION ALL SELECT CONCAT(recurring_id, '|', due_date) k FROM cash_recurring_skips WHERE recurring_id IN (${ids.map(() => '?').join(',')})`,
+      ...ids, ...ids,
+    )).map((r) => String(r.k)),
+  );
+  const openings = new Map((await accountsOf(t.id, true)).map((a) => [a.id, a.opening_date]));
+  const out: PendingDue[] = [];
+  for (const r of list) {
+    for (const due of dueDates(r, today())) {
+      if (marks.has(`${r.id}|${due}`)) continue;
+      if (due < (openings.get(r.account_id) ?? '9999')) continue;
+      if (t.cashbook_locked_until && due <= t.cashbook_locked_until) continue;
+      out.push({ recurring: r, due });
+    }
+  }
+  return out.sort((a, b) => a.due.localeCompare(b.due) || a.recurring.text.localeCompare(b.recurring.text));
+}
+
+/** Termin eines Dauerauftrags buchen (als freie Buchung mit Verweis auf den Dauerauftrag) */
+export async function bookDue(t: Tenant, r: Recurring, due: string, userId: number): Promise<number> {
+  if (!dueDates(r, today()).includes(due)) throw new UserError('Dieser Termin gehört nicht zum Dauerauftrag oder liegt in der Zukunft.');
+  await checkAccount(t, r.account_id, due);
+  if (await one('SELECT 1 FROM cash_entries WHERE recurring_id = ? AND recurring_due = ?', r.id, due)) {
+    throw new UserError(`Der Termin ${formatDate(due)} ist bereits gebucht.`);
+  }
+  const now = nowIso();
+  const month = `${['Januar', 'Februar', 'März', 'April', 'Mai', 'Juni', 'Juli', 'August', 'September', 'Oktober', 'November', 'Dezember'][Number(due.slice(5, 7)) - 1]} ${due.slice(0, 4)}`;
+  const res = await run(
+    `INSERT INTO cash_entries (tenant_id, account_id, entry_date, amount, source, recurring_id, recurring_due, text, receipt_ref, sphere, vat_rate, category, created_by, created_at, updated_at)
+     VALUES (?, ?, ?, ?, 'manual', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    t.id, r.account_id, due, r.amount, r.id, due, `${r.text} ${r.rhythm === 'yearly' ? due.slice(0, 4) : month}`,
+    r.receipt_ref, r.sphere, r.vat_rate, r.category, userId, now, now,
+  );
+  return Number(res.insertId);
+}
+
+export async function skipDue(r: Recurring, due: string) {
+  if (!dueDates(r, today()).includes(due)) throw new UserError('Dieser Termin gehört nicht zum Dauerauftrag.');
+  await run('INSERT IGNORE INTO cash_recurring_skips (recurring_id, due_date, created_at) VALUES (?, ?, ?)', r.id, due, nowIso());
 }

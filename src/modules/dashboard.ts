@@ -14,7 +14,8 @@ import { purchaseBadge, purchaseStatus } from './purchases/views.ts';
 import { dueOf, payable, type Purchase } from './purchases/repo.ts';
 import { isSphere, nonprofitLimits, NONPROFIT_ALLOWANCE, SPHERES, type Sphere } from '../lib/nonprofit.ts';
 import { donationTotals } from './donations/repo.ts';
-import { cashbookCard } from './cashbook/routes.ts';
+import { cashbookCard, pendingCard } from './cashbook/routes.ts';
+import { cashbookEnabled, pendingDues } from './cashbook/repo.ts';
 import type { Module, Tenant } from '../types.ts';
 
 /**
@@ -174,46 +175,63 @@ async function resultChart(t: Tenant, year: string, todayIso: string) {
   });
 }
 
-/** Kachel mit Umschalter: Top-Lieferanten nach Kosten bzw. größte offene Verbindlichkeiten */
-async function supplierCard(t: Tenant, todayIso: string) {
-  const from = `${last24Months(todayIso)[0].key}-01`;
+/**
+ * Kachel mit Umschalter: Top-Lieferanten nach Kosten bzw. größte Verbindlichkeiten (alle
+ * Eingangsrechnungen, offene wie bezahlte) – jeweils für ein wählbares Jahr oder den ganzen Bestand.
+ */
+async function supplierCard(t: Tenant, period: string, years: string[], dashYear: string) {
+  const all_ = period === 'all';
+  const where = all_ ? '' : 'AND substr(p.issue_date, 1, 4) = ?';
+  const params = all_ ? [] : [period];
   const rows = await all<{ id: number; label: string; s: number | string }>(
     `SELECT c.id, COALESCE(NULLIF(c.company, ''), c.name) label, ${COST(t)} s
      FROM purchase_invoices p JOIN contacts c ON c.id = p.contact_id
-     WHERE p.tenant_id = ? AND p.status <> 'draft' AND p.issue_date >= ? AND p.issue_date <= ?
+     WHERE p.tenant_id = ? AND p.status <> 'draft' ${where}
      GROUP BY c.id, label ORDER BY s DESC`,
-    t.id, from, todayIso,
+    t.id, ...params,
   );
   const positive = rows.map((r) => ({ ...r, s: Number(r.s) })).filter((r) => r.s > 0);
   const slices: PieSlice[] = positive.slice(0, 5).map((r) => ({ label: r.label, value: r.s, href: `/contacts/${r.id}` }));
   const rest = positive.slice(5).reduce((a, r) => a + r.s, 0);
   if (rest > 0) slices.push({ label: `Sonstige (${positive.length - 5})`, value: rest, rest: true });
+  const label = all_ ? 'gesamt' : period;
   const pie = pieChart(slices, {
     caption: 'Top-Lieferanten',
-    sub: `${t.small_business ? 'Kosten brutto' : 'Kosten netto'} seit ${formatDate(from)}`,
-    emptyText: 'In den letzten 24 Monaten wurden keine Eingangsrechnungen erfasst.',
-    centerLabel: '24 Monate',
+    sub: `${t.small_business ? 'Kosten brutto' : 'Kosten netto'} ${all_ ? 'aller Jahre' : `im Jahr ${period}`}`,
+    emptyText: all_ ? 'Es wurden noch keine Eingangsrechnungen erfasst.' : `${period} wurden keine Eingangsrechnungen erfasst.`,
+    centerLabel: label,
     bare: true,
   });
 
-  const open = await all<Purchase & { contact_label: string | null }>(
+  const biggest = await all<Purchase & { contact_label: string | null }>(
     `SELECT p.*, COALESCE(NULLIF(c.company, ''), c.name) AS contact_label FROM purchase_invoices p LEFT JOIN contacts c ON c.id = p.contact_id
-     WHERE p.tenant_id = ? AND p.status = 'open' AND p.is_credit = 0 AND p.gross_total - p.prepaid_total > 0
-     ORDER BY p.gross_total - p.prepaid_total DESC, COALESCE(p.due_date, p.issue_date) LIMIT 6`,
-    t.id,
+     WHERE p.tenant_id = ? AND p.status <> 'draft' AND p.is_credit = 0 ${where}
+     ORDER BY p.gross_total DESC, p.issue_date DESC LIMIT 6`,
+    t.id, ...params,
   );
-  const liabilities = open.length
-    ? html`<ul class="plain liability-list">${open.map((p) => html`<li>
-        <a href="/purchases/${p.id}" class="liability-name">${p.contact_label ?? 'ohne Lieferant'}<span class="muted small"> · ${p.number || 'ohne Nr.'}</span></a>
-        <span class="liability-due small">${purchaseStatus(p) === 'overdue' ? purchaseBadge('overdue') : html`<span class="muted">fällig ${formatDate(dueOf(p))}</span>`}</span>
-        <strong class="num">${formatMoney(payable(p))}</strong>
-      </li>`)}</ul>
-      <p class="small"><a href="/purchases?status=open">Alle offenen Eingangsrechnungen</a></p>`
-    : html`<p class="muted small pie-empty">Keine offenen Verbindlichkeiten.</p>`;
+  const liabilities = biggest.length
+    ? html`<ul class="plain liability-list">${biggest.map((p) => {
+        const st = purchaseStatus(p);
+        return html`<li>
+          <a href="/purchases/${p.id}" class="liability-name">${p.contact_label ?? 'ohne Lieferant'}<span class="muted small"> · ${p.number || 'ohne Nr.'} · ${formatDate(p.issue_date)}</span>${p.description ? html`<span class="muted small liability-desc">${p.description}</span>` : ''}</a>
+          <span class="liability-due small">${st === 'open' ? html`<span class="muted">fällig ${formatDate(dueOf(p))}</span>` : purchaseBadge(st)}</span>
+          <strong class="num">${formatMoney(p.gross_total)}</strong>
+        </li>`;
+      })}</ul>
+      <p class="small"><a href="/purchases">Alle Eingangsrechnungen</a></p>`
+    : html`<p class="muted small pie-empty">${all_ ? 'Keine Eingangsrechnungen.' : `Keine Eingangsrechnungen in ${period}.`}</p>`;
 
   return html`<section class="card dual" data-tabs>
     <div class="dual-head">
       <h2 data-tab-title>Lieferanten</h2>
+      <form method="get" action="/" class="dual-period">
+        <input type="hidden" name="year" value="${dashYear}">
+        <select name="sp" class="year-select small-select" data-autosubmit aria-label="Zeitraum Lieferanten">
+          ${years.map((y) => html`<option value="${y}"${selected(y, period)}>${y}</option>`)}
+          <option value="all"${selected('all', period)}>Alle Jahre</option>
+        </select>
+        <noscript><button class="btn small">OK</button></noscript>
+      </form>
       <div class="tabs small-tabs" role="tablist">
         <button type="button" role="tab" data-tab="suppliers" aria-selected="true">Top-Lieferanten</button>
         <button type="button" role="tab" data-tab="liabilities" aria-selected="false">Größte Verbindlichkeiten</button>
@@ -227,8 +245,13 @@ async function supplierCard(t: Tenant, todayIso: string) {
 /** Kleinunternehmergrenze nach § 19 UStG – nur wenn die Regelung aktiv ist */
 async function smallBusinessLimits(t: Tenant, year: number) {
   const npo = t.nonprofit ? t.default_sphere : null;
-  const prev = await yearRevenue(t.id, year - 1, npo);
-  const cur = await yearRevenue(t.id, year, npo);
+  const withCash = async (y: number) => {
+    const r = await yearRevenue(t.id, y, npo);
+    const cash = (await cashRevenue(t, y)).filter((x) => !t.nonprofit || x.sp !== 'ideell').reduce((a, x) => a + x.net, 0);
+    return { n: r.n, s: r.s + cash };
+  };
+  const prev = await withCash(year - 1);
+  const cur = await withCash(year);
   const prevOver = prev.s > KU_PREV_YEAR_LIMIT;
   const next = year + 1;
   // Zustand: unter 80 % der 25.000-€-Grenze ok, darüber Warnung, über 25.000 € Folgejahr betroffen, über 100.000 € sofort
@@ -249,21 +272,48 @@ async function smallBusinessLimits(t: Tenant, year: number) {
     <p class="small ku-status ku-${state}">${status}</p>
     <p class="small ${prevOver ? 'danger-text' : 'muted'}">Vorjahr ${year - 1}: ${formatMoney(prev.s)}
       ${prevOver ? ` – über ${formatMoney(KU_PREV_YEAR_LIMIT)}, die Kleinunternehmerregelung ist ${year} nicht anwendbar.` : ` – innerhalb der Grenze von ${formatMoney(KU_PREV_YEAR_LIMIT)}.`}</p>
-    <p class="muted small">Berechnet aus den festgeschriebenen Rechnungen in Schottr${t.nonprofit ? ' (ohne ideellen Bereich)' : ''}. Maßgeblich ist dein gesamter Umsatz – Umsätze außerhalb von Schottr zählen mit.</p>
+    <p class="muted small">Berechnet aus den festgeschriebenen Rechnungen und den Bareinnahmen ohne Rechnung im Kassenbuch (netto)${t.nonprofit ? ', ohne ideellen Bereich' : ''}. Maßgeblich ist dein gesamter Umsatz – Umsätze außerhalb von Schottr zählen mit.</p>
   </section>`;
 }
 
 /** Einnahmen (brutto) je Tätigkeitsbereich eines Jahres; Rechnungen ohne Zuordnung zählen zum Vorgabe-Bereich */
-async function sphereRevenue(t: Tenant, year: number): Promise<Record<Sphere, { n: number; s: number }>> {
+type SphereSum = { n: number; s: number; cashN: number; cash: number };
+
+async function sphereRevenue(t: Tenant, year: number): Promise<Record<Sphere, SphereSum>> {
   const rows = await all<{ sp: string; n: number; s: number | string }>(
     `SELECT COALESCE(NULLIF(sphere, ''), ?) sp, COUNT(*) n, ${GROSS_REVENUE} s FROM documents
      WHERE tenant_id = ? AND kind = 'invoice' AND finalized_at IS NOT NULL AND substr(issue_date, 1, 4) = ?
      GROUP BY sp`,
     t.default_sphere || 'business', t.id, String(year),
   );
-  const out = Object.fromEntries(SPHERES.map((x) => [x.value, { n: 0, s: 0 }])) as Record<Sphere, { n: number; s: number }>;
-  for (const r of rows) if (isSphere(String(r.sp))) out[r.sp as Sphere] = { n: Number(r.n), s: Number(r.s) };
+  const out = Object.fromEntries(SPHERES.map((x) => [x.value, { n: 0, s: 0, cashN: 0, cash: 0 }])) as Record<Sphere, SphereSum>;
+  for (const r of rows) if (isSphere(String(r.sp))) out[r.sp as Sphere] = { n: Number(r.n), s: Number(r.s), cashN: 0, cash: 0 };
+  for (const r of await cashRevenue(t, year)) {
+    if (!isSphere(r.sp)) continue;
+    out[r.sp].cash = r.gross;
+    out[r.sp].cashN = r.n;
+    out[r.sp].s += r.gross;
+  }
   return out;
+}
+
+/**
+ * Einnahmen ohne Rechnung aus dem Kassenbuch (z. B. Getränkeverkauf): freie Einnahme-Buchungen
+ * und Kassenzählungen (deren Differenz – positiv wie negativ – ist der geschätzte Barumsatz).
+ * Brutto und netto (abzüglich enthaltener USt.), je Bereich; nie negativ.
+ */
+async function cashRevenue(t: Tenant, year: number): Promise<{ sp: Sphere; n: number; gross: number; net: number }[]> {
+  const rows = await all<{ sp: string; n: number; gross: number | string; net: number | string }>(
+    `SELECT COALESCE(NULLIF(sphere, ''), ?) sp, COUNT(*) n,
+       SUM(amount) gross, SUM(amount - IF(vat_rate > 0, ROUND(amount * vat_rate / (10000 + vat_rate)), 0)) net
+     FROM cash_entries
+     WHERE tenant_id = ? AND substr(entry_date, 1, 4) = ? AND (source = 'count' OR (source = 'manual' AND amount > 0))
+     GROUP BY sp`,
+    t.default_sphere || 'business', t.id, String(year),
+  );
+  return rows
+    .filter((r) => isSphere(String(r.sp)) || !t.nonprofit)
+    .map((r) => ({ sp: String(r.sp) as Sphere, n: Number(r.n), gross: Math.max(0, Number(r.gross)), net: Math.max(0, Number(r.net)) }));
 }
 
 /**
@@ -316,18 +366,18 @@ async function nonprofitLimitsCard(t: Tenant, year: number) {
     <p class="small ku-status ku-${fundsState}">${fundsState === 'over'
       ? html`<strong>Über ${euro(lim.funds)}:</strong> Die Mittel müssen zeitnah – spätestens bis Ende des übernächsten Jahres – für die satzungsmäßigen Zwecke verwendet werden.`
       : html`Bis ${euro(lim.funds)} Einnahmen im Jahr entfällt die Pflicht zur zeitnahen Mittelverwendung.
-          Enthalten sind Rechnungen und die unter „Spenden“ erfassten Zuwendungen – Zuschüsse und Barkasse zählen ebenfalls mit.`}</p>
+          Enthalten sind Rechnungen, die unter „Spenden“ erfassten Zuwendungen und die Bareinnahmen aus dem Kassenbuch.`}</p>
     <ul class="plain npo-split small">${SPHERES.map((x) => html`<li>
       <a href="/invoices?year=${year}&amp;sphere=${x.value}" title="${x.hint}">${x.label}</a>
-      <span class="muted">${cur[x.value].n} Rechnung(en)</span>
+      <span class="muted">${cur[x.value].n} Rechnung(en)${cur[x.value].cash > 0 ? html` · bar ohne Rechnung ${formatMoney(cur[x.value].cash)}` : ''}</span>
       <strong class="num">${formatMoney(cur[x.value].s)}</strong></li>`)}
       <li><a href="/donations?year=${year}">Spenden und Mitgliedsbeiträge</a>
         <span class="muted">${giftCount} Zuwendung(en)</span>
         <strong class="num">${formatMoney(giftSum)}</strong></li></ul>
     <p class="small ${prevBiz.s > prevLim.business ? 'danger-text' : 'muted'}">Vorjahr ${year - 1}: ${formatMoney(prevBiz.s)} in wirtschaftlichen Geschäftsbetrieben
       ${prevBiz.s > prevLim.business ? ` – über der Grenze von ${euro(prevLim.business)}.` : ` – innerhalb der Grenze von ${euro(prevLim.business)}.`}</p>
-    <p class="muted small">Brutto aus den festgeschriebenen Rechnungen in Schottr (Stornos abgezogen), zugeordnet nach dem Bereich der Rechnung.
-      Einnahmen ohne Rechnung – etwa Barverkäufe beim Vereinsfest – zählen mit. Keine Steuerberatung.</p>
+    <p class="muted small">Brutto aus den festgeschriebenen Rechnungen (Stornos abgezogen) und den Einnahmen ohne Rechnung aus dem Kassenbuch –
+      freie Einnahme-Buchungen und Kassenzählungen, z. B. Getränkeverkauf –, jeweils nach ihrem Bereich. Keine Steuerberatung.</p>
   </section>`;
 }
 
@@ -354,11 +404,13 @@ export const dashboardModule: Module = {
       const chart = await monthlyChart(t.id, d);
       const result = await resultChart(t, selYear, d);
       const customers = await topCustomers(t.id, d);
-      const suppliers = await supplierCard(t, d);
+      const spParam = c.req.query('sp') ?? '';
+      const suppliers = await supplierCard(t, spParam === 'all' || years.includes(spParam) ? spParam : selYear, years, selYear);
       const liab = await openLiabilities(t.id);
       const ku = t.small_business ? await smallBusinessLimits(t, Number(year)) : null;
       const npo = t.nonprofit ? await nonprofitLimitsCard(t, Number(year)) : null;
       const cash = await cashbookCard(t);
+      const pending = cashbookEnabled(t) ? pendingCard(c, await pendingDues(t), '/') : '';
       const drafts = await all(
         `SELECT d.*, COALESCE(NULLIF(c.company, ''), c.name) contact_label FROM documents d JOIN contacts c ON c.id = d.contact_id
          WHERE d.tenant_id = ? AND d.kind = 'invoice' AND d.status = 'draft' ORDER BY d.updated_at DESC LIMIT 10`, t.id,
@@ -395,6 +447,7 @@ export const dashboardModule: Module = {
             <strong>${formatMoney(revenue.s)}</strong><small>${revenue.n} Rechnung(en)</small>
           </div>
         </div>
+        ${pending}
         ${cash ?? ''}
         ${chart}
         ${result}

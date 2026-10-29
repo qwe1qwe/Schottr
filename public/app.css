@@ -223,6 +223,13 @@ input.num { text-align: right; }
 .notice ul { margin: .4rem 0; padding-left: 1.2rem; }
 .notice.soft { background: var(--surface-2); border-color: var(--line); }
 .year-select { width: auto; }
+.sphere-field .sphere-hint { display: block; line-height: 1.4; }
+.sphere-help { margin-top: .2rem; font-weight: 400; color: var(--muted); }
+.sphere-help summary { cursor: pointer; color: var(--accent); width: fit-content; }
+.sphere-help dl { margin: .5rem 0 .25rem; display: grid; gap: .1rem .75rem; }
+.sphere-help dt { font-weight: 600; color: var(--ink); margin-top: .35rem; }
+.sphere-help dd { margin: 0; color: var(--ink); }
+.desc-col { max-width: 16rem; }
 .cash-balances { display: flex; flex-wrap: wrap; gap: .6rem; margin-bottom: 1rem; }
 .cash-balance { display: flex; flex-direction: column; gap: .15rem; padding: .6rem .9rem; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); color: var(--ink); text-decoration: none; min-width: 10rem; }
 .cash-balance span:first-child { font-size: .8rem; color: var(--muted); }
@@ -234,6 +241,8 @@ input.num { text-align: right; }
 .cash-card .chart { margin: 0; }
 .assign-list li { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: .75rem; align-items: center; }
 .assign-list select { width: auto; max-width: 14rem; }
+.pending-card { border-color: color-mix(in srgb, var(--accent) 35%, var(--line)); }
+.pending-card .inline-form { gap: .35rem; }
 .count-table td, .count-table th { padding-top: .3rem; padding-bottom: .3rem; }
 .count-table input { max-width: 7rem; padding: .3rem .5rem; }
 @media (max-width: 720px) { .assign-list li { grid-template-columns: minmax(0, 1fr) auto; } .assign-list form { grid-column: 1 / -1; } }
@@ -486,6 +495,9 @@ body.bare { display: grid; place-items: center; min-height: 100vh; padding: 1rem
 .liability-list li { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: .75rem; align-items: center; }
 .liability-name { color: var(--ink); text-decoration: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .liability-name:hover { text-decoration: underline; }
+.liability-desc { display: block; overflow: hidden; text-overflow: ellipsis; }
+.dual-period { margin-left: auto; }
+.dual-period select { padding: .2rem 1.6rem .2rem .5rem; font-size: .82rem; }
 
 /* ---------- Filter-Chip (Rechnungsliste) ---------- */
 .filter-chip { display: inline-flex; align-items: center; gap: .4rem; padding: .3rem .4rem .3rem .75rem; border-radius: 99px; background: var(--accent-soft); color: var(--accent); font-size: .85rem; font-weight: 600; text-decoration: none; }
@@ -519,6 +531,16 @@ body.bare { display: grid; place-items: center; min-height: 100vh; padding: 1rem
 .preview-frame { display: block; width: 100%; height: min(78vh, 900px); border: 0; background: var(--surface-2); }
 .preview-img { display: block; width: 100%; height: auto; }
 .preview-foot { margin: 0; padding: .5rem .9rem; border-top: 1px solid var(--line); }
+/* Große Monitore: Seiten mit Belegvorschau dürfen breiter werden, die Vorschau bekommt mehr Platz und Höhe */
+@media (min-width: 1400px) {
+  .main:has(.purchase-form.with-preview), .main:has(.purchase-layout:not(.no-preview)) { max-width: min(1800px, 100%); }
+  .purchase-form.with-preview { grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr); }
+  .purchase-layout { grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr); }
+  .preview-frame { height: min(88vh, 1400px); }
+}
+@media (min-width: 1900px) {
+  .purchase-form.with-preview, .purchase-layout { grid-template-columns: minmax(0, 1fr) minmax(0, 1.5fr); }
+}
 .spaced-top { margin-top: 1rem; }
 .tax-rows td { vertical-align: middle; }
 .tax-rows select { width: auto; }

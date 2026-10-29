@@ -675,4 +675,48 @@ export const migrations: { version: number; statements: string[] }[] = [
        IF OLD.count_date <= COALESCE((SELECT cashbook_locked_until FROM tenants WHERE id = OLD.tenant_id), '0000-01-01') THEN ${forbid('Das Kassenbuch ist fuer diesen Zeitraum abgeschlossen')}; END IF`,
     ],
   },
+  {
+    version: 11,
+    statements: [
+      // Daueraufträge (z. B. Miete, Kontoführung, Versicherung): wiederkehrende Buchungen, die
+      // zum Termin in der Übersicht zum Buchen angeboten werden
+      `CREATE TABLE cash_recurring (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        tenant_id INT NOT NULL,
+        account_id INT NOT NULL,
+        amount BIGINT NOT NULL,
+        rhythm ENUM('monthly', 'quarterly', 'halfyearly', 'yearly') NOT NULL DEFAULT 'monthly',
+        start_date DATE NOT NULL,
+        end_date DATE NULL,
+        text VARCHAR(300) NOT NULL,
+        receipt_ref VARCHAR(100) NOT NULL DEFAULT '',
+        category VARCHAR(20) NOT NULL DEFAULT '',
+        sphere VARCHAR(10) NOT NULL DEFAULT '',
+        vat_rate INT NOT NULL DEFAULT 0,
+        active TINYINT(1) NOT NULL DEFAULT 1,
+        created_by INT NULL,
+        created_at DATETIME(3) NOT NULL,
+        updated_at DATETIME(3) NOT NULL,
+        KEY recurring_tenant (tenant_id, active),
+        CONSTRAINT recurring_tenant FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
+        CONSTRAINT recurring_account FOREIGN KEY (account_id) REFERENCES cash_accounts(id),
+        CONSTRAINT recurring_user FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
+      ) ${TABLE}`,
+      // bewusst ausgelassene Termine (z. B. Miete im Sommer erlassen)
+      `CREATE TABLE cash_recurring_skips (
+        recurring_id INT NOT NULL,
+        due_date DATE NOT NULL,
+        created_at DATETIME(3) NOT NULL,
+        PRIMARY KEY (recurring_id, due_date),
+        CONSTRAINT recurring_skips FOREIGN KEY (recurring_id) REFERENCES cash_recurring(id) ON DELETE CASCADE
+      ) ${TABLE}`,
+      // Buchungen: Kostenart (freie Buchungen) und Herkunft aus einem Dauerauftrag (je Termin höchstens einmal)
+      `ALTER TABLE cash_entries
+        ADD COLUMN category VARCHAR(20) NOT NULL DEFAULT '' AFTER sphere,
+        ADD COLUMN recurring_id INT NULL AFTER count_id,
+        ADD COLUMN recurring_due DATE NULL AFTER recurring_id,
+        ADD UNIQUE KEY cash_entries_recurring (recurring_id, recurring_due),
+        ADD CONSTRAINT cash_entries_recurring FOREIGN KEY (recurring_id) REFERENCES cash_recurring(id) ON DELETE SET NULL`,
+    ],
+  },
 ];

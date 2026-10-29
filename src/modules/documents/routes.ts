@@ -1,7 +1,7 @@
 import { all, one, run, tx, nowIso, fromDbTime } from '../../db/index.ts';
 import { nextNumber } from '../../lib/numbering.ts';
 import { html, nl2br, selected, type SafeHtml } from '../../lib/html.ts';
-import { isSphere, sphereLabel, SPHERES } from '../../lib/nonprofit.ts';
+import { isSphere, sphereLabel, sphereSelect, SPHERES } from '../../lib/nonprofit.ts';
 import { accountsOf, bookLinked, cashbookEnabled, getAccount, linkedEntry, unlink } from '../cashbook/repo.ts';
 import { accountSelect } from '../cashbook/routes.ts';
 import { addDays, formatDate, isIsoDate, monthEnd, monthLabel, today } from '../../lib/dates.ts';
@@ -352,7 +352,7 @@ function register(app: App, kind: Kind) {
       // festgeschriebene Rechnungen: Bereich bleibt änderbar (interne Zuordnung, nicht Teil des Belegs)
       meta.push(['Bereich', doc.finalized_at
         ? html`<form method="post" action="${base}/${doc.id}/sphere" class="inline sphere-form">${csrfField(c)}
-            <select name="sphere" aria-label="Bereich (Gemeinnützigkeit)">${SPHERES.map((s) => html`<option value="${s.value}" title="${s.hint}"${selected(s.value, doc.sphere || t.default_sphere)}>${s.label}</option>`)}</select>
+            ${sphereSelect({ value: doc.sphere || t.default_sphere, compact: true, ariaLabel: 'Bereich (Gemeinnützigkeit)' })}
             <button class="btn small">Ändern</button></form>`
         : label]);
     }

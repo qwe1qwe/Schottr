@@ -12,7 +12,7 @@ import { isValidBic, isValidEmail, isValidIban, isValidVatId, normalizeIban, nor
 import { csrfField, page } from '../views/layout.ts';
 import { emailSchema, passwordSchema } from './auth.ts';
 import { EXPENSE_CATEGORIES } from '../lib/expenses.ts';
-import { isSphere, SPHERES } from '../lib/nonprofit.ts';
+import { isSphere, sphereSelect } from '../lib/nonprofit.ts';
 import type { App, Ctx, Module, Tenant } from '../types.ts';
 
 type Field = {
@@ -201,10 +201,10 @@ function register(app: App) {
             <label class="check" data-show-if="org_type=association"><input type="checkbox" name="nonprofit" value="1"${checked(t.nonprofit)} ${owner ? '' : html`disabled`}>
               Gemeinnützig – steuerbegünstigt nach §§ 51 ff. AO</label>
             <div class="stack" data-show-if="org_type=association nonprofit">
-              <label>Bereich für neue Rechnungen
-                <select name="default_sphere" ${owner ? '' : html`disabled`}>${SPHERES.map((s) => html`<option value="${s.value}"${selected(s.value, t.default_sphere)}>${s.label}</option>`)}</select>
-                <small class="muted">Lässt sich je Rechnung ändern. Die Übersicht zeigt daraus die Grenzen für wirtschaftliche Geschäftsbetriebe (§ 64 Abs. 3 AO), sportliche Veranstaltungen (§ 67a AO) und die zeitnahe Mittelverwendung (§ 55 AO).</small>
-              </label>
+              ${sphereSelect({
+                name: 'default_sphere', value: t.default_sphere, label: 'Bereich für neue Rechnungen', disabled: !owner,
+                note: 'Lässt sich je Rechnung ändern. Die Übersicht zeigt daraus die Grenzen für wirtschaftliche Geschäftsbetriebe (§ 64 Abs. 3 AO), sportliche Veranstaltungen (§ 67a AO) und die zeitnahe Mittelverwendung (§ 55 AO).',
+              })}
             </div>
           </div>
         </fieldset>

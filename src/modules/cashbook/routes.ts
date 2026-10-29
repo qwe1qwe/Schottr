@@ -4,12 +4,15 @@ import { addDays, formatDate, isIsoDate, today } from '../../lib/dates.ts';
 import { checked, html, selected, type SafeHtml } from '../../lib/html.ts';
 import { idParam, notFound, readForm, redirectWith, requireOwner, str, tenantOf, userOf, UserError, type Form } from '../../lib/http.ts';
 import { formatAmount, formatMoney, parseDecimal } from '../../lib/money.ts';
-import { isSphere, SPHERES, sphereLabel } from '../../lib/nonprofit.ts';
+import { isSphere, SPHERES, sphereLabel, sphereSelect } from '../../lib/nonprofit.ts';
 import { formatIban, isValidIban, normalizeIban } from '../../lib/validate.ts';
+import { categoryLabel, isExpenseCategory } from '../../lib/expenses.ts';
+import { categoryOptions } from '../purchases/views.ts';
 import { balanceChart } from '../../views/chart.ts';
 import { csrfField, empty, page } from '../../views/layout.ts';
 import type { App, Ctx, Module, Tenant } from '../../types.ts';
 import {
+  bookDue, getRecurring, nextDue, pendingDues, recurringOf, RHYTHMS, skipDue, type PendingDue, type Recurring, type Rhythm,
   accountsOf, assertOpen, balanceAt, balances, bookLinked, cashbookEnabled, createManual, createTransfer, deleteCount, deleteEntry, DENOMINATIONS,
   entriesOf, entrySphere, getAccount, history, lastCount, saveCount, SOURCE_LABELS, unassigned, updateManual,
   type CashAccount, type CashCount, type CashEntry, type EntryInput, type EntryRow, type LinkSource,
@@ -66,7 +69,7 @@ function entryTable(t: Tenant, rows: EntryRow[], opening: number, showAccount: b
           <td>${formatDate(r.entry_date)}</td>
           ${showAccount ? html`<td>${r.account_name}</td>` : ''}
           <td><a href="${href}">${r.ref_label ?? r.text}</a>
-            <div class="muted small">${SOURCE_LABELS[r.source]}${r.ref_label && r.text && r.text !== r.ref_label ? ` · ${r.text}` : ''}${r.receipt_ref ? ` · Beleg ${r.receipt_ref}` : ''}${r.vat_rate ? ` · inkl. ${r.vat_rate / 100} % USt.` : ''}</div></td>
+            <div class="muted small">${r.recurring_id ? 'Dauerauftrag' : SOURCE_LABELS[r.source]}${r.category ? ` · ${categoryLabel(r.category)}` : ''}${r.ref_label && r.text && r.text !== r.ref_label ? ` · ${r.text}` : ''}${r.receipt_ref ? ` · Beleg ${r.receipt_ref}` : ''}${r.vat_rate ? ` · inkl. ${r.vat_rate / 100} % USt.` : ''}</div></td>
           ${t.nonprofit ? html`<td class="small">${sphere ? SPHERES.find((s) => s.value === sphere)?.short ?? '' : '–'}</td>` : ''}
           <td class="right num">${r.amount > 0 ? formatMoney(r.amount) : ''}</td>
           <td class="right num">${r.amount < 0 ? formatMoney(-r.amount) : ''}</td>
@@ -91,20 +94,24 @@ function parseEntry(form: Form, t: Tenant): EntryInput {
     receipt_ref: str(form, 'receipt_ref', 100),
     sphere: t.nonprofit && isSphere(sphere) ? sphere : '',
     vat_rate: t.small_business ? 0 : [0, 700, 1900].includes(vat) ? vat : 0,
+    category: isExpenseCategory(str(form, 'category')) ? str(form, 'category') : '',
   };
+}
+
+function categoryField(c: Ctx, value: string): SafeHtml {
+  return html`<label>Kostenart <select name="category">${categoryOptions(c, value, '– keine (z. B. bei Einnahmen) –')}</select></label>`;
 }
 
 function sphereField(t: Tenant, value: string, name = 'sphere'): SafeHtml {
   if (!t.nonprofit) return html``;
-  return html`<label>Bereich (Gemeinnützigkeit)
-    <select name="${name}">${SPHERES.map((s) => html`<option value="${s.value}" title="${s.hint}"${selected(s.value, value || t.default_sphere)}>${s.label}</option>`)}</select></label>`;
+  return html`<div class="span-2">${sphereSelect({ name, value: value || t.default_sphere })}</div>`;
 }
 
 function vatField(t: Tenant, value: number): SafeHtml {
   if (t.small_business) return html``;
   return html`<label>Enthaltene Umsatzsteuer
     <select name="vat_rate">${VAT_OPTIONS.map(([v, l]) => html`<option value="${v}"${selected(v, value)}>${l}</option>`)}</select>
-    <small class="muted">z. B. 19 % bei Getränkeverkauf im wirtschaftlichen Geschäftsbetrieb</small></label>`;
+    <small class="muted">Einnahme: USt., die der Verein abführt (z. B. 19 % Getränkeverkauf). Ausgabe: USt. laut Rechnung oder Vertrag (Vorsteuer).</small></label>`;
 }
 
 function entryForm(c: Ctx, t: Tenant, accounts: CashAccount[], action: string, e: Partial<CashEntry>): SafeHtml {
@@ -121,6 +128,7 @@ function entryForm(c: Ctx, t: Tenant, accounts: CashAccount[], action: string, e
       <label>Betrag (€) <input name="amount" class="num" inputmode="decimal" required value="${e.amount ? formatAmount(Math.abs(e.amount)).replace(/\./g, '') : ''}" placeholder="0,00"></label>
       <label>Beleg-Nr. (optional) <input name="receipt_ref" maxlength="100" value="${e.receipt_ref ?? ''}" placeholder="z. B. Quittung 12"></label>
       <label class="span-2">Buchungstext <input name="text" maxlength="300" required value="${e.text ?? ''}" placeholder="z. B. Getränkeverkauf Sommerfest, Porto, Kontoführungsgebühr"></label>
+      ${categoryField(c, e.category ?? '')}
       ${sphereField(t, e.sphere ?? '')}
       ${vatField(t, e.vat_rate ?? 0)}
     </div>
@@ -134,6 +142,88 @@ async function needAccounts(c: Ctx, t: Tenant): Promise<CashAccount[]> {
   if (!accounts.length) throw new UserError('Bitte zuerst ein Konto anlegen (Kassenbuch → Konten).');
   return accounts;
 }
+
+/** Fällige Termine von Daueraufträgen – mit „Buchen“ und „Überspringen“ je Termin */
+export function pendingCard(c: Ctx, list: PendingDue[], back: string): SafeHtml {
+  if (!list.length) return html``;
+  return html`<section class="card pending-card">
+    <div class="dual-head">
+      <h2>Fällige Daueraufträge <span class="count">${list.length}</span></h2>
+      ${list.length > 1 ? postButton(c, `/cashbook/recurring/book-all?back=${encodeURIComponent(back)}`, `Alle ${list.length} buchen`, 'btn small primary',
+        `${list.length} Termine buchen?`) : ''}
+    </div>
+    <ul class="plain assign-list">${list.slice(0, 30).map((p) => html`<li>
+      <span><a href="/cashbook/recurring/${p.recurring.id}">${p.recurring.text}</a>
+        <span class="muted small"> · fällig ${formatDate(p.due)} · ${p.recurring.account_name}</span></span>
+      ${money(p.recurring.amount)}
+      <span class="inline-form">
+        ${postButton(c, `/cashbook/recurring/${p.recurring.id}/book?due=${p.due}&back=${encodeURIComponent(back)}`, 'Buchen', 'btn small primary')}
+        ${postButton(c, `/cashbook/recurring/${p.recurring.id}/skip?due=${p.due}&back=${encodeURIComponent(back)}`, 'Überspringen', 'btn small ghost',
+          `Termin ${formatDate(p.due)} überspringen? Er wird dann nicht mehr angeboten.`)}
+      </span></li>`)}</ul>
+    ${list.length > 30 ? html`<p class="muted small">… und ${list.length - 30} weitere.</p>` : ''}
+    <p class="muted small">Gebucht wird mit Betrag und Konto aus dem <a href="/cashbook/recurring">Dauerauftrag</a> – weicht eine Zahlung ab, die Buchung danach im Kassenbuch anpassen.</p>
+  </section>`;
+}
+
+function recurringForm(c: Ctx, t: Tenant, accounts: CashAccount[], action: string, r: Partial<Recurring>): SafeHtml {
+  const out = (r.amount ?? -1) < 0;
+  return html`<form method="post" action="${action}" class="stack">
+    ${csrfField(c)}
+    <fieldset class="inline-radio"><legend>Art</legend>
+      <label class="check"><input type="radio" name="direction" value="out"${checked(out)}> Ausgabe (z. B. Miete, Kontoführung)</label>
+      <label class="check"><input type="radio" name="direction" value="in"${checked(!out)}> Einnahme (z. B. Pacht, Zuschuss)</label>
+    </fieldset>
+    <div class="grid-2">
+      <label class="span-2">Text <input name="text" maxlength="300" required value="${r.text ?? ''}" placeholder="z. B. Miete Vereinsheim"></label>
+      <label>Konto ${accountSelect(accounts, r.account_id)}</label>
+      <label>Betrag (€) <input name="amount" class="num" inputmode="decimal" required value="${r.amount ? formatAmount(Math.abs(r.amount)).replace(/\./g, '') : ''}" placeholder="0,00"></label>
+      <label>Rhythmus <select name="rhythm">${(Object.keys(RHYTHMS) as Rhythm[]).map((k) => html`<option value="${k}"${selected(k, r.rhythm ?? 'monthly')}>${RHYTHMS[k].label}</option>`)}</select></label>
+      <label>Erster Termin <input type="date" name="start_date" required value="${r.start_date ?? `${today().slice(0, 8)}01`}">
+        <small class="muted">bestimmt auch den Tag im Monat, z. B. 3. = immer am 3.</small></label>
+      <label>Endet am (optional) <input type="date" name="end_date" value="${r.end_date ?? ''}"></label>
+      <label>Beleg (optional) <input name="receipt_ref" maxlength="100" value="${r.receipt_ref ?? ''}" placeholder="z. B. Mietvertrag vom 01.01.2024"></label>
+      ${categoryField(c, r.category ?? '')}
+      ${sphereField(t, r.sphere ?? '')}
+      ${vatField(t, r.vat_rate ?? 0)}
+      ${r.id ? html`<label class="check span-2"><input type="checkbox" name="active" value="1"${checked(r.active)}> aktiv (fällige Termine werden zum Buchen angeboten)</label>` : ''}
+    </div>
+    <div class="form-actions"><button class="btn primary">Speichern</button></div>
+  </form>`;
+}
+
+function parseRecurring(form: Form, t: Tenant, isNew: boolean) {
+  const amount = parseDecimal(str(form, 'amount'), 2);
+  const text = str(form, 'text', 300);
+  const rhythm = str(form, 'rhythm') as Rhythm;
+  const start = str(form, 'start_date');
+  const end = str(form, 'end_date');
+  const errors: string[] = [];
+  if (!text) errors.push('Bitte einen Text angeben.');
+  if (amount === null || amount <= 0 || amount > 1e12) errors.push('Bitte einen Betrag größer 0 angeben.');
+  if (!(rhythm in RHYTHMS)) errors.push('Ungültiger Rhythmus.');
+  if (!isIsoDate(start)) errors.push('Bitte den ersten Termin angeben.');
+  if (end && (!isIsoDate(end) || end < start)) errors.push('Das Ende liegt vor dem ersten Termin.');
+  if (errors.length) throw new UserError(errors.join(' '));
+  const sphere = str(form, 'sphere');
+  const vat = Number(str(form, 'vat_rate') || 0);
+  return {
+    account_id: Number(str(form, 'account_id')),
+    amount: str(form, 'direction') === 'in' ? amount! : -amount!,
+    rhythm, start_date: start, end_date: end || null, text,
+    receipt_ref: str(form, 'receipt_ref', 100),
+    category: isExpenseCategory(str(form, 'category')) ? str(form, 'category') : '',
+    sphere: t.nonprofit && isSphere(sphere) ? sphere : '',
+    vat_rate: t.small_business ? 0 : [0, 700, 1900].includes(vat) ? vat : 0,
+    active: isNew || str(form, 'active') === '1' ? 1 : 0,
+  };
+}
+
+/** Rücksprung nach dem Buchen: nur lokale Pfade */
+const backTo = (c: Ctx, fallback: string) => {
+  const b = c.req.query('back') ?? '';
+  return b.startsWith('/') && !b.startsWith('//') ? b : fallback;
+};
 
 /** Kachel für die Übersicht: Stände aller Konten und Verlauf der letzten 12 Monate */
 export async function cashbookCard(t: Tenant): Promise<SafeHtml | null> {
@@ -182,6 +272,7 @@ function register(app: App) {
       title: 'Kassenbuch',
       actions: html`
         <a class="btn" href="/cashbook/accounts">Konten</a>
+        <a class="btn" href="/cashbook/recurring">Daueraufträge</a>
         ${list.some((a) => a.kind === 'cash') ? html`<a class="btn" href="/cashbook/count${selectedAcc?.kind === 'cash' ? `?account=${selectedAcc.id}` : ''}">Kasse zählen</a>` : ''}
         ${list.length > 1 ? html`<a class="btn" href="/cashbook/transfer">Umbuchung</a>` : ''}
         <a class="btn primary" href="/cashbook/new${selectedAcc ? `?account=${selectedAcc.id}` : ''}">Buchung erfassen</a>`,
@@ -192,6 +283,7 @@ function register(app: App) {
         ${list.map((a) => html`<a class="cash-balance ${selectedAcc?.id === a.id || list.length === 1 ? 'active' : ''}" href="${q(a.id)}">
           <span>${a.name} <small class="muted">${KIND_LABEL[a.kind]}</small></span>${money(a.balance)}</a>`)}
       </div>
+      ${pendingCard(c, await pendingDues(t), c.req.path + (c.req.url.includes('?') ? `?${c.req.url.split('?')[1]}` : ''))}
       ${minus ? html`<div class="notice">Die Kasse steht am ${formatDate(minus.date)} im Minus (${formatMoney(minus.balance)}) – eine Bargeldkasse kann nicht negativ sein. Fehlt eine Einnahme oder eine Zählung?</div>` : ''}
       ${balanceChart(points, {
         caption: html`Verlauf ${selectedAcc ? selectedAcc.name : list.length > 1 ? 'aller Konten' : list[0].name}`,
@@ -356,6 +448,115 @@ function register(app: App) {
     await run('UPDATE tenants SET cashbook_locked_until = ? WHERE id = ?', date, t.id);
     await audit(c, 'cashbook.lock', formatDate(date));
     return redirectWith(c, '/cashbook/accounts', 'ok', `Kassenbuch bis ${formatDate(date)} abgeschlossen.`);
+  });
+
+  /* ---------------- Daueraufträge ---------------- */
+  app.get('/cashbook/recurring', async (c) => {
+    const t = cbTenant(c);
+    const accounts = await needAccounts(c, t);
+    const list = await recurringOf(t.id);
+    return page(c, {
+      title: 'Daueraufträge',
+      back: { href: '/cashbook', label: 'Kassenbuch' },
+      body: html`
+      ${pendingCard(c, await pendingDues(t), '/cashbook/recurring')}
+      ${list.length
+        ? html`<div class="card flush"><table class="table">
+            <thead><tr><th>Text</th><th>Konto</th><th>Rhythmus</th><th>Nächster Termin</th><th class="right">Betrag</th></tr></thead>
+            <tbody>${list.map((r) => {
+              const next = r.active ? nextDue(r) : null;
+              return html`<tr class="rowlink ${r.active ? '' : 'muted'}" data-href="/cashbook/recurring/${r.id}">
+                <td><a href="/cashbook/recurring/${r.id}">${r.text}</a>${r.receipt_ref ? html`<div class="muted small">${r.receipt_ref}</div>` : ''}</td>
+                <td>${r.account_name}</td>
+                <td>${RHYTHMS[r.rhythm].label}${r.end_date ? html`<div class="muted small">bis ${formatDate(r.end_date)}</div>` : ''}</td>
+                <td>${r.active ? (next ? formatDate(next) : 'beendet') : 'pausiert'}</td>
+                <td class="right">${money(r.amount)}</td></tr>`;
+            })}</tbody></table></div>`
+        : html`<div class="notice soft">Daueraufträge sind wiederkehrende Zahlungen ohne eigene Rechnung – z. B. Miete laut Mietvertrag, Kontoführungsgebühren oder Versicherungsbeiträge. Zum Termin erscheinen sie in der Übersicht und lassen sich mit einem Klick buchen.</div>`}
+      <section class="card"><h2>Neuer Dauerauftrag</h2>
+        ${recurringForm(c, t, accounts, '/cashbook/recurring', { account_id: accounts.find((a) => a.kind === 'bank')?.id })}</section>`,
+    });
+  });
+
+  app.post('/cashbook/recurring', async (c) => {
+    const t = cbTenant(c);
+    const v = parseRecurring(await readForm(c), t, true);
+    if (!await getAccount(t.id, v.account_id)) throw new UserError('Bitte ein Konto auswählen.');
+    const now = nowIso();
+    const res = await run(
+      `INSERT INTO cash_recurring (tenant_id, account_id, amount, rhythm, start_date, end_date, text, receipt_ref, category, sphere, vat_rate, active, created_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      t.id, v.account_id, v.amount, v.rhythm, v.start_date, v.end_date, v.text, v.receipt_ref, v.category, v.sphere, v.vat_rate, v.active, userOf(c).id, now, now,
+    );
+    await audit(c, 'cashbook.recurring.create', `${v.text}: ${formatMoney(v.amount)} ${RHYTHMS[v.rhythm].label}`);
+    return redirectWith(c, `/cashbook/recurring/${res.insertId}`, 'ok', 'Dauerauftrag angelegt.');
+  });
+
+  app.post('/cashbook/recurring/book-all', async (c) => {
+    const t = cbTenant(c);
+    const list = await pendingDues(t);
+    for (const p of list) await bookDue(t, p.recurring, p.due, userOf(c).id);
+    await audit(c, 'cashbook.recurring.book', `${list.length} Termin(e)`);
+    return redirectWith(c, backTo(c, '/cashbook'), 'ok', `${list.length} Termin(e) gebucht.`);
+  });
+
+  app.get('/cashbook/recurring/:id', async (c) => {
+    const t = cbTenant(c);
+    const r = await getRecurring(t.id, idParam(c)) ?? notFound();
+    const accounts = await accountsOf(t.id, true);
+    const booked = await all<CashEntry>('SELECT * FROM cash_entries WHERE recurring_id = ? ORDER BY entry_date DESC LIMIT 24', r.id);
+    return page(c, {
+      title: r.text,
+      back: { href: '/cashbook/recurring', label: 'Daueraufträge' },
+      body: html`<section class="card">${recurringForm(c, t, accounts, `/cashbook/recurring/${r.id}`, r)}</section>
+      ${booked.length
+        ? html`<h2 class="section-title">Gebuchte Termine</h2>
+          <div class="card flush"><table class="table"><thead><tr><th>Termin</th><th>Buchung</th><th class="right">Betrag</th></tr></thead>
+            <tbody>${booked.map((e) => html`<tr class="rowlink" data-href="/cashbook/entries/${e.id}/edit"><td>${formatDate(e.recurring_due)}</td>
+              <td><a href="/cashbook/entries/${e.id}/edit">${e.text}</a></td><td class="right">${money(e.amount)}</td></tr>`)}</tbody></table></div>`
+        : ''}
+      <div class="danger-zone">${postButton(c, `/cashbook/recurring/${r.id}/delete`, 'Dauerauftrag löschen', 'btn danger',
+        'Dauerauftrag löschen? Bereits gebuchte Termine bleiben im Kassenbuch.')}</div>`,
+    });
+  });
+
+  app.post('/cashbook/recurring/:id', async (c) => {
+    const t = cbTenant(c);
+    const r = await getRecurring(t.id, idParam(c)) ?? notFound();
+    const v = parseRecurring(await readForm(c), t, false);
+    if (!await getAccount(t.id, v.account_id)) throw new UserError('Bitte ein Konto auswählen.');
+    await run(
+      `UPDATE cash_recurring SET account_id = ?, amount = ?, rhythm = ?, start_date = ?, end_date = ?, text = ?, receipt_ref = ?, category = ?, sphere = ?,
+         vat_rate = ?, active = ?, updated_at = ? WHERE id = ?`,
+      v.account_id, v.amount, v.rhythm, v.start_date, v.end_date, v.text, v.receipt_ref, v.category, v.sphere, v.vat_rate, v.active, nowIso(), r.id,
+    );
+    await audit(c, 'cashbook.recurring.update', `${v.text}: ${formatMoney(v.amount)} ${RHYTHMS[v.rhythm].label}`);
+    return redirectWith(c, '/cashbook/recurring', 'ok', 'Dauerauftrag gespeichert. Bereits gebuchte Termine bleiben unverändert.');
+  });
+
+  app.post('/cashbook/recurring/:id/delete', async (c) => {
+    const t = cbTenant(c);
+    const r = await getRecurring(t.id, idParam(c)) ?? notFound();
+    await run('DELETE FROM cash_recurring WHERE id = ?', r.id);
+    await audit(c, 'cashbook.recurring.delete', r.text);
+    return redirectWith(c, '/cashbook/recurring', 'ok', 'Dauerauftrag gelöscht.');
+  });
+
+  app.post('/cashbook/recurring/:id/book', async (c) => {
+    const t = cbTenant(c);
+    const r = await getRecurring(t.id, idParam(c)) ?? notFound();
+    const due = c.req.query('due') ?? '';
+    await bookDue(t, r, due, userOf(c).id);
+    return redirectWith(c, backTo(c, '/cashbook'), 'ok', `${r.text}: Termin ${formatDate(due)} gebucht.`);
+  });
+
+  app.post('/cashbook/recurring/:id/skip', async (c) => {
+    const t = cbTenant(c);
+    const r = await getRecurring(t.id, idParam(c)) ?? notFound();
+    const due = c.req.query('due') ?? '';
+    await skipDue(r, due);
+    await audit(c, 'cashbook.recurring.skip', `${r.text} ${formatDate(due)}`);
+    return redirectWith(c, backTo(c, '/cashbook'), 'ok', `${r.text}: Termin ${formatDate(due)} übersprungen.`);
   });
 
   /* ---------------- Freie Buchungen ---------------- */
