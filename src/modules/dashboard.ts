@@ -1,9 +1,11 @@
 import { all, one } from '../db/index.ts';
-import { html, selected } from '../lib/html.ts';
+import { html, raw, selected } from '../lib/html.ts';
 import { barChart, compareChart, meter, pieChart, type ChartPoint, type ComparePoint, type PieSlice } from '../views/chart.ts';
 import { formatDate, MONTH_NAMES, today } from '../lib/dates.ts';
 import { formatMoney } from '../lib/money.ts';
 import { tenantOf } from '../lib/http.ts';
+import { getCookie, setCookie } from 'hono/cookie';
+import type { Ctx } from '../types.ts';
 import { page } from '../views/layout.ts';
 import { tenantProblems } from './settings.ts';
 import { documentTable } from './documents/views.ts';
@@ -17,6 +19,12 @@ import { donationTotals } from './donations/repo.ts';
 import { cashbookDash, pendingCard } from './cashbook/routes.ts';
 import { cashbookEnabled, pendingDues } from './cashbook/repo.ts';
 import { inboxCount } from './inbox/repo.ts';
+import { SOURCE_LABELS } from './cashbook/repo.ts';
+import { fileCounts } from './cashbook/files.ts';
+import { categoryLabel } from '../lib/expenses.ts';
+import { sphereLabel } from '../lib/nonprofit.ts';
+import { notFound } from '../lib/http.ts';
+import type { SafeHtml } from '../lib/html.ts';
 import type { Module, Tenant } from '../types.ts';
 
 /**
@@ -26,7 +34,27 @@ import type { Module, Tenant } from '../types.ts';
 const revenueSql = (col: 'net_total' | 'gross_total') => `COALESCE(SUM(CASE WHEN documents.type_code = '381' THEN -documents.${col} ELSE documents.${col} -
   (SELECT COALESCE(SUM(p.${col}), 0) FROM document_prepayments x JOIN documents p ON p.id = x.prepaid_id WHERE x.document_id = documents.id)
 END), 0)`;
-const REVENUE = revenueSql('net_total');
+
+/** Beträge in der Übersicht netto oder brutto – im Verein interessiert meist nur brutto (Grenzen der AO, Kasse) */
+type Basis = 'net' | 'gross';
+const docCol = (b: Basis) => (b === 'gross' ? 'gross_total' : 'net_total');
+const basisWord = (b: Basis) => (b === 'gross' ? 'brutto' : 'netto');
+
+/**
+ * Gewählte Basis: ?basis=net|gross setzt sie (je Mandant als Cookie gemerkt), sonst das Cookie,
+ * sonst die Vorgabe – brutto für Vereine, netto für Unternehmen.
+ */
+function dashBasis(c: Ctx, t: Tenant): Basis {
+  const name = `schottr_basis_${t.id}`;
+  const q = c.req.query('basis');
+  if (q === 'net' || q === 'gross') {
+    setCookie(c, name, q, { path: '/', maxAge: 60 * 60 * 24 * 365, sameSite: 'Lax', httpOnly: true });
+    return q;
+  }
+  const v = getCookie(c, name);
+  if (v === 'net' || v === 'gross') return v;
+  return t.org_type === 'association' ? 'gross' : 'net';
+}
 
 const MONTHS = MONTH_NAMES;
 
@@ -34,8 +62,8 @@ const MONTHS = MONTH_NAMES;
  * Ausgaben aus erfassten Eingangsrechnungen (Gutschriften negativ). Mit Vorsteuerabzug zählt
  * der Nettobetrag, als Kleinunternehmer der Bruttobetrag – die Vorsteuer bekommt man dann nicht erstattet.
  */
-const COST = (t: Pick<Tenant, 'small_business'>) => {
-  const col = t.small_business ? 'gross_total' : 'net_total';
+const COST = (t: Pick<Tenant, 'small_business'>, basis: Basis = 'net') => {
+  const col = t.small_business || basis === 'gross' ? 'gross_total' : 'net_total';
   return `COALESCE(SUM(CASE WHEN p.is_credit = 1 THEN -p.${col} ELSE p.${col} END), 0)`;
 };
 
@@ -73,14 +101,14 @@ const CASH_EXPENSE = "source = 'manual' AND amount < 0";
  * Rechnung aus dem Kassenbuch. Bei gemeinnützigen Mandanten bleibt der ideelle Bereich außen vor –
  * er ist nicht unternehmerisch.
  */
-async function yearRevenue(t: Tenant, year: string | number): Promise<{ n: number; s: number; cashN: number; cash: number }> {
+async function yearRevenue(t: Tenant, year: string | number, basis: Basis = 'net'): Promise<{ n: number; s: number; cashN: number; cash: number }> {
   const noIdeell = t.nonprofit ? "AND sp <> 'ideell'" : '';
   const docs = await one<{ n: number; s: number | string }>(
-    `SELECT COALESCE(SUM(s >= 0), 0) n, COALESCE(SUM(s), 0) s FROM (${paidDocsSql('net_total')}) x WHERE substr(dt, 1, 4) = ? ${noIdeell}`,
+    `SELECT COALESCE(SUM(s >= 0), 0) n, COALESCE(SUM(s), 0) s FROM (${paidDocsSql(docCol(basis))}) x WHERE substr(dt, 1, 4) = ? ${noIdeell}`,
     ...paidDocsParams(t), String(year),
   );
   const cash = await one<{ n: number; s: number | string }>(
-    `SELECT COUNT(*) n, COALESCE(SUM(${CASH_NET}), 0) s FROM cash_entries
+    `SELECT COUNT(*) n, COALESCE(SUM(${basis === 'gross' ? 'amount' : CASH_NET}), 0) s FROM cash_entries
      WHERE tenant_id = ? AND substr(entry_date, 1, 4) = ? AND ${CASH_INCOME} ${t.nonprofit ? "AND COALESCE(NULLIF(sphere, ''), ?) <> 'ideell'" : ''}`,
     t.id, String(year), ...(t.nonprofit ? [t.default_sphere || 'business'] : []),
   );
@@ -92,13 +120,13 @@ async function yearRevenue(t: Tenant, year: string | number): Promise<{ n: numbe
  * Ausgaben eines Jahres nach Zahlung: bezahlte Eingangsrechnungen (mit Vorsteuerabzug netto, als
  * Kleinunternehmer brutto) plus Ausgaben ohne Eingangsrechnung aus dem Kassenbuch. Je Monat (mm).
  */
-async function yearCosts(t: Tenant, year: string): Promise<Map<string, number>> {
+async function yearCosts(t: Tenant, year: string, basis: Basis = 'net'): Promise<Map<string, number>> {
   const rows = await all<{ m: string; s: number | string }>(
     `SELECT m, SUM(s) s FROM (
-       SELECT substr(p.paid_at, 6, 2) m, ${COST(t)} s FROM purchase_invoices p
+       SELECT substr(p.paid_at, 6, 2) m, ${COST(t, basis)} s FROM purchase_invoices p
        WHERE p.tenant_id = ? AND p.status = 'paid' AND p.paid_at IS NOT NULL AND substr(p.paid_at, 1, 4) = ? GROUP BY m
        UNION ALL
-       SELECT substr(entry_date, 6, 2) m, -SUM(${t.small_business ? 'amount' : CASH_NET}) s FROM cash_entries
+       SELECT substr(entry_date, 6, 2) m, -SUM(${t.small_business || basis === 'gross' ? 'amount' : CASH_NET}) s FROM cash_entries
        WHERE tenant_id = ? AND substr(entry_date, 1, 4) = ? AND ${CASH_EXPENSE} GROUP BY m
      ) x GROUP BY m`,
     t.id, year, t.id, year,
@@ -126,17 +154,18 @@ async function revenueYears(tenantId: number, current: string): Promise<string[]
     `SELECT DISTINCT substr(issue_date, 1, 4) y FROM documents WHERE tenant_id = ? AND kind = 'invoice' AND finalized_at IS NOT NULL
      UNION SELECT DISTINCT substr(paid_at, 1, 4) y FROM documents WHERE tenant_id = ? AND kind = 'invoice' AND paid_at IS NOT NULL
      UNION SELECT DISTINCT substr(issue_date, 1, 4) y FROM purchase_invoices WHERE tenant_id = ? AND status <> 'draft' AND issue_date IS NOT NULL
+     UNION SELECT DISTINCT substr(paid_at, 1, 4) y FROM purchase_invoices WHERE tenant_id = ? AND status = 'paid' AND paid_at IS NOT NULL
      UNION SELECT DISTINCT substr(entry_date, 1, 4) y FROM cash_entries WHERE tenant_id = ?`,
-    tenantId, tenantId, tenantId, tenantId,
+    tenantId, tenantId, tenantId, tenantId, tenantId,
   );
   return [...new Set([current, ...rows.map((r) => String(r.y))])].sort().reverse();
 }
 
 /** Rechnungsbeträge der letzten 24 Monate (inkl. laufendem Monat) */
-async function monthlyChart(tenantId: number, todayIso: string) {
+async function monthlyChart(tenantId: number, todayIso: string, basis: Basis) {
   const months = last24Months(todayIso);
   const rows = await all<{ ym: string; n: number; s: number | string }>(
-    `SELECT substr(issue_date, 1, 7) ym, COUNT(*) n, ${REVENUE} s FROM documents
+    `SELECT substr(issue_date, 1, 7) ym, COUNT(*) n, ${revenueSql(docCol(basis))} s FROM documents
      WHERE tenant_id = ? AND kind = 'invoice' AND finalized_at IS NOT NULL AND issue_date >= ? AND issue_date <= ?
      GROUP BY ym`,
     tenantId, `${months[0].key}-01`, `${months[23].key}-31`,
@@ -156,17 +185,17 @@ async function monthlyChart(tenantId: number, todayIso: string) {
     };
   });
   return barChart(points, {
-    caption: 'Rechnungen der letzten 24 Monate',
+    caption: `Rechnungen der letzten 24 Monate (${basisWord(basis)})`,
     emptyText: 'In den letzten 24 Monaten wurden keine Rechnungen festgeschrieben.',
     hint: 'Klick auf eine Säule zeigt die Rechnungen des Monats – am Handy zweimal antippen.',
   });
 }
 
-/** Top-5-Kunden nach Netto-Umsatz der letzten 24 Monate, Rest als „Sonstige“ */
-async function topCustomers(tenantId: number, todayIso: string) {
+/** Top-5-Kunden nach Umsatz (netto oder brutto) der letzten 24 Monate, Rest als „Sonstige“ */
+async function topCustomers(tenantId: number, todayIso: string, basis: Basis) {
   const from = `${last24Months(todayIso)[0].key}-01`;
   const rows = await all<{ id: number; label: string; s: number | string }>(
-    `SELECT c.id, COALESCE(NULLIF(c.company, ''), c.name) label, ${REVENUE} s
+    `SELECT c.id, COALESCE(NULLIF(c.company, ''), c.name) label, ${revenueSql(docCol(basis))} s
      FROM documents JOIN contacts c ON c.id = documents.contact_id
      WHERE documents.tenant_id = ? AND documents.kind = 'invoice' AND documents.finalized_at IS NOT NULL
        AND documents.issue_date >= ? AND documents.issue_date <= ?
@@ -180,26 +209,26 @@ async function topCustomers(tenantId: number, todayIso: string) {
   if (rest > 0) slices.push({ label: `Sonstige (${positive.length - 5})`, value: rest, rest: true });
   return pieChart(slices, {
     caption: 'Top-Kunden',
-    sub: `Netto-Umsatz seit ${formatDate(from)}`,
+    sub: `Umsatz ${basisWord(basis)} seit ${formatDate(from)}`,
     emptyText: 'In den letzten 24 Monaten gibt es noch keinen Umsatz.',
     centerLabel: '24 Monate',
   });
 }
 
 /** Umsatz und Ausgaben je Monat eines Jahres mit Ergebnis */
-async function resultChart(t: Tenant, year: string, todayIso: string) {
+async function resultChart(t: Tenant, year: string, todayIso: string, basis: Basis) {
   const noIdeell = t.nonprofit ? "AND sp <> 'ideell'" : '';
   const rev = await all<{ m: string; s: number | string }>(
     `SELECT m, SUM(s) s FROM (
-       SELECT substr(dt, 6, 2) m, s FROM (${paidDocsSql('net_total')}) d WHERE substr(dt, 1, 4) = ? ${noIdeell}
+       SELECT substr(dt, 6, 2) m, s FROM (${paidDocsSql(docCol(basis))}) d WHERE substr(dt, 1, 4) = ? ${noIdeell}
        UNION ALL
-       SELECT substr(entry_date, 6, 2) m, ${CASH_NET} s FROM cash_entries
+       SELECT substr(entry_date, 6, 2) m, ${basis === 'gross' ? 'amount' : CASH_NET} s FROM cash_entries
        WHERE tenant_id = ? AND substr(entry_date, 1, 4) = ? AND ${CASH_INCOME} ${t.nonprofit ? "AND COALESCE(NULLIF(sphere, ''), ?) <> 'ideell'" : ''}
      ) x GROUP BY m`,
     ...paidDocsParams(t), year, t.id, year, ...(t.nonprofit ? [t.default_sphere || 'business'] : []),
   );
   const r = new Map(rev.map((x) => [String(x.m), Number(x.s)]));
-  const k = await yearCosts(t, year);
+  const k = await yearCosts(t, year, basis);
   const nowYm = todayIso.slice(0, 7);
   const points: ComparePoint[] = MONTHS_SHORT.map((label, i) => {
     const mm = String(i + 1).padStart(2, '0');
@@ -211,16 +240,16 @@ async function resultChart(t: Tenant, year: string, todayIso: string) {
       cost: k.get(mm) ?? 0,
       current: ym === nowYm,
       future: ym > nowYm,
-      revenueHref: `/invoices?paid=${ym}`,
-      costHref: `/purchases?paid=${ym}`,
+      revenueHref: `/overview/${ym}#einnahmen`,
+      costHref: `/overview/${ym}#ausgaben`,
     };
   });
   const costLabel = 'Ausgaben';
   return compareChart(points, {
     caption: `Umsatz und Ausgaben ${year}`,
-    sub: `${t.small_business ? 'Umsatz netto, Ausgaben brutto (kein Vorsteuerabzug)' : 'netto'} nach Zahlungsdatum, inkl. Barbuchungen ohne Beleg${t.nonprofit ? ', ohne ideellen Bereich' : ''} · Ergebnis vor Steuern und sonstigen Abzügen`,
+    sub: `${basis === 'gross' ? 'brutto' : t.small_business ? 'Umsatz netto, Ausgaben brutto (kein Vorsteuerabzug)' : 'netto'} nach Zahlungsdatum, inkl. Barbuchungen ohne Beleg${t.nonprofit ? ', ohne ideellen Bereich' : ''} · Ergebnis vor Steuern und sonstigen Abzügen`,
     emptyText: `${year} gibt es noch keine Zahlungen.`,
-    hint: `Klick auf eine Säule zeigt die in dem Monat bezahlten Rechnungen bzw. Eingangsrechnungen${t.nonprofit || t.org_type === 'association' ? ' – Barbuchungen ohne Beleg stehen im Kassenbuch' : ''}.`,
+    hint: 'Klick auf eine Säule zeigt alle Einnahmen bzw. Ausgaben des Monats – Rechnungen und Buchungen ohne Rechnung.',
     costLabel,
   });
 }
@@ -229,14 +258,15 @@ async function resultChart(t: Tenant, year: string, todayIso: string) {
  * Kachel mit Umschalter: Top-Lieferanten nach Kosten bzw. größte Verbindlichkeiten (alle
  * Eingangsrechnungen, offene wie bezahlte) – jeweils für ein wählbares Jahr oder den ganzen Bestand.
  */
-async function supplierCard(t: Tenant, period: string, years: string[], dashYear: string) {
+async function supplierCard(t: Tenant, period: string, years: string[], dashYear: string, basis: Basis) {
   const all_ = period === 'all';
-  const where = all_ ? '' : 'AND substr(p.issue_date, 1, 4) = ?';
+  // Wie Ausgaben und Ergebnis nach Zahlungsdatum: nur bezahlte Eingangsrechnungen im gewählten Jahr
+  const paidWhere = all_ ? '' : 'AND substr(p.paid_at, 1, 4) = ?';
   const params = all_ ? [] : [period];
   const rows = await all<{ id: number; label: string; s: number | string }>(
-    `SELECT c.id, COALESCE(NULLIF(c.company, ''), c.name) label, ${COST(t)} s
+    `SELECT c.id, COALESCE(NULLIF(c.company, ''), c.name) label, ${COST(t, basis)} s
      FROM purchase_invoices p JOIN contacts c ON c.id = p.contact_id
-     WHERE p.tenant_id = ? AND p.status <> 'draft' ${where}
+     WHERE p.tenant_id = ? AND p.status = 'paid' AND p.paid_at IS NOT NULL ${paidWhere}
      GROUP BY c.id, label ORDER BY s DESC`,
     t.id, ...params,
   );
@@ -247,29 +277,32 @@ async function supplierCard(t: Tenant, period: string, years: string[], dashYear
   const label = all_ ? 'gesamt' : period;
   const pie = pieChart(slices, {
     caption: 'Top-Lieferanten',
-    sub: `${t.small_business ? 'Kosten brutto' : 'Kosten netto'} ${all_ ? 'aller Jahre' : `im Jahr ${period}`}`,
-    emptyText: all_ ? 'Es wurden noch keine Eingangsrechnungen erfasst.' : `${period} wurden keine Eingangsrechnungen erfasst.`,
+    sub: `${t.small_business || basis === 'gross' ? 'Kosten brutto' : 'Kosten netto'}, ${all_ ? 'bezahlt in allen Jahren' : `bezahlt im Jahr ${period}`}`,
+    emptyText: all_ ? 'Es wurden noch keine Eingangsrechnungen bezahlt.' : `${period} wurden keine Eingangsrechnungen bezahlt.`,
     centerLabel: label,
     bare: true,
   });
 
+  // Bezahlte nach Zahlungsjahr; noch offene gehören zum laufenden Jahr (bzw. zu „Alle Jahre“)
+  const withOpen = all_ || period === today().slice(0, 4);
   const biggest = await all<Purchase & { contact_label: string | null }>(
     `SELECT p.*, COALESCE(NULLIF(c.company, ''), c.name) AS contact_label FROM purchase_invoices p LEFT JOIN contacts c ON c.id = p.contact_id
-     WHERE p.tenant_id = ? AND p.status <> 'draft' AND p.is_credit = 0 ${where}
-     ORDER BY p.gross_total DESC, p.issue_date DESC LIMIT 6`,
+     WHERE p.tenant_id = ? AND p.is_credit = 0
+       AND ((p.status = 'paid' AND p.paid_at IS NOT NULL ${paidWhere})${withOpen ? " OR p.status = 'open'" : ''})
+     ORDER BY p.gross_total DESC, COALESCE(p.paid_at, p.issue_date) DESC LIMIT 6`,
     t.id, ...params,
   );
   const liabilities = biggest.length
     ? html`<ul class="plain liability-list">${biggest.map((p) => {
         const st = purchaseStatus(p);
         return html`<li>
-          <a href="/purchases/${p.id}" class="liability-name">${p.contact_label ?? 'ohne Lieferant'}<span class="muted small"> · ${p.number || 'ohne Nr.'} · ${formatDate(p.issue_date)}</span>${p.description ? html`<span class="muted small liability-desc">${p.description}</span>` : ''}</a>
+          <a href="/purchases/${p.id}" class="liability-name">${p.contact_label ?? 'ohne Lieferant'}<span class="muted small"> · ${p.number || 'ohne Nr.'} · ${p.status === 'paid' && p.paid_at ? `bezahlt ${formatDate(p.paid_at)}` : formatDate(p.issue_date)}</span>${p.description ? html`<span class="muted small liability-desc">${p.description}</span>` : ''}</a>
           <span class="liability-due small">${st === 'open' ? html`<span class="muted">fällig ${formatDate(dueOf(p))}</span>` : purchaseBadge(st)}</span>
           <strong class="num">${formatMoney(p.gross_total)}</strong>
         </li>`;
       })}</ul>
       <p class="small"><a href="/purchases">Alle Eingangsrechnungen</a></p>`
-    : html`<p class="muted small pie-empty">${all_ ? 'Keine Eingangsrechnungen.' : `Keine Eingangsrechnungen in ${period}.`}</p>`;
+    : html`<p class="muted small pie-empty">${all_ ? 'Keine Eingangsrechnungen.' : `${period} wurden keine Eingangsrechnungen bezahlt${withOpen ? ', offen ist auch keine' : ''}.`}</p>`;
 
   return html`<section class="card dual" data-tabs>
     <div class="dual-head">
@@ -424,10 +457,151 @@ async function nonprofitLimitsCard(t: Tenant, year: number) {
   </section>`;
 }
 
+
+/* ---------- Monatsaufstellung: alles, was in einer Säule des Ergebnis-Charts steckt ---------- */
+
+interface MonthLine { date: string; title: string; sub: string; href: string; amount: number; files?: number }
+
+/**
+ * Einnahmen und Ausgaben eines Monats nach Zahlungsdatum – mit denselben Regeln wie
+ * yearRevenue / yearCosts, damit die Summen genau zu den Säulen passen.
+ */
+async function monthLines(t: Tenant, ym: string, basis: Basis) {
+  const col = docCol(basis);
+  const def = t.default_sphere || 'business';
+  const noIdeell = t.nonprofit ? "AND sp <> 'ideell'" : '';
+  const prepaid = (alias: string) => `(SELECT COALESCE(SUM(p.${col}), 0) FROM document_prepayments x JOIN documents p ON p.id = x.prepaid_id WHERE x.document_id = ${alias}.id)`;
+
+  const docs = await all<{ id: number; number: string; type_code: string; dt: string; sp: string; label: string | null; subject: string | null; s: number | string }>(
+    `SELECT * FROM (
+       SELECT d.id, d.number, d.type_code, d.paid_at dt, COALESCE(NULLIF(d.sphere, ''), ?) sp,
+         COALESCE(NULLIF(c.company, ''), c.name) label, d.subject, d.${col} - ${prepaid('d')} s
+       FROM documents d LEFT JOIN contacts c ON c.id = d.contact_id
+       WHERE d.tenant_id = ? AND d.kind = 'invoice' AND d.finalized_at IS NOT NULL AND d.type_code <> '381'
+         AND d.paid_at IS NOT NULL AND substr(d.paid_at, 1, 7) = ?
+       UNION ALL
+       SELECT d.id, d.number, d.type_code, d.issue_date dt, COALESCE(NULLIF(o.sphere, ''), ?) sp,
+         COALESCE(NULLIF(c.company, ''), c.name) label, d.subject, -d.${col} s
+       FROM documents d JOIN documents o ON o.id = d.corrects_id LEFT JOIN contacts c ON c.id = d.contact_id
+       WHERE d.tenant_id = ? AND d.kind = 'invoice' AND d.finalized_at IS NOT NULL AND d.type_code = '381'
+         AND o.paid_at IS NOT NULL AND substr(d.issue_date, 1, 7) = ?
+     ) x WHERE 1 = 1 ${noIdeell} ORDER BY dt, number`,
+    def, t.id, ym, def, t.id, ym,
+  );
+
+  type EntryRow = { id: number; account_id: number; entry_date: string; source: string; text: string; receipt_ref: string; category: string | null; sp: string; vat_rate: number; account: string; s: number | string };
+  const entries = async (cond: string, amount: string, sphereFilter: boolean) => all<EntryRow>(
+    `SELECT e.id, e.account_id, e.entry_date, e.source, e.text, e.receipt_ref, e.category, e.vat_rate,
+       COALESCE(NULLIF(e.sphere, ''), ?) sp, a.name account, ${amount} s
+     FROM cash_entries e JOIN cash_accounts a ON a.id = e.account_id
+     WHERE e.tenant_id = ? AND substr(e.entry_date, 1, 7) = ? AND ${cond}
+       ${sphereFilter && t.nonprofit ? "AND COALESCE(NULLIF(e.sphere, ''), ?) <> 'ideell'" : ''}
+     ORDER BY e.entry_date, e.id`,
+    def, t.id, ym, ...(sphereFilter && t.nonprofit ? [def] : []),
+  );
+  const net = (a: string) => `${a}.amount - IF(${a}.vat_rate > 0, ROUND(${a}.amount * ${a}.vat_rate / (10000 + ${a}.vat_rate)), 0)`;
+  const cashIn = await entries("(e.source = 'count' OR (e.source = 'manual' AND e.amount > 0))", basis === 'gross' ? 'e.amount' : net('e'), true);
+  const cashOut = await entries("e.source = 'manual' AND e.amount < 0", t.small_business || basis === 'gross' ? '-e.amount' : `-(${net('e')})`, false);
+
+  const costCol = t.small_business || basis === 'gross' ? 'gross_total' : 'net_total';
+  const purchases = await all<{ id: number; number: string; dt: string; label: string | null; description: string | null; category: string | null; is_credit: number; s: number | string }>(
+    `SELECT p.id, p.number, p.paid_at dt, COALESCE(NULLIF(c.company, ''), c.name) label, p.description, p.category, p.is_credit,
+       CASE WHEN p.is_credit = 1 THEN -p.${costCol} ELSE p.${costCol} END s
+     FROM purchase_invoices p LEFT JOIN contacts c ON c.id = p.contact_id
+     WHERE p.tenant_id = ? AND p.status = 'paid' AND p.paid_at IS NOT NULL AND substr(p.paid_at, 1, 7) = ?
+     ORDER BY p.paid_at, p.id`,
+    t.id, ym,
+  );
+
+  const files = await fileCounts([...cashIn, ...cashOut].map((e) => e.id));
+  const sphere = (sp: string) => (t.nonprofit ? ` · ${sphereLabel(sp)}` : '');
+  const entryLine = (e: EntryRow): MonthLine => ({
+    date: e.entry_date,
+    title: e.text || SOURCE_LABELS[e.source as keyof typeof SOURCE_LABELS] || 'Buchung',
+    sub: [e.source === 'count' ? 'Kassenzählung' : 'ohne Rechnung', e.account, e.category ? categoryLabel(e.category) : '', e.receipt_ref ? `Beleg ${e.receipt_ref}` : '', e.vat_rate ? `inkl. ${e.vat_rate / 100} % USt.` : '']
+      .filter(Boolean).join(' · ') + sphere(e.sp),
+    href: e.source === 'count' ? `/cashbook/counts?account=${e.account_id}` : `/cashbook/entries/${e.id}/edit`,
+    amount: Number(e.s),
+    files: files.get(e.id),
+  });
+
+  const income: MonthLine[] = [
+    ...docs.map((d) => ({
+      date: d.dt,
+      title: `${d.type_code === '381' ? 'Storno' : 'Rechnung'} ${d.number} · ${d.label ?? ''}`,
+      sub: (d.type_code === '381' ? 'Erstattung einer bezahlten Rechnung' : d.subject || 'bezahlte Rechnung') + sphere(d.sp),
+      href: `/invoices/${d.id}`,
+      amount: Number(d.s),
+    })),
+    ...cashIn.map(entryLine),
+  ].sort((a, b) => a.date.localeCompare(b.date));
+  const costs: MonthLine[] = [
+    ...purchases.map((p) => ({
+      date: p.dt,
+      title: `${p.is_credit ? 'Gutschrift' : 'Eingangsrechnung'}${p.number ? ` ${p.number}` : ''} · ${p.label ?? 'ohne Lieferant'}`,
+      sub: [p.description, p.category ? categoryLabel(p.category) : ''].filter(Boolean).join(' · ') || 'bezahlte Eingangsrechnung',
+      href: `/purchases/${p.id}`,
+      amount: Number(p.s),
+    })),
+    ...cashOut.map(entryLine),
+  ].sort((a, b) => a.date.localeCompare(b.date));
+  return { income, costs };
+}
+
+function monthTable(lines: MonthLine[], emptyText: string, sumLabel: string): SafeHtml {
+  if (!lines.length) return html`<p class="muted">${emptyText}</p>`;
+  const sum = lines.reduce((a, l) => a + l.amount, 0);
+  return html`<div class="card flush"><table class="table month-table stack-mobile">
+    <thead><tr><th>Datum</th><th>Vorgang</th><th class="right">Betrag</th></tr></thead>
+    <tbody>${lines.map((l) => html`<tr class="rowlink">
+      <td data-label="Datum" class="nowrap">${formatDate(l.date)}</td>
+      <td data-label="Vorgang"><a href="${l.href}">${l.title}</a>
+        <div class="muted small">${l.sub}${l.files ? html` · <span class="has-file">${l.files} ${l.files === 1 ? 'Beleg' : 'Belege'}</span>` : ''}</div></td>
+      <td data-label="Betrag" class="right num ${l.amount < 0 ? 'kpi-alert' : ''}">${formatMoney(l.amount)}</td>
+    </tr>`)}</tbody>
+    <tfoot><tr><td colspan="2"><strong>${sumLabel}</strong></td><td class="right num"><strong>${formatMoney(sum)}</strong></td></tr></tfoot>
+  </table></div>`;
+}
+
 export const dashboardModule: Module = {
   name: 'dashboard',
   nav: { label: 'Übersicht', href: '/', order: 0, group: 'start', icon: 'dashboard' },
   register(app) {
+    app.get('/overview/:ym', async (c) => {
+      const t = tenantOf(c);
+      const ym = c.req.param('ym');
+      if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(ym)) notFound();
+      const basis = dashBasis(c, t);
+      const { income, costs } = await monthLines(t, ym, basis);
+      const [y, m] = ym.split('-').map(Number);
+      const shift = (d: number) => {
+        const i = y * 12 + (m - 1) + d;
+        return `${Math.floor(i / 12)}-${String((i % 12) + 1).padStart(2, '0')}`;
+      };
+      const sumIn = income.reduce((a, l) => a + l.amount, 0);
+      const sumOut = costs.reduce((a, l) => a + l.amount, 0);
+      const toggle = html`<span class="seg-toggle" role="group" aria-label="Beträge netto oder brutto">
+        ${(['net', 'gross'] as const).map((b) => html`<a href="/overview/${ym}?basis=${b}" class="${b === basis ? 'active' : ''}">${basisWord(b)}</a>`)}
+      </span>`;
+      return page(c, {
+        title: `${MONTHS[m - 1]} ${y}`,
+        back: { href: `/?year=${y}`, label: 'Übersicht' },
+        actions: html`<a class="btn" href="/overview/${shift(-1)}" aria-label="Vormonat">← ${MONTHS_SHORT[(m + 10) % 12]}</a>
+          <a class="btn" href="/overview/${shift(1)}" aria-label="Folgemonat">${MONTHS_SHORT[m % 12]} →</a>`,
+        body: html`
+        <div class="month-summary card">
+          <div><span class="muted small">Einnahmen</span><strong class="num">${formatMoney(sumIn)}</strong></div>
+          <div><span class="muted small">Ausgaben</span><strong class="num">${formatMoney(sumOut)}</strong></div>
+          <div><span class="muted small">Ergebnis</span><strong class="num ${sumIn - sumOut < 0 ? 'kpi-alert' : ''}">${formatMoney(sumIn - sumOut)}</strong></div>
+          <div class="month-basis">${toggle}<span class="muted small">nach Zahlungsdatum${t.nonprofit ? ' · Einnahmen ohne ideellen Bereich' : ''}</span></div>
+        </div>
+        <h2 class="section-title" id="einnahmen">Einnahmen <span class="count">${income.length}</span></h2>
+        ${monthTable(income, 'In diesem Monat gibt es keine Einnahmen.', 'Summe Einnahmen')}
+        <h2 class="section-title" id="ausgaben">Ausgaben <span class="count">${costs.length}</span></h2>
+        ${monthTable(costs, 'In diesem Monat gibt es keine Ausgaben.', 'Summe Ausgaben')}`,
+      });
+    });
+
     app.get('/', async (c) => {
       const t = tenantOf(c);
       const d = today();
@@ -439,12 +613,13 @@ export const dashboardModule: Module = {
       const years = await revenueYears(t.id, year);
       const reqYear = c.req.query('year') ?? '';
       const selYear = years.includes(reqYear) ? reqYear : year;
-      const revenue = await yearRevenue(t, selYear);
-      const chart = await monthlyChart(t.id, d);
-      const result = await resultChart(t, selYear, d);
-      const customers = await topCustomers(t.id, d);
+      const basis = dashBasis(c, t);
+      const revenue = await yearRevenue(t, selYear, basis);
+      const chart = await monthlyChart(t.id, d, basis);
+      const result = await resultChart(t, selYear, d, basis);
+      const customers = await topCustomers(t.id, d, basis);
       const spParam = c.req.query('sp') ?? '';
-      const suppliers = await supplierCard(t, spParam === 'all' || years.includes(spParam) ? spParam : selYear, years, selYear);
+      const suppliers = await supplierCard(t, spParam === 'all' || years.includes(spParam) ? spParam : selYear, years, selYear, basis);
       const liab = await openLiabilities(t.id);
       const ku = t.small_business ? await smallBusinessLimits(t, Number(year)) : null;
       const npo = t.nonprofit ? await nonprofitLimitsCard(t, Number(year)) : null;
@@ -463,8 +638,16 @@ export const dashboardModule: Module = {
       const problems = tenantProblems(t);
       const invites = await pendingInvitations(userOf(c).email);
       const inboxN = await inboxCount(t.id);
-      const costs = [...(await yearCosts(t, selYear)).values()].reduce((a, x) => a + x, 0);
+      const costs = [...(await yearCosts(t, selYear, basis)).values()].reduce((a, x) => a + x, 0);
       const toCapture = Number((await one<{ n: number }>("SELECT COUNT(*) n FROM purchase_invoices WHERE tenant_id = ? AND status = 'draft'", t.id))?.n ?? 0);
+      const basisHref = (b: Basis) => {
+        const q = new URLSearchParams({ year: selYear, basis: b });
+        if (spParam) q.set('sp', spParam);
+        return `/?${q}`;
+      };
+      const basisToggle = html`<span class="seg-toggle" role="group" aria-label="Beträge netto oder brutto">
+        ${(['net', 'gross'] as const).map((b) => html`<a href="${basisHref(b)}" class="${b === basis ? 'active' : ''}"${b === basis ? raw(' aria-current="true"') : ''}>${basisWord(b)}</a>`)}
+      </span>`;
       const n = (k: number, one_: string, many: string) => `${k} ${k === 1 ? one_ : many}`;
       const row = (href: string, label: string, amount: number, sub: string, alert = '') => html`<a class="kpi-row" href="${href}">
         <span class="kpi-label">${label}</span><strong class="num">${formatMoney(amount)}</strong>
@@ -480,7 +663,7 @@ export const dashboardModule: Module = {
           <form method="get" action="/" class="stat-year kpi-head">
             <label for="revenue-year">Umsatz</label>
             <select id="revenue-year" name="year" data-autosubmit>${years.map((y) => html`<option value="${y}"${selected(y, selYear)}>${y}</option>`)}</select>
-            <span>netto · nach Zahlung</span>
+            ${basisToggle}<span>nach Zahlung</span>
             <noscript><button class="btn">OK</button></noscript>
           </form>
           <a class="kpi-big" href="/invoices?paid=${selYear}"><strong class="num">${formatMoney(revenue.s)}</strong>

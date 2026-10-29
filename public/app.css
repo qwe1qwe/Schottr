@@ -312,6 +312,17 @@ input.num { text-align: right; }
 .kpi-head label { font-size: inherit; color: inherit; }
 .kpi-head span { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .kpi-head select { text-transform: none; letter-spacing: 0; }
+.seg-toggle {
+  display: inline-flex; padding: 2px; gap: 2px; border-radius: 7px; background: var(--line);
+  text-transform: none; letter-spacing: 0; font-weight: 600;
+}
+.seg-toggle a {
+  padding: .05rem .5rem; border-radius: 5px; font-size: .75rem; line-height: 1.5;
+  color: var(--muted); text-decoration: none;
+}
+.seg-toggle a:hover { color: var(--ink); }
+.seg-toggle a.active { background: var(--surface); color: var(--ink); box-shadow: 0 1px 2px rgb(0 0 0 / 8%); }
+.seg-toggle a:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .kpi-big + .kpi-list { margin-top: .4rem; }
 .kpi-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0 .75rem; color: var(--ink); text-decoration: none; padding: .35rem 0; border-top: 1px solid var(--line); }
 .kpi-row:first-of-type { border-top: 0; padding-top: 0; }
@@ -804,3 +815,11 @@ ul.tight { margin: .35rem 0 0; padding-left: 1.2rem; }
   .inbox-preview .preview-foot { border-top: 0; padding: .8rem .9rem; }
   .capture-form .upload-buttons .btn { flex: 1 1 10rem; justify-content: center; padding: .9rem; }
 }
+
+/* ---------- Monatsaufstellung ---------- */
+.month-summary { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 1rem 2.25rem; }
+.month-summary > div { display: flex; flex-direction: column; gap: .15rem; }
+.month-summary strong { font-size: 1.25rem; }
+.month-summary .month-basis { margin-left: auto; align-items: flex-end; gap: .35rem; }
+.month-table tfoot td { border-bottom: 0; border-top: 1px solid var(--line-strong); }
+@media (max-width: 860px) { .month-summary .month-basis { margin-left: 0; align-items: flex-start; } }
