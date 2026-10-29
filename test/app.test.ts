@@ -921,7 +921,7 @@ test('Gemeinnütziger Verein: Bereich je Rechnung, Grenzen in der Übersicht, Vo
   assert.match(page, /aria-valuemax="5000000" aria-valuenow="4200000"/);
   assert.match(page, /ku-status ku-warn"><strong>Achtung:<\/strong> nur noch/);
   assert.match(page, /aria-valuemax="10000000" aria-valuenow="4200000"/, 'Einnahmen gesamt gegen 100.000 € – nur bezahlte Rechnungen');
-  assert.match(page, new RegExp(`href="/invoices\\?paid=${year}&amp;sphere=ideell"`));
+  assert.match(page, new RegExp(`href="/overview/${year}\\?sphere=ideell&amp;basis=gross"`));
   assert.doesNotMatch(page, /Sportliche Veranstaltungen \d{4}/, 'ohne Sporteinnahmen keine Sportzeile');
 
   // Liste nach Jahr und Bereich filtern
@@ -1163,6 +1163,19 @@ test('Kassenbuch: Konten, Zuordnung, Umbuchung, Kassenzählung, Abschluss, Steue
   assert.equal(diff.sphere, 'business');
   assert.equal(diff.vat_rate, 1900);
   assert.equal(await balance(kasse), 22600);
+
+  // Aufstellung je Bereich (Link aus der Gemeinnützigkeits-Kachel): Bareinnahmen ohne Rechnung und Ausgaben ohne Rechnung
+  const yr = today.slice(0, 4);
+  let sp = await (await req(`/overview/${yr}?sphere=business&basis=gross`)).text();
+  assert.match(sp, /Getränkeverkauf Probenabende/);
+  assert.match(sp, /90,00.€/);
+  assert.doesNotMatch(sp, />Porto</);
+  sp = await (await req(`/overview/${yr}?sphere=ideell&basis=gross`)).text();
+  assert.match(sp, />Porto</);
+  assert.doesNotMatch(sp, /Getränkeverkauf Probenabende/);
+  sp = await (await req(`/overview/${yr}`)).text();
+  assert.match(sp, /Getränkeverkauf Probenabende/);
+  assert.match(sp, />Porto</, 'ohne Bereich: alle Ausgaben wie im Ergebnis');
 
   // Übersicht und Kassenbuch zeigen Stände und Verlauf
   page = await (await req('/')).text();

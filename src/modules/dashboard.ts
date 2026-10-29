@@ -444,7 +444,7 @@ async function nonprofitLimitsCard(t: Tenant, year: number) {
       : html`Bis ${euro(lim.funds)} Einnahmen im Jahr entfällt die Pflicht zur zeitnahen Mittelverwendung.
           Enthalten sind Rechnungen, die unter „Spenden“ erfassten Zuwendungen und die Bareinnahmen aus dem Kassenbuch.`}</p>
     <ul class="plain npo-split small">${SPHERES.map((x) => html`<li>
-      <a href="/invoices?paid=${year}&amp;sphere=${x.value}" title="${x.hint}">${x.label}</a>
+      <a href="/overview/${year}?sphere=${x.value}&amp;basis=gross" title="${x.hint} – alle Einnahmen und Ausgaben des Bereichs">${x.label}</a>
       <span class="muted">${cur[x.value].n} bezahlte Rechnung(en)${cur[x.value].cash > 0 ? html` · bar ohne Rechnung ${formatMoney(cur[x.value].cash)}` : ''}</span>
       <strong class="num">${formatMoney(cur[x.value].s)}</strong></li>`)}
       <li><a href="/donations?year=${year}">Spenden und Mitgliedsbeiträge</a>
@@ -458,18 +458,22 @@ async function nonprofitLimitsCard(t: Tenant, year: number) {
 }
 
 
-/* ---------- Monatsaufstellung: alles, was in einer Säule des Ergebnis-Charts steckt ---------- */
+/* ---------- Aufstellung: alles, was in einer Säule bzw. einem Bereich steckt ---------- */
 
 interface MonthLine { date: string; title: string; sub: string; href: string; amount: number; files?: number }
 
 /**
- * Einnahmen und Ausgaben eines Monats nach Zahlungsdatum – mit denselben Regeln wie
- * yearRevenue / yearCosts, damit die Summen genau zu den Säulen passen.
+ * Einnahmen und Ausgaben eines Monats (YYYY-MM) oder Jahres (YYYY) nach Zahlungsdatum – mit
+ * denselben Regeln wie yearRevenue / yearCosts bzw. der Gemeinnützigkeits-Kachel, damit die Summen
+ * genau passen. Ohne Bereich bleibt bei gemeinnützigen Mandanten der ideelle Bereich bei den
+ * Einnahmen außen vor; mit Bereich gibt es nur dessen Einnahmen und Ausgaben.
  */
-async function monthLines(t: Tenant, ym: string, basis: Basis) {
+async function periodLines(t: Tenant, period: string, basis: Basis, sphere?: Sphere) {
   const col = docCol(basis);
   const def = t.default_sphere || 'business';
-  const noIdeell = t.nonprofit ? "AND sp <> 'ideell'" : '';
+  const len = period.length;
+  const spFilter = sphere ? 'AND sp = ?' : t.nonprofit ? "AND sp <> 'ideell'" : '';
+  const spParams = sphere ? [sphere] : [];
   const prepaid = (alias: string) => `(SELECT COALESCE(SUM(p.${col}), 0) FROM document_prepayments x JOIN documents p ON p.id = x.prepaid_id WHERE x.document_id = ${alias}.id)`;
 
   const docs = await all<{ id: number; number: string; type_code: string; dt: string; sp: string; label: string | null; subject: string | null; s: number | string }>(
@@ -478,48 +482,52 @@ async function monthLines(t: Tenant, ym: string, basis: Basis) {
          COALESCE(NULLIF(c.company, ''), c.name) label, d.subject, d.${col} - ${prepaid('d')} s
        FROM documents d LEFT JOIN contacts c ON c.id = d.contact_id
        WHERE d.tenant_id = ? AND d.kind = 'invoice' AND d.finalized_at IS NOT NULL AND d.type_code <> '381'
-         AND d.paid_at IS NOT NULL AND substr(d.paid_at, 1, 7) = ?
+         AND d.paid_at IS NOT NULL AND substr(d.paid_at, 1, ${len}) = ?
        UNION ALL
        SELECT d.id, d.number, d.type_code, d.issue_date dt, COALESCE(NULLIF(o.sphere, ''), ?) sp,
          COALESCE(NULLIF(c.company, ''), c.name) label, d.subject, -d.${col} s
        FROM documents d JOIN documents o ON o.id = d.corrects_id LEFT JOIN contacts c ON c.id = d.contact_id
        WHERE d.tenant_id = ? AND d.kind = 'invoice' AND d.finalized_at IS NOT NULL AND d.type_code = '381'
-         AND o.paid_at IS NOT NULL AND substr(d.issue_date, 1, 7) = ?
-     ) x WHERE 1 = 1 ${noIdeell} ORDER BY dt, number`,
-    def, t.id, ym, def, t.id, ym,
+         AND o.paid_at IS NOT NULL AND substr(d.issue_date, 1, ${len}) = ?
+     ) x WHERE 1 = 1 ${spFilter} ORDER BY dt, number`,
+    def, t.id, period, def, t.id, period, ...spParams,
   );
 
   type EntryRow = { id: number; account_id: number; entry_date: string; source: string; text: string; receipt_ref: string; category: string | null; sp: string; vat_rate: number; account: string; s: number | string };
-  const entries = async (cond: string, amount: string, sphereFilter: boolean) => all<EntryRow>(
-    `SELECT e.id, e.account_id, e.entry_date, e.source, e.text, e.receipt_ref, e.category, e.vat_rate,
-       COALESCE(NULLIF(e.sphere, ''), ?) sp, a.name account, ${amount} s
-     FROM cash_entries e JOIN cash_accounts a ON a.id = e.account_id
-     WHERE e.tenant_id = ? AND substr(e.entry_date, 1, 7) = ? AND ${cond}
-       ${sphereFilter && t.nonprofit ? "AND COALESCE(NULLIF(e.sphere, ''), ?) <> 'ideell'" : ''}
-     ORDER BY e.entry_date, e.id`,
-    def, t.id, ym, ...(sphereFilter && t.nonprofit ? [def] : []),
+  const entries = async (cond: string, amount: string, filter: string, params: string[]) => all<EntryRow>(
+    `SELECT * FROM (
+       SELECT e.id, e.account_id, e.entry_date, e.source, e.text, e.receipt_ref, e.category, e.vat_rate,
+         COALESCE(NULLIF(e.sphere, ''), ?) sp, a.name account, ${amount} s
+       FROM cash_entries e JOIN cash_accounts a ON a.id = e.account_id
+       WHERE e.tenant_id = ? AND substr(e.entry_date, 1, ${len}) = ? AND ${cond}
+     ) x WHERE 1 = 1 ${filter} ORDER BY entry_date, id`,
+    def, t.id, period, ...params,
   );
   const net = (a: string) => `${a}.amount - IF(${a}.vat_rate > 0, ROUND(${a}.amount * ${a}.vat_rate / (10000 + ${a}.vat_rate)), 0)`;
-  const cashIn = await entries("(e.source = 'count' OR (e.source = 'manual' AND e.amount > 0))", basis === 'gross' ? 'e.amount' : net('e'), true);
-  const cashOut = await entries("e.source = 'manual' AND e.amount < 0", t.small_business || basis === 'gross' ? '-e.amount' : `-(${net('e')})`, false);
+  const cashIn = await entries("(e.source = 'count' OR (e.source = 'manual' AND e.amount > 0))", basis === 'gross' ? 'e.amount' : net('e'), spFilter, spParams);
+  // Ausgaben: ohne Bereich alle (wie im Ergebnis), mit Bereich nur dessen
+  const costFilter = sphere ? 'AND sp = ?' : '';
+  const cashOut = await entries("e.source = 'manual' AND e.amount < 0", t.small_business || basis === 'gross' ? '-e.amount' : `-(${net('e')})`, costFilter, spParams);
 
   const costCol = t.small_business || basis === 'gross' ? 'gross_total' : 'net_total';
-  const purchases = await all<{ id: number; number: string; dt: string; label: string | null; description: string | null; category: string | null; is_credit: number; s: number | string }>(
-    `SELECT p.id, p.number, p.paid_at dt, COALESCE(NULLIF(c.company, ''), c.name) label, p.description, p.category, p.is_credit,
-       CASE WHEN p.is_credit = 1 THEN -p.${costCol} ELSE p.${costCol} END s
-     FROM purchase_invoices p LEFT JOIN contacts c ON c.id = p.contact_id
-     WHERE p.tenant_id = ? AND p.status = 'paid' AND p.paid_at IS NOT NULL AND substr(p.paid_at, 1, 7) = ?
-     ORDER BY p.paid_at, p.id`,
-    t.id, ym,
+  const purchases = await all<{ id: number; number: string; dt: string; sp: string; label: string | null; description: string | null; category: string | null; is_credit: number; s: number | string }>(
+    `SELECT * FROM (
+       SELECT p.id, p.number, p.paid_at dt, COALESCE(NULLIF(p.sphere, ''), ?) sp, COALESCE(NULLIF(c.company, ''), c.name) label,
+         p.description, p.category, p.is_credit, CASE WHEN p.is_credit = 1 THEN -p.${costCol} ELSE p.${costCol} END s
+       FROM purchase_invoices p LEFT JOIN contacts c ON c.id = p.contact_id
+       WHERE p.tenant_id = ? AND p.status = 'paid' AND p.paid_at IS NOT NULL AND substr(p.paid_at, 1, ${len}) = ?
+     ) x WHERE 1 = 1 ${costFilter} ORDER BY dt, id`,
+    def, t.id, period, ...spParams,
   );
 
   const files = await fileCounts([...cashIn, ...cashOut].map((e) => e.id));
-  const sphere = (sp: string) => (t.nonprofit ? ` · ${sphereLabel(sp)}` : '');
+  const showSphere = t.nonprofit && !sphere;
+  const sphereTxt = (sp: string) => (showSphere ? ` · ${sphereLabel(sp)}` : '');
   const entryLine = (e: EntryRow): MonthLine => ({
     date: e.entry_date,
     title: e.text || SOURCE_LABELS[e.source as keyof typeof SOURCE_LABELS] || 'Buchung',
     sub: [e.source === 'count' ? 'Kassenzählung' : 'ohne Rechnung', e.account, e.category ? categoryLabel(e.category) : '', e.receipt_ref ? `Beleg ${e.receipt_ref}` : '', e.vat_rate ? `inkl. ${e.vat_rate / 100} % USt.` : '']
-      .filter(Boolean).join(' · ') + sphere(e.sp),
+      .filter(Boolean).join(' · ') + sphereTxt(e.sp),
     href: e.source === 'count' ? `/cashbook/counts?account=${e.account_id}` : `/cashbook/entries/${e.id}/edit`,
     amount: Number(e.s),
     files: files.get(e.id),
@@ -529,7 +537,7 @@ async function monthLines(t: Tenant, ym: string, basis: Basis) {
     ...docs.map((d) => ({
       date: d.dt,
       title: `${d.type_code === '381' ? 'Storno' : 'Rechnung'} ${d.number} · ${d.label ?? ''}`,
-      sub: (d.type_code === '381' ? 'Erstattung einer bezahlten Rechnung' : d.subject || 'bezahlte Rechnung') + sphere(d.sp),
+      sub: (d.type_code === '381' ? 'Erstattung einer bezahlten Rechnung' : d.subject || 'bezahlte Rechnung') + sphereTxt(d.sp),
       href: `/invoices/${d.id}`,
       amount: Number(d.s),
     })),
@@ -539,7 +547,7 @@ async function monthLines(t: Tenant, ym: string, basis: Basis) {
     ...purchases.map((p) => ({
       date: p.dt,
       title: `${p.is_credit ? 'Gutschrift' : 'Eingangsrechnung'}${p.number ? ` ${p.number}` : ''} · ${p.label ?? 'ohne Lieferant'}`,
-      sub: [p.description, p.category ? categoryLabel(p.category) : ''].filter(Boolean).join(' · ') || 'bezahlte Eingangsrechnung',
+      sub: ([p.description, p.category ? categoryLabel(p.category) : ''].filter(Boolean).join(' · ') || 'bezahlte Eingangsrechnung') + sphereTxt(p.sp),
       href: `/purchases/${p.id}`,
       amount: Number(p.s),
     })),
@@ -567,38 +575,64 @@ export const dashboardModule: Module = {
   name: 'dashboard',
   nav: { label: 'Übersicht', href: '/', order: 0, group: 'start', icon: 'dashboard' },
   register(app) {
-    app.get('/overview/:ym', async (c) => {
+    app.get('/overview/:period', async (c) => {
       const t = tenantOf(c);
-      const ym = c.req.param('ym');
-      if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(ym)) notFound();
-      const basis = dashBasis(c, t);
-      const { income, costs } = await monthLines(t, ym, basis);
-      const [y, m] = ym.split('-').map(Number);
+      const period = c.req.param('period');
+      if (!/^\d{4}(-(0[1-9]|1[0-2]))?$/.test(period)) notFound();
+      const spQ = c.req.query('sphere') ?? '';
+      const sphere = t.nonprofit && isSphere(spQ) ? spQ : undefined;
+      // ?basis= gilt hier nur für diese Ansicht (die Gemeinnützigkeits-Kachel verlinkt brutto)
+      const bq = c.req.query('basis');
+      const basis: Basis = bq === 'net' || bq === 'gross' ? bq : dashBasis(c, t);
+      const { income, costs } = await periodLines(t, period, basis, sphere);
+      const isMonth = period.length === 7;
+      const [y, m] = period.split('-').map(Number);
       const shift = (d: number) => {
+        if (!isMonth) return String(y + d);
         const i = y * 12 + (m - 1) + d;
         return `${Math.floor(i / 12)}-${String((i % 12) + 1).padStart(2, '0')}`;
       };
+      // Umschalter in dieser Ansicht: Basis explizit in der Adresse, ohne die Vorgabe der Übersicht zu ändern
+      const q = (b: Basis) => `?${new URLSearchParams({ ...(sphere ? { sphere } : {}), basis: b })}`;
+      const keep = (extra: Record<string, string> = {}) => {
+        const p = new URLSearchParams({ ...extra, ...(bq === 'net' || bq === 'gross' ? { basis: bq } : {}) });
+        const str = p.toString();
+        return str ? `?${str}` : '';
+      };
+      const navQ = keep(sphere ? { sphere } : {});
       const sumIn = income.reduce((a, l) => a + l.amount, 0);
       const sumOut = costs.reduce((a, l) => a + l.amount, 0);
       const toggle = html`<span class="seg-toggle" role="group" aria-label="Beträge netto oder brutto">
-        ${(['net', 'gross'] as const).map((b) => html`<a href="/overview/${ym}?basis=${b}" class="${b === basis ? 'active' : ''}">${basisWord(b)}</a>`)}
+        ${(['net', 'gross'] as const).map((b) => html`<a href="/overview/${period}${q(b)}" class="${b === basis ? 'active' : ''}">${basisWord(b)}</a>`)}
       </span>`;
+      const label = isMonth ? `${MONTHS[m - 1]} ${y}` : String(y);
+      const prevLabel = isMonth ? MONTHS_SHORT[(m + 10) % 12] : String(y - 1);
+      const nextLabel = isMonth ? MONTHS_SHORT[m % 12] : String(y + 1);
+      const scope = sphere
+        ? `nur ${sphereLabel(sphere)}`
+        : t.nonprofit ? 'Einnahmen ohne ideellen Bereich' : '';
       return page(c, {
-        title: `${MONTHS[m - 1]} ${y}`,
+        title: sphere ? `${sphereLabel(sphere)} · ${label}` : label,
         back: { href: `/?year=${y}`, label: 'Übersicht' },
-        actions: html`<a class="btn" href="/overview/${shift(-1)}" aria-label="Vormonat">← ${MONTHS_SHORT[(m + 10) % 12]}</a>
-          <a class="btn" href="/overview/${shift(1)}" aria-label="Folgemonat">${MONTHS_SHORT[m % 12]} →</a>`,
+        actions: html`<a class="btn" href="/overview/${shift(-1)}${navQ}" aria-label="${isMonth ? 'Vormonat' : 'Vorjahr'}">← ${prevLabel}</a>
+          <a class="btn" href="/overview/${shift(1)}${navQ}" aria-label="${isMonth ? 'Folgemonat' : 'Folgejahr'}">${nextLabel} →</a>`,
         body: html`
         <div class="month-summary card">
           <div><span class="muted small">Einnahmen</span><strong class="num">${formatMoney(sumIn)}</strong></div>
           <div><span class="muted small">Ausgaben</span><strong class="num">${formatMoney(sumOut)}</strong></div>
           <div><span class="muted small">Ergebnis</span><strong class="num ${sumIn - sumOut < 0 ? 'kpi-alert' : ''}">${formatMoney(sumIn - sumOut)}</strong></div>
-          <div class="month-basis">${toggle}<span class="muted small">nach Zahlungsdatum${t.nonprofit ? ' · Einnahmen ohne ideellen Bereich' : ''}</span></div>
+          <div class="month-basis">${toggle}<span class="muted small">nach Zahlungsdatum${scope ? ` · ${scope}` : ''}</span></div>
         </div>
+        ${t.nonprofit
+          ? html`<nav class="tabs sphere-tabs" aria-label="Bereich">
+              <a href="/overview/${period}${keep()}" class="${sphere ? '' : 'active'}">Alle Bereiche</a>
+              ${SPHERES.map((x) => html`<a href="/overview/${period}${keep({ sphere: x.value })}" class="${sphere === x.value ? 'active' : ''}" title="${x.hint}">${x.short}</a>`)}
+            </nav>`
+          : ''}
         <h2 class="section-title" id="einnahmen">Einnahmen <span class="count">${income.length}</span></h2>
-        ${monthTable(income, 'In diesem Monat gibt es keine Einnahmen.', 'Summe Einnahmen')}
+        ${monthTable(income, `${isMonth ? 'In diesem Monat' : `${y}`} gibt es keine Einnahmen${sphere ? ' in diesem Bereich' : ''}.`, 'Summe Einnahmen')}
         <h2 class="section-title" id="ausgaben">Ausgaben <span class="count">${costs.length}</span></h2>
-        ${monthTable(costs, 'In diesem Monat gibt es keine Ausgaben.', 'Summe Ausgaben')}`,
+        ${monthTable(costs, `${isMonth ? 'In diesem Monat' : `${y}`} gibt es keine Ausgaben${sphere ? ' in diesem Bereich' : ''}.`, 'Summe Ausgaben')}`,
       });
     });
 
@@ -666,7 +700,7 @@ export const dashboardModule: Module = {
             ${basisToggle}<span>nach Zahlung</span>
             <noscript><button class="btn">OK</button></noscript>
           </form>
-          <a class="kpi-big" href="/invoices?paid=${selYear}"><strong class="num">${formatMoney(revenue.s)}</strong>
+          <a class="kpi-big" href="/overview/${selYear}" title="Alle Einnahmen und Ausgaben ${selYear}"><strong class="num">${formatMoney(revenue.s)}</strong>
             <small>${n(revenue.n, 'bezahlte Rechnung', 'bezahlte Rechnungen')}${revenue.cashN ? ` · bar ohne Rechnung ${formatMoney(revenue.cash)}` : ''}${t.nonprofit ? ' · ohne ideellen Bereich' : ''}</small></a>
           <ul class="plain kpi-list">
             <li><a href="/purchases?paid=${selYear}" title="Bezahlte Eingangsrechnungen und Ausgaben ohne Beleg aus dem Kassenbuch, nach Zahlungsdatum">Ausgaben</a><span class="num">${formatMoney(costs)}</span></li>

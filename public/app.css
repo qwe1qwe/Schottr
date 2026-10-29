@@ -823,3 +823,4 @@ ul.tight { margin: .35rem 0 0; padding-left: 1.2rem; }
 .month-summary .month-basis { margin-left: auto; align-items: flex-end; gap: .35rem; }
 .month-table tfoot td { border-bottom: 0; border-top: 1px solid var(--line-strong); }
 @media (max-width: 860px) { .month-summary .month-basis { margin-left: 0; align-items: flex-start; } }
+.sphere-tabs { width: max-content; max-width: 100%; margin: .25rem 0 .5rem; }
