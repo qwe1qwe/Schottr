@@ -750,11 +750,22 @@ test('Eingangsrechnungen: E-Rechnung, Scan, manuell, Export und Übersicht', opt
   const dash = await (await req('/?year=2026')).text();
   assert.match(dash, /Verbindlichkeiten/);
   assert.match(dash, /Umsatz und Ausgaben 2026/);
-  assert.match(dash, /href="\/purchases\?paid=2026-09"/);
+  assert.match(dash, /href="\/overview\/2026-09#ausgaben"/);
   assert.match(dash, /Größte Verbindlichkeiten/);
-  assert.match(dash, /PM-1/);
+  // Lieferanten nach Zahlungsdatum: bezahlte Tankquittung im Jahr der Zahlung, offene PM-1 unter „Alle Jahre“
+  assert.match(dash, /Tankstelle Süd/);
+  assert.match(await (await req('/?year=2026&sp=all')).text(), /PM-1/);
   // nach Zahlungsdatum: nur die bezahlte Tankquittung (100 € netto), PM-1 ist noch offen
   assert.match(dash, /September 2026: Umsatz [^"]* · Ausgaben 100,00.€/);
+  // Umschalter brutto: dieselbe Quittung mit 119 €
+  assert.match(await (await req('/?year=2026&basis=gross')).text(), /September 2026: Umsatz [^"]* · Ausgaben 119,00.€/);
+  // Monatsaufstellung: alles, was in der Säule steckt
+  const month = await (await req('/overview/2026-09')).text();
+  assert.match(month, /September 2026/);
+  assert.match(month, /B-77/);
+  assert.doesNotMatch(month, /PM-1/);
+  assert.match(month, /Summe Ausgaben/);
+  assert.equal((await req('/overview/2026-13')).status, 404);
   const paidList = await (await req('/purchases?paid=2026-09')).text();
   assert.match(paidList, /B-77/);
   assert.doesNotMatch(paidList, /PM-1/);
