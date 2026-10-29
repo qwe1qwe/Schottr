@@ -7,13 +7,15 @@ import { config } from '../config.ts';
 /**
  * Dateiablage außerhalb der Datenbank:
  *   <data>/nachweise/<Mandant>/…           Nachweisdokumentationen
- *   <data>/verbindlichkeiten/<Mandant>/…   Eingangsrechnungen (PDF, XML, Scans)
+ *   <data>/verbindlichkeiten/<Mandant>/…   Eingangsrechnungen (PDF, XML, Scans) und Kassenbuch-Belege
+ *   <data>/other/<Mandant>/…               Belegeingang: hochgeladen, aber noch nicht zugeordnet –
+ *                                          beim Zuordnen wird die Datei in den passenden Bereich verschoben
  *
  * In der Datenbank steht nur der relative Pfad "<Mandant>/<Datei>" samt SHA-256.
  * Dateien werden nie überschrieben (neuer Name je Upload) und atomar geschrieben.
  */
-export type FileArea = 'nachweise' | 'verbindlichkeiten';
-export const FILE_AREAS: FileArea[] = ['nachweise', 'verbindlichkeiten'];
+export type FileArea = 'nachweise' | 'verbindlichkeiten' | 'other';
+export const FILE_AREAS: FileArea[] = ['nachweise', 'verbindlichkeiten', 'other'];
 
 export function areaRoot(area: FileArea): string {
   return path.resolve(config.dataDir, area);
@@ -51,6 +53,15 @@ export async function saveFile(area: FileArea, tenantId: number, originalName: s
   await fs.writeFile(tmp, data, { flag: 'wx' });
   await fs.rename(tmp, abs);
   return { path: rel, sha256: sha256(data), size: data.length };
+}
+
+/** Datei in einen anderen Bereich verschieben (neu schreiben, prüfen, alte löschen) */
+export async function moveStoredFile(from: FileArea, rel: string, to: FileArea, tenantId: number, name: string): Promise<StoredFile> {
+  const data = await readStoredFile(from, rel);
+  const stored = await saveFile(to, tenantId, name, data);
+  if (sha256(await readStoredFile(to, stored.path)) !== sha256(data)) throw new Error(`Verschieben von ${rel} fehlgeschlagen (Prüfsumme)`);
+  await removeStoredFile(from, rel);
+  return stored;
 }
 
 export async function readStoredFile(area: FileArea, rel: string): Promise<Buffer> {
@@ -98,7 +109,7 @@ export async function checkStorage(): Promise<void> {
       throw new Error(
         `Die Dateiablage ${dir} ist kein Volume. Hochgeladene Dateien gingen beim nächsten Update verloren.\n`
         + `Bitte in compose.yml beim Dienst "schottr" ergänzen:\n`
-        + `    volumes:\n      - ./data/nachweise:/app/data/nachweise\n      - ./data/verbindlichkeiten:/app/data/verbindlichkeiten\n`
+        + `    volumes:\n      - ./data/nachweise:/app/data/nachweise\n      - ./data/verbindlichkeiten:/app/data/verbindlichkeiten\n      - ./data/other:/app/data/other\n`
         + `(Nur zum Ausprobieren lässt sich die Prüfung mit SCHOTTR_ALLOW_EPHEMERAL_FILES=true abschalten.)`,
       );
     }

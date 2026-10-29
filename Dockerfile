@@ -12,9 +12,9 @@ COPY src ./src
 COPY public ./public
 COPY assets ./assets
 COPY docker-entrypoint.sh /usr/local/bin/schottr-entrypoint
-# Dateiablage (Nachweise, Eingangsrechnungen) – in compose.yml als Volumes einbinden
+# Dateiablage (Nachweise, Eingangsrechnungen, Belegeingang) – in compose.yml als Volumes einbinden
 RUN chmod 755 /usr/local/bin/schottr-entrypoint \
- && mkdir -p /app/data/nachweise /app/data/verbindlichkeiten \
+ && mkdir -p /app/data/nachweise /app/data/verbindlichkeiten /app/data/other \
  && chown -R node:node /app/data
 EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=3s --start-period=30s CMD wget -qO- http://127.0.0.1:3000/health || exit 1

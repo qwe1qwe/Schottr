@@ -60,6 +60,44 @@ async function uploadedFiles(c: Ctx): Promise<File[]> {
   return (Array.isArray(raw) ? raw : [raw]).filter((f): f is File => f instanceof File && f.size > 0);
 }
 
+export type ImportResult = { id?: number; name: string; kind: 'einvoice' | 'draft' | 'skipped'; message?: string; supplierCreated?: boolean };
+
+/**
+ * Eine Datei als Eingangsrechnung übernehmen: E-Rechnungen (XRechnung/ZUGFeRD) vollständig,
+ * PDFs und Fotos als Entwurf zum Erfassen. Fehler (zu groß, falsches Format, doppelt) kommen
+ * als „skipped“ mit Begründung zurück. Auch vom Belegeingang genutzt.
+ */
+export async function importPurchaseFile(c: Ctx, t: Tenant, userId: number, file: { name: string; data: Uint8Array }): Promise<ImportResult> {
+  const name = file.name || 'beleg';
+  if (file.data.length > MAX_FILE_SIZE) return { name, kind: 'skipped', message: 'größer als 10 MB' };
+  const data = Buffer.from(file.data);
+  const kind = detectFile(data);
+  if (!kind) return { name, kind: 'skipped', message: 'nur PDF, XML, JPG oder PNG' };
+  const dup = await findBySha(t.id, sha256(data));
+  if (dup) return { id: dup.id, name, kind: 'skipped', message: 'bereits hochgeladen' };
+  try {
+    const inv = kind === 'pdf' || kind === 'xml' ? await readEInvoice(data) : null;
+    if (inv) {
+      const r = await createFromEInvoice(t, userId, { name, data, kind }, inv);
+      await audit(c, 'purchase.import', `${inv.formatLabel} ${inv.number} (${inv.seller.name})`);
+      return { id: r.id, name, kind: 'einvoice', supplierCreated: r.supplierCreated };
+    }
+    if (kind === 'xml') return { name, kind: 'skipped', message: 'XML ist keine E-Rechnung' };
+    return { id: await createFromUpload(t, userId, { name, data, kind }), name, kind: 'draft' };
+  } catch (err) {
+    if (err instanceof EInvoiceError || err instanceof UserError) return { name, kind: 'skipped', message: err.message };
+    throw err;
+  }
+}
+
+/** Weiterleitung nach dem Übernehmen einer einzelnen Datei */
+export function importRedirect(c: Ctx, r: ImportResult, fallback = '/purchases') {
+  if (r.kind === 'einvoice') return redirectWith(c, `/purchases/${r.id}`, 'ok', `E-Rechnung übernommen${r.supplierCreated ? ' – der Lieferant wurde neu angelegt' : ''}. Bitte noch die Kostenart prüfen.`);
+  if (r.kind === 'draft') return redirectWith(c, `/purchases/${r.id}/edit`, 'ok', 'Beleg hochgeladen. Bitte jetzt die Angaben erfassen.');
+  if (r.id) return redirectWith(c, `/purchases/${r.id}`, 'error', `${r.name}: ${r.message}.`);
+  return redirectWith(c, fallback, 'error', `${r.name}: ${r.message}.`);
+}
+
 function register(app: App) {
   app.get('/purchases', async (c) => {
     const t = tenantOf(c);
@@ -126,50 +164,19 @@ function register(app: App) {
     const files = await uploadedFiles(c);
     if (!files.length) return redirectWith(c, '/purchases', 'error', 'Bitte mindestens eine Datei auswählen.');
     if (files.length > 20) return redirectWith(c, '/purchases', 'error', 'Bitte höchstens 20 Dateien auf einmal hochladen.');
-    const results: { id?: number; name: string; kind: 'einvoice' | 'draft' | 'skipped'; message?: string; supplierCreated?: boolean }[] = [];
+    const results: ImportResult[] = [];
     for (const f of files) {
-      const name = f.name || 'beleg';
       if (f.size > MAX_FILE_SIZE) {
-        results.push({ name, kind: 'skipped', message: 'größer als 10 MB' });
+        results.push({ name: f.name || 'beleg', kind: 'skipped', message: 'größer als 10 MB' });
         continue;
       }
-      const data = Buffer.from(await f.arrayBuffer());
-      const kind = detectFile(data);
-      if (!kind) {
-        results.push({ name, kind: 'skipped', message: 'nur PDF, XML, JPG oder PNG' });
-        continue;
-      }
-      const dup = await findBySha(t.id, sha256(data));
-      if (dup) {
-        results.push({ id: dup.id, name, kind: 'skipped', message: 'bereits hochgeladen' });
-        continue;
-      }
-      try {
-        const inv = kind === 'pdf' || kind === 'xml' ? await readEInvoice(data) : null;
-        if (inv) {
-          const r = await createFromEInvoice(t, user.id, { name, data, kind }, inv);
-          results.push({ id: r.id, name, kind: 'einvoice', supplierCreated: r.supplierCreated });
-          await audit(c, 'purchase.import', `${inv.formatLabel} ${inv.number} (${inv.seller.name})`);
-        } else if (kind === 'xml') {
-          results.push({ name, kind: 'skipped', message: 'XML ist keine E-Rechnung' });
-        } else {
-          results.push({ id: await createFromUpload(t, user.id, { name, data, kind }), name, kind: 'draft' });
-        }
-      } catch (err) {
-        if (err instanceof EInvoiceError || err instanceof UserError) results.push({ name, kind: 'skipped', message: err.message });
-        else throw err;
-      }
+      results.push(await importPurchaseFile(c, t, user.id, { name: f.name, data: new Uint8Array(await f.arrayBuffer()) }));
     }
 
     const done = results.filter((r) => r.kind !== 'skipped');
     const skipped = results.filter((r) => r.kind === 'skipped');
     const skippedText = skipped.length ? ` Nicht übernommen: ${skipped.map((s) => `${s.name} (${s.message})`).join('; ')}.` : '';
-    if (done.length === 1 && !skipped.length) {
-      const r = done[0];
-      return r.kind === 'einvoice'
-        ? redirectWith(c, `/purchases/${r.id}`, 'ok', `E-Rechnung übernommen${r.supplierCreated ? ' – der Lieferant wurde neu angelegt' : ''}. Bitte noch die Kostenart prüfen.`)
-        : redirectWith(c, `/purchases/${r.id}/edit`, 'ok', 'Beleg hochgeladen. Bitte jetzt die Angaben erfassen.');
-    }
+    if (done.length === 1 && !skipped.length) return importRedirect(c, done[0]);
     if (!done.length) return redirectWith(c, '/purchases', 'error', `Keine Datei übernommen.${skippedText}`);
     const e = done.filter((r) => r.kind === 'einvoice').length;
     const d = done.length - e;

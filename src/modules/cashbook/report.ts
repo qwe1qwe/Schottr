@@ -51,17 +51,17 @@ export async function accountReports(t: Tenant, from: string, to: string): Promi
   return out;
 }
 
-export function cashbookCsv(t: Tenant, rep: AccountReport): string {
-  const head = ['Datum', 'Konto', 'Art', 'Buchungstext', 'Beleg', 'Kostenart', 'Bereich', 'USt-Satz', 'darin USt', 'Einnahme', 'Ausgabe', 'Saldo'];
-  const lines: (string | number)[][] = [['', rep.account.name, '', 'Anfangsbestand', '', '', '', '', '', '', '', num(rep.opening)]];
+export function cashbookCsv(t: Tenant, rep: AccountReport, files = new Map<number, string[]>()): string {
+  const head = ['Datum', 'Konto', 'Art', 'Buchungstext', 'Beleg', 'Kostenart', 'Bereich', 'USt-Satz', 'darin USt', 'Einnahme', 'Ausgabe', 'Saldo', 'Belegdateien'];
+  const lines: (string | number)[][] = [['', rep.account.name, '', 'Anfangsbestand', '', '', '', '', '', '', '', num(rep.opening), '']];
   for (const r of rep.rows) {
     lines.push([
       formatDate(r.entry_date), rep.account.name, r.recurring_id ? 'Dauerauftrag' : SOURCE_LABELS[r.source], entryLabel(r) + (r.ref_label && r.text ? ` – ${r.text}` : ''), r.receipt_ref,
       r.category || r.ref_category ? categoryLabel(r.category || r.ref_category!) : '', sphereText(t, r), r.vat_rate ? `${r.vat_rate / 100} %` : '', r.vat_rate ? num(vatOf(Math.abs(r.amount), r.vat_rate)) : '',
-      r.amount > 0 ? num(r.amount) : '', r.amount < 0 ? num(-r.amount) : '', num(r.balance),
+      r.amount > 0 ? num(r.amount) : '', r.amount < 0 ? num(-r.amount) : '', num(r.balance), (files.get(r.id) ?? []).join(', '),
     ]);
   }
-  lines.push(['', rep.account.name, '', 'Endbestand', '', '', '', '', '', num(rep.income), num(rep.expense), num(rep.closing)]);
+  lines.push(['', rep.account.name, '', 'Endbestand', '', '', '', '', '', num(rep.income), num(rep.expense), num(rep.closing), '']);
   return csv(head, lines);
 }
 
@@ -202,7 +202,7 @@ export async function summaryPdf(t: Tenant, from: string, to: string, reports: A
     heading: 'Inhalt des Pakets',
     columns: [{ label: 'Ordner / Datei', width: 35 }, { label: 'Inhalt', width: 65 }],
     rows: [
-      ['01_Kassenbuch', 'Kassenbuch je Konto als PDF und CSV (Excel), mit laufendem Saldo'],
+      ['01_Kassenbuch', 'Kassenbuch je Konto als PDF und CSV (Excel), mit laufendem Saldo; Belege (Fotos, PDFs) zu den Buchungen im Unterordner Belege'],
       ['02_Kassenzaehlungen.csv', 'Zählprotokolle der Bargeldkassen mit Stückelung und Differenz'],
       ['03_Ausgangsrechnungen', 'Rechnungen als ZUGFeRD-PDF und XRechnung, Rechnungsausgangsbuch (CSV)'],
       ['04_Eingangsrechnungen', 'Original-Belege, Rechnungseingangsbuch (CSV)'],

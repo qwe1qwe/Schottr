@@ -719,4 +719,49 @@ export const migrations: { version: number; statements: string[] }[] = [
         ADD CONSTRAINT cash_entries_recurring FOREIGN KEY (recurring_id) REFERENCES cash_recurring(id) ON DELETE SET NULL`,
     ],
   },
+  {
+    version: 12,
+    statements: [
+      // Belege zu Kassenbuch-Buchungen (PDF oder Foto, z. B. Quittung) – Datei in der Belegablage
+      // (data/verbindlichkeiten/<Mandant>/kasse_…), hier nur Verweis und Prüfsumme
+      `CREATE TABLE cash_entry_files (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        tenant_id INT NOT NULL,
+        entry_id INT NOT NULL,
+        file_name VARCHAR(200) NOT NULL,
+        file_path VARCHAR(300) NOT NULL,
+        file_mime VARCHAR(60) NOT NULL,
+        file_size INT NOT NULL,
+        file_sha256 CHAR(64) NOT NULL,
+        created_by INT NULL,
+        created_at DATETIME(3) NOT NULL,
+        KEY cash_files_entry (entry_id),
+        CONSTRAINT cash_files_tenant FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
+        CONSTRAINT cash_files_entry FOREIGN KEY (entry_id) REFERENCES cash_entries(id),
+        CONSTRAINT cash_files_user FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
+      ) ${TABLE}`,
+    ],
+  },
+  {
+    version: 13,
+    statements: [
+      // Belegeingang: hochgeladene, noch keiner Eingangsrechnung oder Buchung zugeordnete Belege
+      // (Datei unter data/other/<Mandant>/ – beim Zuordnen wird sie verschoben und der Eintrag gelöscht)
+      `CREATE TABLE inbox_files (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        tenant_id INT NOT NULL,
+        file_name VARCHAR(200) NOT NULL,
+        file_path VARCHAR(300) NOT NULL,
+        file_mime VARCHAR(60) NOT NULL,
+        file_size INT NOT NULL,
+        file_sha256 CHAR(64) NOT NULL,
+        note VARCHAR(300) NOT NULL DEFAULT '',
+        created_by INT NULL,
+        created_at DATETIME(3) NOT NULL,
+        KEY inbox_tenant (tenant_id, created_at),
+        CONSTRAINT inbox_tenant FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
+        CONSTRAINT inbox_user FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
+      ) ${TABLE}`,
+    ],
+  },
 ];

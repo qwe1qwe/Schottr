@@ -43,7 +43,7 @@ export function createApp() {
     referrerPolicy: 'same-origin',
   });
   app.use((c, next) =>
-    c.req.query('inline') === '1' && /^\/purchases\/\d+\/file$/.test(new URL(c.req.url).pathname)
+    c.req.query('inline') === '1' && /^\/(purchases\/\d+\/file|cashbook\/files\/\d+|inbox\/\d+\/file)$/.test(new URL(c.req.url).pathname)
       ? framableHeaders(c, next)
       : strictHeaders(c, next),
   );

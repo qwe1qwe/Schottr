@@ -64,3 +64,27 @@ export async function appendPdfs(base: Buffer, attachments: Uint8Array[]): Promi
   }
   return Buffer.from(await doc.save({ useObjectStreams: false, updateFieldAppearances: false }));
 }
+
+/**
+ * Fotos (JPEG/PNG) zu einem PDF zusammenfassen – eine Seite je Bild, A4 im Hoch- bzw.
+ * Querformat passend zum Bild, Bild mit Rand eingepasst. Für mehrseitige Belege (z. B. eine
+ * lange Quittung in zwei Fotos), die als ein Beleg abgelegt werden.
+ */
+export async function imagesToPdf(images: { data: Uint8Array; mime: string }[]): Promise<Uint8Array> {
+  const doc = await PDFDocument.create();
+  doc.setProducer('Schottr');
+  doc.setCreator('Schottr');
+  const A4 = [595.28, 841.89];
+  const margin = 20;
+  for (const img of images) {
+    const embedded = img.mime === 'image/png' ? await doc.embedPng(img.data) : await doc.embedJpg(img.data);
+    const landscape = embedded.width > embedded.height;
+    const [w, h] = landscape ? [A4[1], A4[0]] : A4;
+    const scale = Math.min((w - 2 * margin) / embedded.width, (h - 2 * margin) / embedded.height, 1e9);
+    const dw = embedded.width * scale;
+    const dh = embedded.height * scale;
+    const page = doc.addPage([w, h]);
+    page.drawImage(embedded, { x: (w - dw) / 2, y: (h - dh) / 2, width: dw, height: dh });
+  }
+  return doc.save();
+}

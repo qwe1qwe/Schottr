@@ -16,6 +16,7 @@ import { isSphere, nonprofitLimits, NONPROFIT_ALLOWANCE, SPHERES, type Sphere } 
 import { donationTotals } from './donations/repo.ts';
 import { cashbookCard, pendingCard } from './cashbook/routes.ts';
 import { cashbookEnabled, pendingDues } from './cashbook/repo.ts';
+import { inboxCount } from './inbox/repo.ts';
 import type { Module, Tenant } from '../types.ts';
 
 /**
@@ -423,11 +424,17 @@ export const dashboardModule: Module = {
       );
       const problems = tenantProblems(t);
       const invites = await pendingInvitations(userOf(c).email);
+      const inboxN = await inboxCount(t.id);
       return page(c, {
         title: 'Übersicht',
-        actions: html`<a class="btn" href="/quotes/new">Neues Angebot</a><a class="btn primary" href="/invoices/new">Neue Rechnung</a>`,
+        actions: html`<a class="btn hide-mobile" href="/capture">Beleg erfassen</a><a class="btn" href="/quotes/new">Neues Angebot</a><a class="btn primary" href="/invoices/new">Neue Rechnung</a>`,
         body: html`
+        <section class="capture-cta" aria-label="Beleg erfassen">
+          <a class="btn primary big" href="/capture">📷 Beleg erfassen</a>
+          <a class="capture-inbox ${inboxN ? 'has' : ''}" href="/inbox">${inboxN ? `${inboxN} nicht zugeordnet` : 'Belegeingang'}</a>
+        </section>
         ${invitationsBox(c, invites)}
+        ${inboxN ? html`<div class="notice soft hide-mobile"><a href="/inbox">${inboxN} Beleg(e)</a> im Belegeingang warten auf die Zuordnung.</div>` : ''}
         ${problems.length
           ? html`<div class="notice">Deine Firmendaten sind noch unvollständig – es fehlen: ${problems.join(", ")}. <a href="/settings">Jetzt ergänzen</a></div>`
           : ''}

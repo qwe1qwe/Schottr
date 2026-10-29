@@ -3,6 +3,7 @@ import { all, one, run, tx, nowIso } from '../../db/index.ts';
 import { addDays, formatDate, isIsoDate, today } from '../../lib/dates.ts';
 import { UserError } from '../../lib/http.ts';
 import type { Tenant } from '../../types.ts';
+import { detachAll, removePaths } from './files.ts';
 
 /**
  * Kassenbuch für Vereine: Bankkonten und Bargeldkassen mit Buchungen.
@@ -202,7 +203,9 @@ export async function unlink(t: Tenant, source: LinkSource, refId: number): Prom
   const existing = await linkedEntry(source, refId);
   if (!existing) return;
   assertOpen(t, existing.entry_date);
+  const paths = await detachAll('e.id = ?', existing.id);
   await run('DELETE FROM cash_entries WHERE id = ?', existing.id);
+  await removePaths(paths);
 }
 
 export async function createManual(t: Tenant, e: EntryInput, userId: number): Promise<number> {
@@ -232,8 +235,17 @@ export async function deleteEntry(t: Tenant, entry: CashEntry): Promise<void> {
     throw new UserError(entry.source === 'count' ? 'Buchungen aus einer Kassenzählung werden mit der Zählung gelöscht.' : 'Diese Buchung gehört zu einem Beleg – dort die Zahlung zurücknehmen.');
   }
   assertOpen(t, entry.entry_date);
-  if (entry.source === 'transfer' && entry.transfer_group) await run('DELETE FROM cash_entries WHERE transfer_group = ? AND tenant_id = ?', entry.transfer_group, t.id);
-  else await run('DELETE FROM cash_entries WHERE id = ?', entry.id);
+  const paths = await tx(async () => {
+    if (entry.source === 'transfer' && entry.transfer_group) {
+      const p = await detachAll('e.transfer_group = ? AND e.tenant_id = ?', entry.transfer_group, t.id);
+      await run('DELETE FROM cash_entries WHERE transfer_group = ? AND tenant_id = ?', entry.transfer_group, t.id);
+      return p;
+    }
+    const p = await detachAll('e.id = ?', entry.id);
+    await run('DELETE FROM cash_entries WHERE id = ?', entry.id);
+    return p;
+  });
+  await removePaths(paths);
 }
 
 /** Umbuchung zwischen zwei Konten (z. B. Bareinzahlung der Kasse auf die Bank) */
@@ -308,10 +320,13 @@ export async function deleteCount(t: Tenant, a: CashAccount, count: CashCount) {
   const last = await lastCount(a.id);
   if (!last || last.id !== count.id) throw new UserError('Nur die letzte Zählung einer Kasse lässt sich löschen.');
   assertOpen(t, count.count_date);
-  await tx(async () => {
+  const paths = await tx(async () => {
+    const p = await detachAll('e.count_id = ?', count.id);
     await run('DELETE FROM cash_entries WHERE count_id = ?', count.id);
     await run('DELETE FROM cash_counts WHERE id = ?', count.id);
+    return p;
   });
+  await removePaths(paths);
 }
 
 /* ---------------- Noch nicht zugeordnet ---------------- */

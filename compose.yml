@@ -37,9 +37,10 @@ services:
     ports:
       - "${SCHOTTR_PORT:-3000}:3000"
     volumes:
-      # Dateiablage je Mandant – Nachweise und Eingangsrechnungen (nicht in der Datenbank)
+      # Dateiablage je Mandant – Nachweise, Eingangsrechnungen und Belegeingang (nicht in der Datenbank)
       - ./data/nachweise:/app/data/nachweise
       - ./data/verbindlichkeiten:/app/data/verbindlichkeiten
+      - ./data/other:/app/data/other
     environment:
       DB_HOST: db
       DB_NAME: schottr

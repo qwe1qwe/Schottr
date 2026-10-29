@@ -74,6 +74,11 @@ export function uploadCard(c: Ctx): SafeHtml {
       </label>
       <div class="form-actions"><button class="btn primary">Hochladen</button> <a class="btn ghost" href="/purchases/new">Ohne Beleg erfassen</a></div>
     </form>
+    <form method="post" action="/capture" enctype="multipart/form-data" class="photo-capture" data-photo-submit>
+      ${csrfField(c)}<input type="hidden" name="target" value="purchase">
+      <label class="btn">📷 Foto aufnehmen<input type="file" name="files[]" accept="image/*" capture="environment" class="sr-only"></label>
+      <span class="muted small">Beleg mit dem Handy fotografieren – mehrseitige Belege über <a href="/capture?target=purchase">Beleg erfassen</a>.</span>
+    </form>
   </section>`;
 }
 

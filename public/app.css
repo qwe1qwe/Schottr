@@ -223,6 +223,35 @@ input.num { text-align: right; }
 .notice ul { margin: .4rem 0; padding-left: 1.2rem; }
 .notice.soft { background: var(--surface-2); border-color: var(--line); }
 .year-select { width: auto; }
+.entry-files { display: flex; flex-direction: column; gap: .4rem; }
+.field-label { font-size: .88rem; color: var(--muted); }
+.upload-buttons { display: flex; gap: .5rem; flex-wrap: wrap; }
+.upload-buttons .btn { cursor: pointer; }
+.file-picks li { padding: .2rem 0; border: 0; }
+.entry-file-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(11rem, 1fr)); gap: .75rem; margin: 0 0 1rem; }
+.entry-file-list li { border: 1px solid var(--line); border-radius: 8px; padding: .5rem; display: flex; flex-direction: column; gap: .35rem; }
+.entry-file { display: flex; flex-direction: column; gap: .35rem; color: var(--ink); text-decoration: none; word-break: break-word; font-size: .85rem; }
+.entry-file img { width: 100%; height: 8rem; object-fit: cover; border-radius: 6px; background: var(--surface-2); }
+/* Belege: Belegeingang, Beleg erfassen */
+.inbox-grid, .plain.inbox-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr)); gap: .75rem; margin: 1rem 0; }
+.inbox-item { display: flex; flex-direction: column; gap: .5rem; padding: .6rem; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+.inbox-thumb { display: block; text-decoration: none; }
+.inbox-thumb img { display: block; width: 100%; height: 11rem; object-fit: cover; object-position: top; border-radius: 6px; background: var(--surface-2); }
+.inbox-thumb .pdf-badge { height: 11rem; }
+.inbox-meta { display: flex; flex-direction: column; gap: .3rem; min-width: 0; }
+.inbox-meta .inline-form { display: flex; flex-wrap: wrap; gap: .35rem; margin-top: .2rem; }
+.target-choice { display: grid; gap: .5rem; border: 0; padding: 0; margin: 0; }
+.target-choice legend { font-weight: 600; margin-bottom: .4rem; }
+.target-option { display: flex; gap: .65rem; align-items: flex-start; padding: .7rem .8rem; border: 1px solid var(--line); border-radius: 10px; cursor: pointer; }
+.target-option:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+.target-option input { margin-top: .2rem; width: auto; }
+.target-option span { display: flex; flex-direction: column; gap: .15rem; }
+.photo-capture { display: flex; gap: .75rem; align-items: center; flex-wrap: wrap; margin-top: .75rem; }
+.photo-capture .btn { cursor: pointer; }
+.photo-capture.busy { opacity: .6; pointer-events: none; }
+.capture-cta { display: none; }
+.pdf-badge { display: grid; place-items: center; height: 8rem; border-radius: 6px; background: var(--surface-2); color: var(--danger); font-weight: 700; letter-spacing: .05em; }
+.has-file { color: var(--accent); font-weight: 600; }
 .sphere-field .sphere-hint { display: block; line-height: 1.4; }
 .sphere-help { margin-top: .2rem; font-weight: 400; color: var(--muted); }
 .sphere-help summary { cursor: pointer; color: var(--accent); width: fit-content; }
@@ -676,4 +705,17 @@ ul.tight { margin: .35rem 0 0; padding-left: 1.2rem; }
   .no-vat .items .line-total { grid-column: 2; }
   .items-foot { padding: 1rem; }
   .items-foot .totals { margin-left: auto; }
+}
+
+/* Handy: „Beleg erfassen“ ganz oben auf der Übersicht */
+@media (max-width: 860px) {
+  .capture-cta { display: flex; flex-direction: column; gap: .4rem; margin-bottom: 1rem; }
+  .capture-cta .btn.big { padding: 1rem; font-size: 1.1rem; justify-content: center; text-align: center; }
+  .capture-inbox { align-self: center; font-size: .9rem; color: var(--muted); }
+  .capture-inbox.has { color: var(--accent); font-weight: 600; }
+  .hide-mobile { display: none; }
+  /* PDFs lassen sich in Handy-Browsern nicht eingebettet anzeigen – dort nur der Link */
+  .inbox-preview .preview-frame { display: none; }
+  .inbox-preview .preview-foot { border-top: 0; padding: .8rem .9rem; }
+  .capture-form .upload-buttons .btn { flex: 1 1 10rem; justify-content: center; padding: .9rem; }
 }

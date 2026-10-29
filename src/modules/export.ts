@@ -1,5 +1,6 @@
 import { all, one } from '../db/index.ts';
 import { cashbookEnabled, unassigned } from './cashbook/repo.ts';
+import { readEntryFile } from './cashbook/files.ts';
 import { accountReports, cashbookCsv, cashbookPdf, countsCsv, donationsCsv, sphereCsv, sphereSummary, summaryPdf } from './cashbook/report.ts';
 import { audit } from '../lib/audit.ts';
 import { buildDatevCsv, creditorAccount, revenueAccounts, type DatevInvoice, type DatevPurchase } from '../lib/datev.ts';
@@ -11,6 +12,7 @@ import { html } from '../lib/html.ts';
 import { attachment, tenantOf, userOf } from '../lib/http.ts';
 import { formatAmount, formatMoney } from '../lib/money.ts';
 import { createZip } from '../lib/zip.ts';
+import { inboxCount } from './inbox/repo.ts';
 import { INVOICE_TYPES, dueAmount, type DocumentData } from '../einvoice/model.ts';
 import { page } from '../views/layout.ts';
 import type { App, Ctx, Module, Tenant } from '../types.ts';
@@ -329,10 +331,23 @@ function register(app: App) {
 
     // Kassenbuch je Konto
     const reports = await accountReports(t, from, to);
+    // Belege zu den Buchungen (Fotos, PDFs) unter 01_Kassenbuch/Belege/<Konto>/
+    const entryFiles = await all<{ id: number; entry_id: number; file_name: string; file_path: string; entry_date: string; account_name: string }>(
+      `SELECT f.id, f.entry_id, f.file_name, f.file_path, e.entry_date, a.name account_name
+       FROM cash_entry_files f JOIN cash_entries e ON e.id = f.entry_id JOIN cash_accounts a ON a.id = e.account_id
+       WHERE f.tenant_id = ? AND e.entry_date BETWEEN ? AND ? ORDER BY e.entry_date, f.id`,
+      t.id, from, to,
+    );
+    const fileNames = new Map<number, string[]>();
+    for (const f of entryFiles) {
+      const name = `01_Kassenbuch/Belege/${safeName(f.account_name)}/${f.entry_date}_B${f.entry_id}_${safeName(f.file_name)}`;
+      fileNames.set(f.entry_id, [...(fileNames.get(f.entry_id) ?? []), name.split('/').pop()!]);
+      files.push({ name, data: await readEntryFile(f) });
+    }
     for (const rep of reports) {
       const base = `01_Kassenbuch/${safeName(rep.account.name)}_${year}`;
       files.push({ name: `${base}.pdf`, data: await cashbookPdf(t, rep, from, to) });
-      files.push({ name: `${base}.csv`, data: cashbookCsv(t, rep) });
+      files.push({ name: `${base}.csv`, data: cashbookCsv(t, rep, fileNames) });
     }
     const counts = await countsCsv(t, from, to);
     if (counts) files.push({ name: `02_Kassenzaehlungen_${year}.csv`, data: counts });
@@ -380,6 +395,8 @@ function register(app: App) {
     if (openInv?.n) notes.push(`${openInv.n} Ausgangsrechnung(en) bis ${formatDate(to)} sind noch offen (${formatMoney(Number(openInv.s))}).`);
     const drafts = await one<{ n: number }>("SELECT COUNT(*) n FROM purchase_invoices WHERE tenant_id = ? AND status = 'draft'", t.id);
     if (drafts?.n) notes.push(`${drafts.n} hochgeladene(r) Beleg(e) sind noch nicht erfasst und fehlen.`);
+    const inboxN = await inboxCount(t.id);
+    if (inboxN) notes.push(`${inboxN} Beleg(e) im Belegeingang sind noch keiner Eingangsrechnung oder Buchung zugeordnet und fehlen.`);
     if (!t.cashbook_locked_until || t.cashbook_locked_until < to) notes.push(`Das Kassenbuch ist für ${year} noch nicht abgeschlossen – Änderungen sind noch möglich.`);
     for (const r of reports) {
       // Stand am Tagesende (innerhalb eines Tages ist die Reihenfolge der Buchungen zufällig)

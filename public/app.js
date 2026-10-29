@@ -175,6 +175,81 @@
     sync();
   });
 
+  /* ---------- Belege anhängen: Foto aufnehmen / Datei wählen, mehrere nacheinander, Fotos verkleinern ---------- */
+  const MAX_EDGE = 2000;
+  const shrink = async (file) => {
+    if (!/^image\/(jpeg|png|webp)$/.test(file.type) || typeof createImageBitmap !== 'function') return file;
+    try {
+      const bmp = await createImageBitmap(file);
+      const scale = Math.min(1, MAX_EDGE / Math.max(bmp.width, bmp.height));
+      if (scale === 1 && file.size < 1.5 * 1024 * 1024) return file;
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(bmp.width * scale);
+      canvas.height = Math.round(bmp.height * scale);
+      canvas.getContext('2d').drawImage(bmp, 0, 0, canvas.width, canvas.height);
+      const blob = await new Promise((r) => canvas.toBlob(r, 'image/jpeg', 0.85));
+      if (!blob || blob.size >= file.size) return file;
+      const name = (file.name || 'foto').replace(/\.[^.]+$/, '') + '.jpg';
+      return new File([blob], name, { type: 'image/jpeg', lastModified: Date.now() });
+    } catch {
+      return file; // z. B. HEIC in Browsern ohne Unterstützung – der Server meldet sich dann
+    }
+  };
+  document.querySelectorAll('[data-entry-files]').forEach((box) => {
+    const list = box.querySelector('[data-file-list]');
+    const holder = document.createElement('div');
+    holder.hidden = true;
+    box.append(holder);
+    const refresh = () => {
+      list.replaceChildren();
+      holder.querySelectorAll('input[type="file"]').forEach((input) => {
+        [...input.files].forEach((f) => {
+          const li = document.createElement('li');
+          li.textContent = `${f.name} (${Math.max(1, Math.round(f.size / 1024))} KB) `;
+          const rm = document.createElement('button');
+          rm.type = 'button';
+          rm.className = 'link danger';
+          rm.textContent = 'entfernen';
+          rm.addEventListener('click', () => {
+            input.remove();
+            refresh();
+          });
+          li.append(rm);
+          list.append(li);
+        });
+      });
+      list.hidden = !list.children.length;
+    };
+    const onPick = async (input) => {
+      if (!input.files.length) return;
+      // gefülltes Feld beiseitelegen (wird mitgeschickt), ein leeres für das nächste Foto einsetzen
+      const fresh = input.cloneNode();
+      fresh.value = '';
+      input.after(fresh);
+      bind(fresh);
+      holder.append(input);
+      const dt = new DataTransfer();
+      for (const f of input.files) dt.items.add(await shrink(f));
+      input.files = dt.files;
+      refresh();
+    };
+    const bind = (input) => input.addEventListener('change', () => onPick(input));
+    box.querySelectorAll('input[data-shrink]').forEach(bind);
+  });
+
+  /* ---------- Ein Foto aufnehmen und sofort hochladen (Eingangsrechnungen) ---------- */
+  document.querySelectorAll('[data-photo-submit]').forEach((form) => {
+    const input = form.querySelector('input[type="file"]');
+    input.addEventListener('change', async () => {
+      if (!input.files.length) return;
+      form.classList.add('busy');
+      const dt = new DataTransfer();
+      for (const f of input.files) dt.items.add(await shrink(f));
+      input.files = dt.files;
+      form.submit();
+    });
+  });
+
   /* ---------- Kacheln mit Umschalter (z. B. Lieferanten / Verbindlichkeiten) ---------- */
   document.querySelectorAll('[data-tabs]').forEach((box, n) => {
     const key = `schottr:tab:${location.pathname}:${n}`;

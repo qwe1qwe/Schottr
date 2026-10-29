@@ -3,7 +3,7 @@
 # (als Volume eingebunden, vom Host meist root gehörend) übertragen.
 set -e
 if [ "$(id -u)" = "0" ]; then
-  for dir in "$SCHOTTR_DATA_DIR/nachweise" "$SCHOTTR_DATA_DIR/verbindlichkeiten"; do
+  for dir in "$SCHOTTR_DATA_DIR/nachweise" "$SCHOTTR_DATA_DIR/verbindlichkeiten" "$SCHOTTR_DATA_DIR/other"; do
     mkdir -p "$dir"
     find "$dir" \( ! -user node -o ! -group node \) -exec chown node:node {} +
   done

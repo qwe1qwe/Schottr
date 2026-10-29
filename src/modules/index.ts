@@ -14,6 +14,7 @@ import { correctionModule } from './documents/correction.ts';
 import { purchasesModule } from './purchases/routes.ts';
 import { donationsModule } from './donations/routes.ts';
 import { cashbookModule } from './cashbook/routes.ts';
+import { inboxModule } from './inbox/routes.ts';
 
 /**
  * Alle aktiven Module. Ein neues Modul (z. B. Zeiterfassung)
@@ -29,6 +30,7 @@ export const modules: Module[] = [
   invoicesModule,
   correctionModule,
   purchasesModule,
+  inboxModule,
   proofsModule,
   donationsModule,
   cashbookModule,

@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import mysql from 'mysql2/promise';
+import { PDFDocument } from 'pdf-lib';
 import { openDatabase, closeDatabase, one, all, run } from '../src/db/index.ts';
 import { createApp } from '../src/app.ts';
 
@@ -1191,6 +1192,108 @@ test('Kassenbuch: Konten, Zuordnung, Umbuchung, Kassenzählung, Abschluss, Steue
   // Kostenart bei freien Buchungen
   r = await req('/cashbook/entries', { form: { account_id: String(bank), entry_date: today, direction: 'out', amount: '120', text: 'Beitrag Landesverband', category: 'verband', vat_rate: '0' } });
   assert.equal((await one("SELECT category FROM cash_entries WHERE tenant_id = ? AND text = 'Beitrag Landesverband'", t.id))!.category, 'verband');
+  // Belege an Buchungen: Foto (JPEG) und PDF beim Erfassen, später nachreichen, Prüfung des Typs
+  const multipart = async (path: string, fields: Record<string, string>, files: { name: string; data: Buffer; type: string }[]) => {
+    const fd = new FormData();
+    fd.append('_csrf', csrf);
+    for (const [k, v] of Object.entries(fields)) fd.append(k, v);
+    for (const f of files) fd.append('files[]', new Blob([new Uint8Array(f.data)], { type: f.type }), f.name);
+    return app.request(path, { method: 'POST', headers: { cookie }, body: fd });
+  };
+  const jpeg = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(200, 1)]);
+  const pdfFile = Buffer.from('%PDF-1.4\n%Testbeleg\n');
+  r = await multipart('/cashbook/entries', { account_id: String(kasse), entry_date: today, direction: 'out', amount: '12,40', text: 'Putzmittel Vereinsheim', category: 'vereinsheim', vat_rate: '0' },
+    [{ name: 'IMG_0815.jpg', data: jpeg, type: 'image/jpeg' }, { name: 'quittung.pdf', data: pdfFile, type: 'application/pdf' }]);
+  const putz = (await one("SELECT * FROM cash_entries WHERE tenant_id = ? AND text = 'Putzmittel Vereinsheim'", t.id))!;
+  let att = await all('SELECT * FROM cash_entry_files WHERE entry_id = ? ORDER BY id', putz.id);
+  assert.deepEqual(att.map((f) => [f.file_name, f.file_mime]), [['IMG_0815.jpg', 'image/jpeg'], ['quittung.pdf', 'application/pdf']]);
+  assert.ok(fs.existsSync(path.join(process.env.SCHOTTR_DATA_DIR!, 'verbindlichkeiten', att[0].file_path)), 'Datei in der Belegablage');
+  // Abruf
+  r = await req(`/cashbook/files/${att[0].id}?inline=1`);
+  assert.equal(r.headers.get('content-type'), 'image/jpeg');
+  assert.deepEqual(Buffer.from(await r.arrayBuffer()), jpeg);
+  // Liste zeigt die Anzahl, Bearbeiten-Seite die Belege
+  page = await (await req(`/cashbook?account=${kasse}`)).text();
+  assert.match(page, /2 Belege/);
+  page = await (await req(`/cashbook/entries/${putz.id}/edit`)).text();
+  assert.match(page, /capture="environment"/);
+  assert.match(page, /quittung\.pdf/);
+  // nachreichen; falscher Dateityp wird abgelehnt
+  r = await multipart(`/cashbook/entries/${putz.id}/files`, {}, [{ name: 'notiz.txt', data: Buffer.from('hallo'), type: 'text/plain' }]);
+  assert.equal((await all('SELECT id FROM cash_entry_files WHERE entry_id = ?', putz.id)).length, 2);
+  r = await multipart(`/cashbook/entries/${putz.id}/files`, {}, [{ name: 'nachtrag.png', data: Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(50)]), type: 'image/png' }]);
+  assert.equal((await all('SELECT id FROM cash_entry_files WHERE entry_id = ?', putz.id)).length, 3);
+  // Beleg entfernen und Buchung samt Belegen löschen
+  r = await req(`/cashbook/files/${att[1].id}/delete`, { form: {} });
+  att = await all('SELECT * FROM cash_entry_files WHERE entry_id = ?', putz.id);
+  assert.equal(att.length, 2);
+  const putzFile = path.join(process.env.SCHOTTR_DATA_DIR!, 'verbindlichkeiten', att[0].file_path);
+  r = await req(`/cashbook/entries/${putz.id}/delete`, { form: {} });
+  assert.equal(await one('SELECT 1 FROM cash_entries WHERE id = ?', putz.id), undefined);
+  assert.equal((await all('SELECT id FROM cash_entry_files WHERE entry_id = ?', putz.id)).length, 0);
+  assert.ok(!fs.existsSync(putzFile), 'Datei aufgeräumt');
+  // ein Beleg bleibt für das Steuerbüro-Paket
+  r = await multipart('/cashbook/entries', { account_id: String(kasse), entry_date: today, direction: 'out', amount: '3', text: 'Briefmarken', vat_rate: '0' },
+    [{ name: 'briefmarken.jpg', data: jpeg, type: 'image/jpeg' }]);
+
+  // Beleg erfassen (Handy): zwei Fotos → ein PDF im Belegeingang (data/other), dann als Buchung zugeordnet
+  const png = fs.readFileSync(path.join(import.meta.dirname, 'logo.png'));
+  const inboxRows = () => all('SELECT * FROM inbox_files WHERE tenant_id = ? ORDER BY id', t.id);
+  page = await (await req('/capture')).text();
+  assert.match(page, /Kassenbuch-Buchung/);
+  r = await multipart('/capture', { target: 'cash', note: 'Getränke Sommerfest' }, [{ name: 'image.png', data: png, type: 'image/png' }, { name: 'image.png', data: png, type: 'image/png' }]);
+  let inbox = await inboxRows();
+  assert.equal(inbox.length, 1);
+  assert.equal(location(r), `/cashbook/new?inbox=${inbox[0].id}`);
+  assert.equal(inbox[0].file_mime, 'application/pdf');
+  assert.match(inbox[0].file_name, /^Beleg_\d{4}-\d{2}-\d{2}_\d{4}\.pdf$/);
+  const inboxFile = path.join(process.env.SCHOTTR_DATA_DIR!, 'other', inbox[0].file_path);
+  assert.ok(fs.existsSync(inboxFile), 'Datei unter data/other');
+  r = await req(`/inbox/${inbox[0].id}/file?inline=1`);
+  const merged = await PDFDocument.load(new Uint8Array(await r.arrayBuffer()));
+  assert.equal(merged.getPageCount(), 2, 'ein PDF mit zwei Seiten');
+  page = await (await req(`/cashbook/new?inbox=${inbox[0].id}`)).text();
+  assert.match(page, new RegExp(`<iframe src="/inbox/${inbox[0].id}/file\\?inline=1"`));
+  assert.match(page, new RegExp(`<option value="${inbox[0].id}" selected>`));
+  page = await (await req('/')).text();
+  assert.match(page, /1 nicht zugeordnet/);
+  r = await multipart('/cashbook/entries', { account_id: String(kasse), entry_date: today, direction: 'out', amount: '48,90', text: 'Getränke Sommerfest', vat_rate: '0', inbox_id: String(inbox[0].id) }, []);
+  const drinks = (await one("SELECT * FROM cash_entries WHERE tenant_id = ? AND text = 'Getränke Sommerfest'", t.id))!;
+  att = await all('SELECT * FROM cash_entry_files WHERE entry_id = ?', drinks.id);
+  assert.equal(att.length, 1);
+  assert.equal(att[0].file_mime, 'application/pdf');
+  assert.ok(fs.existsSync(path.join(process.env.SCHOTTR_DATA_DIR!, 'verbindlichkeiten', att[0].file_path)), 'in die Belegablage verschoben');
+  assert.ok(!fs.existsSync(inboxFile), 'aus data/other entfernt');
+  assert.equal((await inboxRows()).length, 0);
+
+  // „Später zuordnen“ und dann als Eingangsrechnung übernehmen
+  const jpeg2 = Buffer.concat([jpeg, Buffer.from('rechnung')]);
+  r = await multipart('/capture', { target: 'later' }, [{ name: 'rechnung_baumarkt.jpg', data: jpeg2, type: 'image/jpeg' }]);
+  assert.equal(location(r), '/inbox');
+  inbox = await inboxRows();
+  assert.equal(inbox[0].file_name, 'rechnung_baumarkt.jpg');
+  page = await (await req('/inbox')).text();
+  assert.match(page, /rechnung_baumarkt\.jpg/);
+  assert.match(page, new RegExp(`href="/cashbook/new\\?inbox=${inbox[0].id}"`));
+  r = await req(`/inbox/${inbox[0].id}/purchase`, { form: {} });
+  const fromInbox = (await one('SELECT * FROM purchase_invoices WHERE tenant_id = ? AND file_name = ?', t.id, 'rechnung_baumarkt.jpg'))!;
+  assert.equal(location(r), `/purchases/${fromInbox.id}/edit`);
+  assert.equal(fromInbox.status, 'draft');
+  assert.equal((await inboxRows()).length, 0);
+  // direkt als Eingangsrechnung fotografieren
+  r = await multipart('/capture', { target: 'purchase' }, [{ name: 'image.jpg', data: Buffer.concat([jpeg, Buffer.from('foto')]), type: 'image/jpeg' }]);
+  assert.match(location(r) ?? '', /^\/purchases\/\d+\/edit$/);
+  page = await (await req('/purchases')).text();
+  assert.match(page, /data-photo-submit/);
+  // Alle Belege
+  page = await (await req('/inbox?tab=all')).text();
+  assert.match(page, /Getränke Sommerfest/);
+  assert.match(page, /rechnung_baumarkt\.jpg/);
+  assert.match(page, /briefmarken\.jpg/);
+  // falscher Typ: nichts abgelegt
+  r = await multipart('/capture', { target: 'later' }, [{ name: 'notiz.txt', data: Buffer.from('hallo'), type: 'text/plain' }]);
+  assert.equal((await inboxRows()).length, 0);
+
   // Einnahmen haben keine Kostenart – auch wenn eine mitgeschickt wird
   r = await req('/cashbook/entries', { form: { account_id: String(kasse), entry_date: today, direction: 'in', amount: '5', text: 'Kuchenverkauf', category: 'verband', vat_rate: '0' } });
   assert.equal((await one("SELECT category FROM cash_entries WHERE tenant_id = ? AND text = 'Kuchenverkauf'", t.id))!.category, '');
@@ -1231,6 +1334,7 @@ test('Kassenbuch: Konten, Zuordnung, Umbuchung, Kassenzählung, Abschluss, Steue
     assert.ok(zip.includes(name), `${name} im Paket`);
   }
   assert.match(zip, /05_Spenden\/Zuwendungsbestaetigungen\/ZB-\d{4}-0001\.pdf/);
+  assert.match(zip, /01_Kassenbuch\/Belege\/Barkasse\/\d{4}-\d{2}-\d{2}_B\d+_briefmarken\.jpg/);
 
   // Abschluss: danach keine Änderungen mehr – auch nicht direkt in der Datenbank
   r = await req('/cashbook/lock', { form: { date: today } });

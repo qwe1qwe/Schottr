@@ -1,8 +1,9 @@
-import { all, one, run, nowIso } from '../../db/index.ts';
+import { all, one, run, tx, nowIso } from '../../db/index.ts';
+import { attachFiles, deleteFile, fileCounts, filesFrom, filesOf, getFile, readEntryFile, type EntryFile } from './files.ts';
 import { audit } from '../../lib/audit.ts';
 import { addDays, formatDate, isIsoDate, today } from '../../lib/dates.ts';
 import { checked, html, selected, type SafeHtml } from '../../lib/html.ts';
-import { idParam, notFound, readForm, redirectWith, requireOwner, str, tenantOf, userOf, UserError, type Form } from '../../lib/http.ts';
+import { attachment, idParam, notFound, readForm, redirectWith, requireOwner, str, tenantOf, userOf, UserError, type Form } from '../../lib/http.ts';
 import { formatAmount, formatMoney, parseDecimal } from '../../lib/money.ts';
 import { isSphere, SPHERES, sphereLabel, sphereSelect } from '../../lib/nonprofit.ts';
 import { formatIban, isValidIban, normalizeIban } from '../../lib/validate.ts';
@@ -11,6 +12,7 @@ import { categoryOptions } from '../purchases/views.ts';
 import { balanceChart } from '../../views/chart.ts';
 import { csrfField, empty, page } from '../../views/layout.ts';
 import type { App, Ctx, Module, Tenant } from '../../types.ts';
+import { assignToEntry, getInbox, inboxOf, removeInboxFile, type InboxFile } from '../inbox/repo.ts';
 import {
   bookDue, getRecurring, nextDue, pendingDues, recurringOf, RHYTHMS, skipDue, type PendingDue, type Recurring, type Rhythm,
   accountsOf, assertOpen, balanceAt, balances, bookLinked, cashbookEnabled, createManual, createTransfer, deleteCount, deleteEntry, DENOMINATIONS,
@@ -55,7 +57,7 @@ function rangeOf(year: number) {
   return { year, from: `${year}-01-01`, to: `${year}-12-31`, chartFrom: `${year}-01-01`, chartTo: `${year}-12-31` };
 }
 
-function entryTable(t: Tenant, rows: EntryRow[], opening: number, showAccount: boolean): SafeHtml {
+function entryTable(t: Tenant, rows: EntryRow[], opening: number, showAccount: boolean, files = new Map<number, number>()): SafeHtml {
   return html`<div class="card flush"><table class="table cash-table">
     <thead><tr><th>Datum</th>${showAccount ? html`<th>Konto</th>` : ''}<th>Buchung</th>${t.nonprofit ? html`<th>Bereich</th>` : ''}
       <th class="right">Einnahme</th><th class="right">Ausgabe</th><th class="right">Saldo</th></tr></thead>
@@ -69,7 +71,7 @@ function entryTable(t: Tenant, rows: EntryRow[], opening: number, showAccount: b
           <td>${formatDate(r.entry_date)}</td>
           ${showAccount ? html`<td>${r.account_name}</td>` : ''}
           <td><a href="${href}">${r.ref_label ?? r.text}</a>
-            <div class="muted small">${r.recurring_id ? 'Dauerauftrag' : SOURCE_LABELS[r.source]}${r.category ? ` · ${categoryLabel(r.category)}` : ''}${r.ref_label && r.text && r.text !== r.ref_label ? ` · ${r.text}` : ''}${r.receipt_ref ? ` · Beleg ${r.receipt_ref}` : ''}${r.vat_rate ? ` · inkl. ${r.vat_rate / 100} % USt.` : ''}</div></td>
+            <div class="muted small">${r.recurring_id ? 'Dauerauftrag' : SOURCE_LABELS[r.source]}${r.category ? ` · ${categoryLabel(r.category)}` : ''}${r.ref_label && r.text && r.text !== r.ref_label ? ` · ${r.text}` : ''}${r.receipt_ref ? ` · Beleg ${r.receipt_ref}` : ''}${r.vat_rate ? ` · inkl. ${r.vat_rate / 100} % USt.` : ''}${files.get(r.id) ? html` · <span class="has-file">${files.get(r.id)} ${files.get(r.id) === 1 ? 'Beleg' : 'Belege'}</span>` : ''}</div></td>
           ${t.nonprofit ? html`<td class="small">${sphere ? SPHERES.find((s) => s.value === sphere)?.short ?? '' : '–'}</td>` : ''}
           <td class="right num">${r.amount > 0 ? formatMoney(r.amount) : ''}</td>
           <td class="right num">${r.amount < 0 ? formatMoney(-r.amount) : ''}</td>
@@ -115,9 +117,66 @@ function vatField(t: Tenant, value: number): SafeHtml {
     <small class="muted">Einnahme: USt., die der Verein abführt (z. B. 19 % Getränkeverkauf). Ausgabe: USt. laut Rechnung oder Vertrag (Vorsteuer).</small></label>`;
 }
 
-function entryForm(c: Ctx, t: Tenant, accounts: CashAccount[], action: string, e: Partial<CashEntry>): SafeHtml {
-  const out = (e.amount ?? 0) < 0;
-  return html`<form method="post" action="${action}" class="card stack">
+/**
+ * Belege hochladen: „Foto aufnehmen“ öffnet am Handy direkt die Kamera, „Datei wählen“ nimmt
+ * PDFs und Bilder. Mehrere Fotos nacheinander sind möglich; große Fotos verkleinert der Browser
+ * vor dem Hochladen (app.js).
+ */
+export function fileUploader(label = 'Beleg (PDF oder Foto, optional)', inbox: InboxFile[] = [], inboxId?: number, hint?: string): SafeHtml {
+  return html`<div class="entry-files span-2" data-entry-files>
+    <span class="field-label">${label}</span>
+    <div class="upload-buttons">
+      <label class="btn">📷 Foto aufnehmen<input type="file" name="files[]" accept="image/*" capture="environment" class="sr-only" data-shrink></label>
+      <label class="btn ghost">Datei wählen<input type="file" name="files[]" accept="application/pdf,image/jpeg,image/png,.pdf,.jpg,.jpeg,.png" multiple class="sr-only" data-shrink></label>
+    </div>
+    <ul class="plain file-picks small" data-file-list hidden></ul>
+    <small class="muted">${hint ?? 'PDF, JPEG oder PNG, je höchstens 10 MB. Fotos werden vor dem Hochladen verkleinert.'}</small>
+    ${inbox.length ? inboxSelect(inbox, inboxId) : ''}
+  </div>`;
+}
+
+/** Auswahl eines noch nicht zugeordneten Belegs aus dem Belegeingang */
+export function inboxSelect(inbox: InboxFile[], inboxId?: number): SafeHtml {
+  return html`<label><span>Oder aus dem <a href="/inbox">Belegeingang</a> übernehmen</span>
+    <select name="inbox_id">
+      <option value="">– keiner –</option>
+      ${inbox.map((f) => html`<option value="${f.id}"${selected(f.id, inboxId ?? '')}>${f.file_name} · ${formatDate(f.created_at.slice(0, 10))}${f.note ? ` · ${f.note}` : ''}</option>`)}
+    </select></label>`;
+}
+
+/** Vorschau eines Belegs aus dem Belegeingang */
+export function inboxPreview(f: InboxFile): SafeHtml {
+  const src = `/inbox/${f.id}/file?inline=1`;
+  return html`<div class="card flush preview-card inbox-preview">
+    ${f.file_mime === 'application/pdf'
+      ? html`<iframe src="${src}" title="Beleg ${f.file_name}" class="preview-frame"></iframe>`
+      : html`<a href="${src}" target="_blank" rel="noopener"><img src="${src}" alt="Beleg ${f.file_name}" class="preview-img"></a>`}
+    <p class="preview-foot small"><a href="${src}" target="_blank" rel="noopener">${f.file_name} in neuem Tab öffnen</a>${f.note ? html` · ${f.note}` : ''}</p>
+  </div>`;
+}
+
+/** inbox_id aus einem Formular: Beleg aus dem Belegeingang an die Buchung hängen (in einer Transaktion) */
+async function takeInbox(t: Tenant, form: Form, entryId: number, userId: number): Promise<InboxFile | null> {
+  const id = Number(str(form, 'inbox_id'));
+  return id ? assignToEntry(t, id, entryId, userId) : null;
+}
+
+/** Angehängte Belege mit Vorschau (Bilder) bzw. Link (PDF) */
+function filesList(c: Ctx, files: EntryFile[], canDelete: boolean): SafeHtml {
+  if (!files.length) return html``;
+  return html`<ul class="plain entry-file-list">${files.map((f) => html`<li>
+    <a href="/cashbook/files/${f.id}?inline=1" target="_blank" rel="noopener" class="entry-file">
+      ${f.file_mime.startsWith('image/') ? html`<img src="/cashbook/files/${f.id}?inline=1" alt="Beleg ${f.file_name}" loading="lazy">` : html`<span class="pdf-badge">PDF</span>`}
+      <span>${f.file_name}<span class="muted small"> · ${Math.max(1, Math.round(f.file_size / 1024))} KB</span></span>
+    </a>
+    ${canDelete ? postButton(c, `/cashbook/files/${f.id}/delete`, 'Entfernen', 'link danger', `Beleg „${f.file_name}“ entfernen?`) : ''}
+  </li>`)}</ul>`;
+}
+
+function entryForm(c: Ctx, t: Tenant, accounts: CashAccount[], action: string, e: Partial<CashEntry>, inbox: InboxFile[] = [], inboxId?: number): SafeHtml {
+  // Beleg aus dem Belegeingang (Quittung, Kassenbon) ist meist eine Ausgabe
+  const out = (e.amount ?? 0) < 0 || (!e.id && !!inboxId);
+  return html`<form method="post" action="${action}" class="card stack" enctype="multipart/form-data">
     ${csrfField(c)}
     <fieldset class="inline-radio"><legend>Art</legend>
       <label class="check"><input type="radio" name="direction" value="in"${checked(!out)}> Einnahme</label>
@@ -132,6 +191,7 @@ function entryForm(c: Ctx, t: Tenant, accounts: CashAccount[], action: string, e
       ${categoryField(c, e.category ?? '')}
       ${sphereField(t, e.sphere ?? '')}
       ${vatField(t, e.vat_rate ?? 0)}
+      ${fileUploader(e.id ? 'Weitere Belege anhängen (PDF oder Foto)' : undefined, inbox, inboxId)}
     </div>
     <p class="muted small">Rechnungen, Eingangsrechnungen und Spenden bitte nicht hier, sondern beim Beleg als bezahlt markieren bzw. unten unter „Noch nicht zugeordnet“ – dann ist der Beleg verknüpft.</p>
     <div class="form-actions"><button class="btn primary">Speichern</button></div>
@@ -312,7 +372,7 @@ function register(app: App) {
         <span class="muted small">Einnahmen ${formatMoney(income)} · Ausgaben ${formatMoney(spend)} · Endbestand ${formatMoney(closing)}</span>
         <noscript><button class="btn">OK</button></noscript>
       </form>
-      ${rows.length ? entryTable(t, rows, opening, !selectedAcc && list.length > 1) : empty(`Keine Buchungen in ${r.year}.`)}`,
+      ${rows.length ? entryTable(t, rows, opening, !selectedAcc && list.length > 1, await fileCounts(rows.map((x) => x.id))) : empty(`Keine Buchungen in ${r.year}.`)}`,
     });
   });
 
@@ -564,18 +624,30 @@ function register(app: App) {
   app.get('/cashbook/new', async (c) => {
     const t = cbTenant(c);
     const accounts = await needAccounts(c, t);
+    const inbox = await inboxOf(t.id);
+    const chosen = c.req.query('inbox') ? await getInbox(t.id, Number(c.req.query('inbox'))) : undefined;
+    const form = entryForm(c, t, accounts, '/cashbook/entries', { account_id: Number(c.req.query('account') ?? 0) || accounts[0].id, text: chosen?.note || undefined }, inbox, chosen?.id);
     return page(c, {
       title: 'Buchung erfassen',
-      back: { href: '/cashbook', label: 'Kassenbuch' },
-      body: entryForm(c, t, accounts, '/cashbook/entries', { account_id: Number(c.req.query('account') ?? 0) || accounts[0].id }),
+      back: chosen ? { href: '/inbox', label: 'Belegeingang' } : { href: '/cashbook', label: 'Kassenbuch' },
+      body: chosen ? html`<div class="purchase-layout"><div>${form}</div><aside>${inboxPreview(chosen)}</aside></div>` : form,
     });
   });
 
   app.post('/cashbook/entries', async (c) => {
     const t = cbTenant(c);
-    const e = parseEntry(await readForm(c), t);
-    await createManual(t, e, userOf(c).id);
-    return redirectWith(c, `/cashbook?account=${e.account_id}&year=${e.entry_date.slice(0, 4)}`, 'ok', 'Buchung gespeichert.');
+    const form = await readForm(c);
+    const e = parseEntry(form, t);
+    const files = filesFrom(await c.req.parseBody({ all: true }));
+    const taken = await tx(async () => {
+      const newId = await createManual(t, e, userOf(c).id);
+      await attachFiles(t, newId, files, userOf(c).id);
+      return takeInbox(t, form, newId, userOf(c).id);
+    });
+    if (taken) await removeInboxFile(taken);
+    const n = files.length + (taken ? 1 : 0);
+    return redirectWith(c, `/cashbook?account=${e.account_id}&year=${e.entry_date.slice(0, 4)}`, 'ok',
+      n ? `Buchung mit ${n} Beleg(en) gespeichert.` : 'Buchung gespeichert. Belege lassen sich beim Bearbeiten nachreichen.');
   });
 
   app.get('/cashbook/entries/:id/edit', async (c) => {
@@ -583,16 +655,29 @@ function register(app: App) {
     const e = await one<CashEntry>('SELECT * FROM cash_entries WHERE tenant_id = ? AND id = ?', t.id, idParam(c)) ?? notFound();
     const accounts = await accountsOf(t.id, true);
     const locked = !!t.cashbook_locked_until && e.entry_date <= t.cashbook_locked_until;
+    const files = await filesOf(e.id);
+    const inbox = locked ? [] : await inboxOf(t.id);
+    const linked = e.source === 'invoice' || e.source === 'purchase' || e.source === 'donation';
     return page(c, {
       title: e.source === 'transfer' ? 'Umbuchung' : 'Buchung bearbeiten',
       back: { href: `/cashbook?account=${e.account_id}&year=${e.entry_date.slice(0, 4)}`, label: 'Kassenbuch' },
       body: html`
       ${locked ? html`<div class="notice">Abgeschlossen – diese Buchung lässt sich nicht mehr ändern.</div>` : ''}
       ${e.source === 'manual' && !locked
-        ? entryForm(c, t, accounts, `/cashbook/entries/${e.id}`, e)
+        ? entryForm(c, t, accounts, `/cashbook/entries/${e.id}`, e, inbox)
         : html`<section class="card"><dl class="dl">
             <dt>Datum</dt><dd>${formatDate(e.entry_date)}</dd><dt>Text</dt><dd>${e.text}</dd><dt>Betrag</dt><dd>${money(e.amount)}</dd>
             ${e.sphere ? html`<dt>Bereich</dt><dd>${sphereLabel(e.sphere)}</dd>` : ''}</dl></section>`}
+      ${files.length || !linked
+        ? html`<section class="card"><h2>Belege <span class="count">${files.length}</span></h2>
+            ${files.length ? filesList(c, files, !locked) : html`<p class="muted small">Noch kein Beleg angehängt.</p>`}
+            ${!linked && (locked || e.source !== 'manual')
+              ? html`<form method="post" action="/cashbook/entries/${e.id}/files" enctype="multipart/form-data" class="stack">
+                  ${csrfField(c)}${fileUploader('Beleg anhängen (PDF oder Foto)', await inboxOf(t.id))}
+                  <div><button class="btn primary">Hochladen</button></div></form>`
+              : ''}
+          </section>`
+        : ''}
       ${!locked && (e.source === 'manual' || e.source === 'transfer')
         ? html`<div class="danger-zone">${postButton(c, `/cashbook/entries/${e.id}/delete`, e.source === 'transfer' ? 'Umbuchung löschen' : 'Buchung löschen', 'btn danger', 'Wirklich löschen?')}</div>`
         : ''}`,
@@ -602,10 +687,56 @@ function register(app: App) {
   app.post('/cashbook/entries/:id', async (c) => {
     const t = cbTenant(c);
     const e = await one<CashEntry>('SELECT * FROM cash_entries WHERE tenant_id = ? AND id = ?', t.id, idParam(c)) ?? notFound();
-    const input = parseEntry(await readForm(c), t);
-    await updateManual(t, e, input);
+    const form = await readForm(c);
+    const input = parseEntry(form, t);
+    const files = filesFrom(await c.req.parseBody({ all: true }));
+    const taken = await tx(async () => {
+      await updateManual(t, e, input);
+      await attachFiles(t, e.id, files, userOf(c).id);
+      return takeInbox(t, form, e.id, userOf(c).id);
+    });
+    if (taken) await removeInboxFile(taken);
     await audit(c, 'cashbook.entry.update', `${formatDate(e.entry_date)} ${formatMoney(e.amount)} → ${formatDate(input.entry_date)} ${formatMoney(input.amount)}: ${input.text}`);
     return redirectWith(c, `/cashbook?account=${input.account_id}&year=${input.entry_date.slice(0, 4)}`, 'ok', 'Buchung gespeichert.');
+  });
+
+  /** Belege nachreichen – auch zu Zählungen, Umbuchungen und in abgeschlossenen Zeiträumen */
+  app.post('/cashbook/entries/:id/files', async (c) => {
+    const t = cbTenant(c);
+    const e = await one<CashEntry>('SELECT * FROM cash_entries WHERE tenant_id = ? AND id = ?', t.id, idParam(c)) ?? notFound();
+    if (e.source === 'invoice' || e.source === 'purchase' || e.source === 'donation') throw new UserError('Der Beleg dieser Buchung ist die verknüpfte Rechnung bzw. Spende.');
+    const form = await readForm(c);
+    const files = filesFrom(await c.req.parseBody({ all: true }));
+    if (!files.length && !str(form, 'inbox_id')) throw new UserError('Bitte ein PDF oder Foto auswählen.');
+    const taken = await tx(async () => {
+      const k = await attachFiles(t, e.id, files, userOf(c).id);
+      return { k, f: await takeInbox(t, form, e.id, userOf(c).id) };
+    });
+    if (taken.f) await removeInboxFile(taken.f);
+    const n = taken.k + (taken.f ? 1 : 0);
+    await audit(c, 'cashbook.file.add', `${formatDate(e.entry_date)} ${e.text}: ${n} Beleg(e)`);
+    return redirectWith(c, `/cashbook/entries/${e.id}/edit`, 'ok', `${n} Beleg(e) angehängt.`);
+  });
+
+  app.get('/cashbook/files/:id', async (c) => {
+    const t = cbTenant(c);
+    const f = await getFile(t.id, idParam(c)) ?? notFound();
+    return c.body(new Uint8Array(await readEntryFile(f)), 200, {
+      'Content-Type': f.file_mime,
+      'Content-Disposition': attachment(f.file_name, c.req.query('inline') === '1'),
+      'Cache-Control': 'private, no-store',
+      'X-Content-Type-Options': 'nosniff',
+    });
+  });
+
+  app.post('/cashbook/files/:id/delete', async (c) => {
+    const t = cbTenant(c);
+    const f = await getFile(t.id, idParam(c)) ?? notFound();
+    const e = (await one<CashEntry>('SELECT * FROM cash_entries WHERE id = ?', f.entry_id))!;
+    assertOpen(t, e.entry_date);
+    await deleteFile(f);
+    await audit(c, 'cashbook.file.delete', `${formatDate(e.entry_date)} ${e.text}: ${f.file_name}`);
+    return redirectWith(c, `/cashbook/entries/${e.id}/edit`, 'ok', 'Beleg entfernt.');
   });
 
   app.post('/cashbook/entries/:id/delete', async (c) => {
