@@ -68,7 +68,7 @@ function register(app: App) {
   app.get('/capture', async (c) => {
     const t = tenantOf(c);
     const q = c.req.query('target');
-    const target: Target = q === 'purchase' || q === 'later' || (q === 'cash' && cashbookEnabled(t)) ? q : 'purchase';
+    const target: Target = q === 'purchase' || q === 'later' || (q === 'cash' && cashbookEnabled(t)) ? q : 'later';
     return page(c, {
       title: 'Beleg erfassen',
       back: { href: '/', label: 'Übersicht' },
