@@ -3,7 +3,7 @@ import { accountsOf, bookLinked, cashbookEnabled, getAccount, linkedEntry, unlin
 import { accountSelect } from '../cashbook/routes.ts';
 import { all, one, tx } from '../../db/index.ts';
 import { audit } from '../../lib/audit.ts';
-import { formatDate, isIsoDate, monthEnd, monthLabel, today } from '../../lib/dates.ts';
+import { formatDate, isIsoDate, monthEnd, monthLabel, paidPeriod, today } from '../../lib/dates.ts';
 import { readStoredFile } from '../../lib/files.ts';
 import { categoryLabel } from '../../lib/expenses.ts';
 import { html, type SafeHtml } from '../../lib/html.ts';
@@ -118,6 +118,14 @@ function register(app: App) {
       where += " AND p.status <> 'draft' AND p.issue_date >= ? AND p.issue_date <= ?";
       params.push(`${month}-01`, monthEnd(month));
     }
+    // Zahlungszeitraum (aus der Übersicht): in Jahr/Monat bezahlte Eingangsrechnungen
+    const paidParam = c.req.query('paid') ?? '';
+    const paid = paidPeriod(paidParam) ? paidParam : '';
+    if (paid) {
+      const pp = paidPeriod(paid)!;
+      where += " AND p.status = 'paid' AND p.paid_at >= ? AND p.paid_at <= ?";
+      params.push(pp.from, pp.to);
+    }
     if (q) {
       where += ' AND (p.number LIKE ? OR p.description LIKE ? OR p.file_name LIKE ? OR c.company LIKE ? OR c.name LIKE ?)';
       params.push(...Array(5).fill(`%${q}%`));
@@ -136,6 +144,7 @@ function register(app: App) {
       const qs = new URLSearchParams();
       if (st) qs.set('status', st);
       if (month) qs.set('month', month);
+      if (paid) qs.set('paid', paid);
       return `/purchases${qs.size ? `?${qs}` : ''}`;
     };
     return page(c, {
@@ -148,11 +157,13 @@ function register(app: App) {
         ${status ? html`<input type="hidden" name="status" value="${status}">` : ''}
         ${month ? html`<input type="hidden" name="month" value="${month}">
           <a class="filter-chip" href="/purchases${status ? `?status=${status}` : ''}" title="Monatsfilter entfernen">${monthLabel(month)} <span aria-hidden="true">×</span><span class="sr-only">Filter entfernen</span></a>` : ''}
+        ${paid ? html`<input type="hidden" name="paid" value="${paid}">
+          <a class="filter-chip" href="/purchases${status ? `?status=${status}` : ''}" title="Filter entfernen">${paidPeriod(paid)!.label} <span aria-hidden="true">×</span><span class="sr-only">Filter entfernen</span></a>` : ''}
         <input type="search" name="q" value="${q}" placeholder="Suchen …" aria-label="Suchen">
       </form>
       ${rows.length
         ? html`${purchaseTable(rows)}<p class="muted small right">${rows.length} Beleg(e)${counted.length ? ` · netto ${formatMoney(netSum)} · brutto ${formatMoney(sum)}` : ''}</p>`
-        : empty(status || q || month ? 'Keine Eingangsrechnungen gefunden.' : 'Noch keine Eingangsrechnungen – lade oben deinen ersten Beleg hoch.')}`,
+        : empty(status || q || month || paid ? 'Keine Eingangsrechnungen gefunden.' : 'Noch keine Eingangsrechnungen – lade oben deinen ersten Beleg hoch.')}`,
     });
   });
 

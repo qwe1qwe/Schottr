@@ -750,10 +750,14 @@ test('Eingangsrechnungen: E-Rechnung, Scan, manuell, Export und Übersicht', opt
   const dash = await (await req('/?year=2026')).text();
   assert.match(dash, /Verbindlichkeiten/);
   assert.match(dash, /Umsatz und Ausgaben 2026/);
-  assert.match(dash, /href="\/purchases\?month=2026-09"/);
+  assert.match(dash, /href="\/purchases\?paid=2026-09"/);
   assert.match(dash, /Größte Verbindlichkeiten/);
   assert.match(dash, /PM-1/);
-  assert.match(dash, /September 2026: Umsatz [^"]* · Ausgaben 250,00.€/);
+  // nach Zahlungsdatum: nur die bezahlte Tankquittung (100 € netto), PM-1 ist noch offen
+  assert.match(dash, /September 2026: Umsatz [^"]* · Ausgaben 100,00.€/);
+  const paidList = await (await req('/purchases?paid=2026-09')).text();
+  assert.match(paidList, /B-77/);
+  assert.doesNotMatch(paidList, /PM-1/);
 
   // 5) Export: DATEV (nur Eingang), Rechnungseingangsbuch, ZIP
   const q = 'from=2026-09-01&to=2026-09-30';
@@ -869,7 +873,7 @@ test('Gemeinnütziger Verein: Bereich je Rechnung, Grenzen in der Übersicht, Vo
 
   const d = new Date().toISOString().slice(0, 10);
   const year = d.slice(0, 4);
-  const invoice = async (sphere: string, price: string) => {
+  const invoice = async (sphere: string, price: string, paid = true) => {
     const r = await req('/invoices', {
       form: {
         contact_id: contactId, type_code: '380', issue_date: d, due_date: d, service_mode: 'date', service_date: d, sphere,
@@ -879,6 +883,7 @@ test('Gemeinnütziger Verein: Bereich je Rechnung, Grenzen in der Übersicht, Vo
     const id = location(r).split('/').pop()!;
     assert.match(id, /^\d+$/);
     await req(`/invoices/${id}/finalize`, { form: {} });
+    if (paid) await req(`/invoices/${id}/paid`, { form: { paid_at: d } });
     const doc = (await one('SELECT * FROM documents WHERE id = ?', Number(id)))!;
     assert.ok(doc.finalized_at, 'festgeschrieben');
     assert.equal(doc.sphere, sphere);
@@ -886,8 +891,12 @@ test('Gemeinnütziger Verein: Bereich je Rechnung, Grenzen in der Übersicht, Vo
   };
   // Sponsoring 42.000 € brutto (wirtschaftlicher Geschäftsbetrieb) und 1.190 € brutto ideeller Bereich
   const sponsoring = await invoice('business', '35294,12');
-  const beitrag = await invoice('ideell', '1000');
+  const beitrag = await invoice('ideell', '1000', false); // bleibt offen (wird im Kassenbuch-Test bezahlt)
   assert.equal(sponsoring.gross_total, 4200000);
+  assert.equal(sponsoring.paid_at, d);
+  // unbezahlt zählt noch nicht (Zuflussprinzip)
+  const offen = await invoice('business', '5000', false);
+  assert.equal(offen.paid_at, null);
 
   // Vorstand statt Geschäftsführer im XML
   const xml = await (await req(`/invoices/${sponsoring.id}/xrechnung.xml`)).text();
@@ -900,8 +909,8 @@ test('Gemeinnütziger Verein: Bereich je Rechnung, Grenzen in der Übersicht, Vo
   assert.match(page, /§ 64 Abs\. 3 AO/);
   assert.match(page, /aria-valuemax="5000000" aria-valuenow="4200000"/);
   assert.match(page, /ku-status ku-warn"><strong>Achtung:<\/strong> nur noch/);
-  assert.match(page, /aria-valuemax="10000000" aria-valuenow="4319000"/, 'Einnahmen gesamt gegen 100.000 €');
-  assert.match(page, new RegExp(`href="/invoices\\?year=${year}&amp;sphere=ideell"`));
+  assert.match(page, /aria-valuemax="10000000" aria-valuenow="4200000"/, 'Einnahmen gesamt gegen 100.000 € – nur bezahlte Rechnungen');
+  assert.match(page, new RegExp(`href="/invoices\\?paid=${year}&amp;sphere=ideell"`));
   assert.doesNotMatch(page, /Sportliche Veranstaltungen \d{4}/, 'ohne Sporteinnahmen keine Sportzeile');
 
   // Liste nach Jahr und Bereich filtern
@@ -1170,6 +1179,8 @@ test('Kassenbuch: Konten, Zuordnung, Umbuchung, Kassenzählung, Abschluss, Steue
   // Gemeinnützigkeits-Kachel: Barumsatz aus der Kassenzählung zählt im wirtschaftlichen Geschäftsbetrieb mit
   page = await (await req('/')).text();
   assert.match(page, /bar ohne Rechnung 90,00.€/);
+  // Umsatz-Kachel enthält die Bareinnahmen ohne Rechnung
+  assert.match(page, /class="kpi-big"[^>]*><strong class="num">[^<]*<\/strong>\s*<small>[^<]*bar ohne Rechnung/);
 
   // Eingangsrechnung mit „Bezahlt am“: Konto ist Pflicht und wird gebucht
   const purchaseCount = async () => Number((await one('SELECT COUNT(*) n FROM purchase_invoices WHERE tenant_id = ?', t.id))!.n);

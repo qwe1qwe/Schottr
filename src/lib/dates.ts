@@ -37,6 +37,15 @@ export function monthLabel(ym: string): string | null {
   return m ? `${MONTH_NAMES[Number(m[2]) - 1]} ${m[1]}` : null;
 }
 
+/**
+ * Zahlungszeitraum aus der Übersicht: Jahr „2026“ oder Monat „2026-10“ → Von/Bis und Bezeichnung
+ */
+export function paidPeriod(v: string): { from: string; to: string; label: string } | null {
+  if (/^\d{4}$/.test(v)) return { from: `${v}-01-01`, to: `${v}-12-31`, label: `bezahlt ${v}` };
+  const label = monthLabel(v);
+  return label ? { from: `${v}-01`, to: monthEnd(v), label: `bezahlt im ${label}` } : null;
+}
+
 /** Letzter Tag eines Monats "2026-02" → "2026-02-28" */
 export function monthEnd(ym: string): string {
   const [y, m] = ym.split('-').map(Number);

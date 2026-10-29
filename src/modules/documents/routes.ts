@@ -4,7 +4,7 @@ import { html, nl2br, selected, type SafeHtml } from '../../lib/html.ts';
 import { isSphere, sphereLabel, sphereSelect, SPHERES } from '../../lib/nonprofit.ts';
 import { accountsOf, bookLinked, cashbookEnabled, getAccount, linkedEntry, unlink } from '../cashbook/repo.ts';
 import { accountSelect } from '../cashbook/routes.ts';
-import { addDays, formatDate, isIsoDate, monthEnd, monthLabel, today } from '../../lib/dates.ts';
+import { addDays, formatDate, isIsoDate, monthEnd, monthLabel, paidPeriod, today } from '../../lib/dates.ts';
 import { formatMoney, formatQuantity, formatRate, formatAmount, parseDecimal } from '../../lib/money.ts';
 import { unitShort } from '../../lib/units.ts';
 import { attachment, idParam, notFound, readForm, redirectWith, str, tenantOf, userOf, UserError } from '../../lib/http.ts';
@@ -191,6 +191,14 @@ function register(app: App, kind: Kind) {
       where += ' AND d.finalized_at IS NOT NULL AND d.issue_date >= ? AND d.issue_date <= ?';
       params.push(`${month}-01`, monthEnd(month));
     }
+    // Zahlungszeitraum (aus Umsatz-Kachel und Diagramm der Übersicht): in Jahr/Monat bezahlte Rechnungen
+    const paidParam = kind === 'invoice' ? (c.req.query('paid') ?? '') : '';
+    const paid = paidPeriod(paidParam) ? paidParam : '';
+    if (paid) {
+      const pp = paidPeriod(paid)!;
+      where += ' AND d.paid_at >= ? AND d.paid_at <= ?';
+      params.push(pp.from, pp.to);
+    }
     // Jahr und Tätigkeitsbereich (aus der Gemeinnützigkeits-Kachel der Übersicht)
     const yearParam = kind === 'invoice' && !month ? (c.req.query('year') ?? '') : '';
     const year = /^\d{4}$/.test(yearParam) ? yearParam : '';
@@ -224,18 +232,20 @@ function register(app: App, kind: Kind) {
       if (month) qs.set('month', month);
       if (year) qs.set('year', year);
       if (sphere) qs.set('sphere', sphere);
+      if (paid) qs.set('paid', paid);
       return `${base}${qs.size ? `?${qs}` : ''}`;
     };
     /** Link ohne einen der Filter (für die Filter-Chips) */
-    const without = (key: 'month' | 'year' | 'sphere') => {
+    const without = (key: 'month' | 'year' | 'sphere' | 'paid') => {
       const qs = new URLSearchParams();
       if (status) qs.set('status', status);
+      if (paid && key !== 'paid') qs.set('paid', paid);
       if (month && key !== 'month') qs.set('month', month);
       if (year && key !== 'year') qs.set('year', year);
       if (sphere && key !== 'sphere') qs.set('sphere', sphere);
       return `${base}${qs.size ? `?${qs}` : ''}`;
     };
-    const chip = (key: 'month' | 'year' | 'sphere', label: string) =>
+    const chip = (key: 'month' | 'year' | 'sphere' | 'paid', label: string) =>
       html`<a class="filter-chip" href="${without(key)}" title="Filter entfernen">${label} <span aria-hidden="true">×</span><span class="sr-only">Filter entfernen</span></a>`;
     return page(c, {
       title: k.many,
@@ -248,11 +258,12 @@ function register(app: App, kind: Kind) {
         ${status ? html`<input type="hidden" name="status" value="${status}">` : ''}
         ${month ? html`<input type="hidden" name="month" value="${month}">${chip('month', monthLabel(month) ?? month)}` : ''}
         ${year ? html`<input type="hidden" name="year" value="${year}">${chip('year', year)}` : ''}
+        ${paid ? html`<input type="hidden" name="paid" value="${paid}">${chip('paid', paidPeriod(paid)!.label)}` : ''}
         ${sphere ? html`<input type="hidden" name="sphere" value="${sphere}">${chip('sphere', sphereLabel(sphere))}` : ''}
         <input type="search" name="q" value="${q}" placeholder="Suchen …" aria-label="Suchen">
       </form>
       ${rows.length
-        ? html`${documentTable(rows, kind)}<p class="muted small right">${rows.length} Beleg(e) · ${month || year || sphere ? `netto ${formatMoney(netSum)} · brutto ` : 'Summe '}${formatMoney(sum)}</p>`
+        ? html`${documentTable(rows, kind)}<p class="muted small right">${rows.length} Beleg(e) · ${month || year || sphere || paid ? `netto ${formatMoney(netSum)} · brutto ` : 'Summe '}${formatMoney(sum)}</p>`
         : empty(`Keine ${k.many} gefunden.`, html`<a class="btn primary" href="${base}/new">${kind === 'quote' ? 'Angebot schreiben' : 'Rechnung schreiben'}</a>`)}`,
     });
   });
