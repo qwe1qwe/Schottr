@@ -227,6 +227,8 @@ button.icon:hover { background: var(--danger-soft); color: var(--danger); }
 form.inline { display: inline; }
 .btn.small { font-size: .8rem; padding: .35rem .6rem; }
 form.inline.sphere-form { display: inline-flex; flex-wrap: wrap; gap: .4rem; align-items: center; }
+form.inline.count-date { display: inline-flex; gap: .4rem; align-items: center; margin-right: .75rem; }
+form.inline.count-date input { width: auto; padding-block: .2rem; }
 .sphere-form select { width: auto; max-width: 100%; padding: .25rem 1.6rem .25rem .5rem; font-size: .88rem; }
 .danger-zone { display: flex; gap: .5rem; flex-wrap: wrap; margin-top: 2rem; padding-top: 1rem; border-top: 1px solid var(--line); }
 

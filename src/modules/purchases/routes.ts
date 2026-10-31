@@ -268,7 +268,7 @@ function register(app: App) {
         <a class="btn" href="/purchases/${p.id}/edit">Bearbeiten</a>
         ${p.status === 'paid'
           ? postButton(c, `/purchases/${p.id}/open`, 'Als offen markieren', 'btn ghost', payment ? 'Wieder als offen markieren? Die Buchung im Kassenbuch wird entfernt.' : undefined)
-          : html`<form method="post" action="/purchases/${p.id}/paid" class="inline paid-form">${csrfField(c)}
+          : html`<form method="post" action="/purchases/${p.id}/paid" class="inline paid-form" data-count-check data-count-date="paid_at">${csrfField(c)}
               <input type="date" name="paid_at" value="${today()}" aria-label="Bezahlt am" required>
               ${cashAccounts.length ? html`${accountSelect(cashAccounts, cashAccounts.find((a) => a.kind === 'bank')?.id)}
                 <input name="amount" class="num amount-input" inputmode="decimal" aria-label="Betrag" value="${formatAmount(payable(p)).replace(/\./g, '')}">` : ''}

@@ -78,7 +78,7 @@ async function donorOptions(tenantId: number, includeId = 0): Promise<Contact[]>
 
 function donationForm(c: Ctx, t: Tenant, action: string, d: Partial<DonationInput>, contacts: Contact[], cash: { accounts: CashAccount[]; selected?: number | null } = { accounts: [] }): SafeHtml {
   const kind = d.kind ?? 'money';
-  return html`<form method="post" action="${action}" class="card stack" data-donation-form>
+  return html`<form method="post" action="${action}" class="card stack" data-donation-form data-count-check data-count-date="donation_date">
     ${csrfField(c)}
     <div class="grid-2">
       <label class="span-2">Zuwendender

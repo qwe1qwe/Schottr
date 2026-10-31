@@ -10,6 +10,53 @@
     }
   });
 
+  /* ---------- Nachträgliche Buchung vor einer Kassenzählung: Hinweis vorher ---------- */
+  // Formulare mit data-count-check: Konto-Feld(er) in data-count-accounts (Standard account_id),
+  // Datumsfeld in data-count-date (Standard entry_date), bisheriger Stand beim Bearbeiten in
+  // data-count-orig („Konto:Datum“). Liegt eine Zählung dieser Kasse am oder nach dem Tag,
+  // wird vor dem Speichern gefragt – die Zählungen werden danach neu berechnet.
+  let countDates = null;
+  const countForms = [...document.querySelectorAll('form[data-count-check]')];
+  const hasAccountField = (f) => (f.dataset.countAccounts || 'account_id').split(',').some((n) => f.elements.namedItem(n));
+  if (countForms.some(hasAccountField)) {
+    fetch('/cashbook/counts.json', { credentials: 'same-origin', headers: { accept: 'application/json' } })
+      .then((r) => (r.ok ? r.json() : {}))
+      .then((d) => { countDates = d; })
+      .catch(() => { countDates = {}; });
+  }
+  const deDate = (d) => d.split('-').reverse().join('.');
+  document.addEventListener('submit', (e) => {
+    const form = e.target;
+    if (!(form instanceof HTMLFormElement) || !form.hasAttribute('data-count-check') || !countDates || e.defaultPrevented) return;
+    const dateField = form.elements.namedItem(form.dataset.countDate || 'entry_date');
+    const date = dateField && 'value' in dateField ? dateField.value : '';
+    const checks = [];
+    if (date) {
+      for (const n of (form.dataset.countAccounts || 'account_id').split(',')) {
+        const el = form.elements.namedItem(n);
+        if (el && 'value' in el && el.value) checks.push([el.value, date]);
+      }
+    }
+    const orig = (form.dataset.countOrig || '').split(':');
+    if (orig[0] && orig[1]) checks.push([orig[0], orig[1]]);
+    // je Kasse der früheste betroffene Tag
+    const from = {};
+    for (const [acc, d] of checks) if (!from[acc] || d < from[acc]) from[acc] = d;
+    const lines = [];
+    for (const [acc, d] of Object.entries(from)) {
+      const info = countDates[acc];
+      const later = info ? info.dates.filter((x) => x >= d) : [];
+      if (!later.length) continue;
+      lines.push(later.length === 1
+        ? `• ${info.name}: Zählung vom ${deDate(later[0])}`
+        : `• ${info.name}: ${later.length} Zählungen vom ${deDate(later[0])} bis ${deDate(later[later.length - 1])}`);
+    }
+    if (!lines.length) return;
+    const msg = `Diese Buchung betrifft bereits erfasste Kassenzählungen:\n\n${lines.join('\n')}\n\n`
+      + 'Der gezählte Bestand bleibt, Buchbestand und Differenz (z. B. Einnahmen ohne Einzelbeleg) werden neu berechnet. Fortfahren?';
+    if (!window.confirm(msg)) e.preventDefault();
+  });
+
   // Auswahlfelder, die sofort absenden
   document.addEventListener('change', (e) => {
     const el = e.target;

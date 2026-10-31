@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
 import { HTTPException } from 'hono/http-exception';
 import { config } from '../config.ts';
@@ -77,7 +78,19 @@ export function takeFlash(c: Ctx): { type: FlashType; message: string } | null {
   }
 }
 
+/**
+ * Hinweise aus tieferen Schichten (z. B. „Kassenzählung neu berechnet“), die an die nächste
+ * Erfolgsmeldung der Anfrage angehängt werden.
+ */
+const notesStore = new AsyncLocalStorage<string[]>();
+export const withNotes = <T>(fn: () => Promise<T>) => notesStore.run([], fn);
+export function addNote(message: string) {
+  notesStore.getStore()?.push(message);
+}
+
 export function redirectWith(c: Ctx, to: string, type: FlashType, message: string) {
+  const notes = type === 'ok' ? notesStore.getStore() ?? [] : [];
+  if (notes.length) message = [message, ...notes].join(' ');
   flash(c, type, message);
   return c.redirect(to, 303);
 }

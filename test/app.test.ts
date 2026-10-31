@@ -1196,6 +1196,36 @@ test('Kassenbuch: Konten, Zuordnung, Umbuchung, Kassenzählung, Abschluss, Steue
   assert.equal(await balance(kasse), 20050);
   page = await (await req(`/cashbook/counts?account=${kasse}`)).text();
   assert.match(page, /nur Gesamtsumme/);
+  // Datum ändern: zwischen den Nachbarn, nicht in die Zukunft
+  assert.match(page, new RegExp(`/cashbook/counts/${count.id}/date`));
+  assert.match(page, new RegExp(`/cashbook/counts/${count2.id}/date`));
+  const yesterday = new Date(Date.parse(today) - 86400000).toISOString().slice(0, 10);
+  const tomorrow = new Date(Date.parse(today) + 86400000).toISOString().slice(0, 10);
+  r = await req(`/cashbook/counts/${count2.id}/date`, { form: { count_date: yesterday } });
+  assert.match(flashOf(r), /vor der vorherigen Zählung/);
+  r = await req(`/cashbook/counts/${count.id}/date`, { form: { count_date: tomorrow } });
+  assert.match(flashOf(r), /Zukunft/);
+  assert.equal((await one('SELECT count_date FROM cash_counts WHERE id = ?', count.id))!.count_date, today);
+
+  // Nachträgliche Ausgabe vor den Zählungen (10 € aus der Kasse genommen): die erste Zählung wird
+  // neu gerechnet – Buchbestand 126 €, Differenz 100 € statt 90 €; die zweite bleibt unverändert
+  const counts = await (await req('/cashbook/counts.json')).json() as Record<string, { name: string; dates: string[] }>;
+  assert.deepEqual(counts[kasse].dates, [today, today]);
+  r = await req('/cashbook/entries', { form: { account_id: String(kasse), entry_date: today, direction: 'out', amount: '10', text: 'Briefmarken nachgetragen', sphere: 'ideell', vat_rate: '0' } });
+  assert.match(flashOf(r), /Kassenzählung „[^“]+“ vom .* neu berechnet: Differenz 90,00.€ → 100,00.€/);
+  let k1 = (await one('SELECT * FROM cash_counts WHERE id = ?', count.id))!;
+  assert.equal(k1.book_balance, 12600);
+  assert.equal(k1.difference, 10000);
+  assert.equal((await one('SELECT amount FROM cash_entries WHERE count_id = ?', count.id))!.amount, 10000);
+  assert.equal((await one('SELECT difference FROM cash_counts WHERE id = ?', count2.id))!.difference, -2550);
+  assert.equal(await balance(kasse), 20050, 'Kassenstand = zuletzt gezählter Bestand');
+  // Buchung wieder löschen → zurück auf 90 €
+  const nachtrag = (await one("SELECT id FROM cash_entries WHERE tenant_id = ? AND text = 'Briefmarken nachgetragen'", t.id))!;
+  r = await req(`/cashbook/entries/${nachtrag.id}/delete`, { form: {} });
+  k1 = (await one('SELECT * FROM cash_counts WHERE id = ?', count.id))!;
+  assert.equal(k1.difference, 9000);
+  assert.equal(k1.book_balance, 13600);
+  assert.equal(await balance(kasse), 20050);
   // ohne Summe → Fehler, nichts gespeichert
   r = await req('/cashbook/count', { form: { account_id: String(kasse), count_date: today, count_mode: 'total', counted_total: '' } });
   assert.equal((await all('SELECT id FROM cash_counts WHERE account_id = ?', kasse)).length, 2);

@@ -764,4 +764,12 @@ export const migrations: { version: number; statements: string[] }[] = [
       ) ${TABLE}`,
     ],
   },
+  {
+    version: 14,
+    statements: [
+      // Datum einer Kassenzählung ist änderbar – abgeschlossene Zeiträume bleiben auch hier gesperrt
+      `CREATE TRIGGER cash_counts_lock_upd BEFORE UPDATE ON cash_counts FOR EACH ROW
+       IF OLD.count_date <= COALESCE((SELECT cashbook_locked_until FROM tenants WHERE id = OLD.tenant_id), '0000-01-01') OR NEW.count_date <= COALESCE((SELECT cashbook_locked_until FROM tenants WHERE id = NEW.tenant_id), '0000-01-01') THEN ${forbid('Das Kassenbuch ist fuer diesen Zeitraum abgeschlossen')}; END IF`,
+    ],
+  },
 ];

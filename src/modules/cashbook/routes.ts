@@ -15,7 +15,7 @@ import type { App, Ctx, Module, Tenant } from '../../types.ts';
 import { assignToEntry, getInbox, inboxOf, removeInboxFile, type InboxFile } from '../inbox/repo.ts';
 import {
   bookDue, getRecurring, nextDue, pendingDues, recurringOf, RHYTHMS, skipDue, type PendingDue, type Recurring, type Rhythm,
-  accountsOf, assertOpen, balanceAt, balances, bookLinked, cashbookEnabled, createManual, createTransfer, deleteCount, deleteEntry, DENOMINATIONS,
+  accountsOf, assertOpen, balanceAt, balances, bookLinked, cashbookEnabled, changeCountDate, createManual, recalcCounts, createTransfer, deleteCount, deleteEntry, DENOMINATIONS,
   entriesOf, entrySphere, getAccount, history, lastCount, saveCount, SOURCE_LABELS, unassigned, updateManual,
   type CashAccount, type CashCount, type CashEntry, type EntryInput, type EntryRow, type LinkSource,
 } from './repo.ts';
@@ -176,7 +176,8 @@ function filesList(c: Ctx, files: EntryFile[], canDelete: boolean): SafeHtml {
 function entryForm(c: Ctx, t: Tenant, accounts: CashAccount[], action: string, e: Partial<CashEntry>, inbox: InboxFile[] = [], inboxId?: number): SafeHtml {
   // Beleg aus dem Belegeingang (Quittung, Kassenbon) ist meist eine Ausgabe
   const out = (e.amount ?? 0) < 0 || (!e.id && !!inboxId);
-  return html`<form method="post" action="${action}" class="card stack" enctype="multipart/form-data">
+  return html`<form method="post" action="${action}" class="card stack" enctype="multipart/form-data"
+    data-count-check ${e.id ? html`data-count-orig="${e.account_id}:${e.entry_date}"` : ''}>
     ${csrfField(c)}
     <fieldset class="inline-radio"><legend>Art</legend>
       <label class="check"><input type="radio" name="direction" value="in"${checked(!out)}> Einnahme</label>
@@ -354,7 +355,7 @@ function register(app: App) {
             <ul class="plain assign-list">${open.slice(0, 50).map((u) => html`<li>
               <span><a href="${u.href}">${u.label}</a><span class="muted small"> · ${formatDate(u.date)}</span></span>
               <strong class="num">${formatMoney(u.amount)}</strong>
-              <form method="post" action="/cashbook/assign" class="inline-form">
+              <form method="post" action="/cashbook/assign" class="inline-form" data-count-check>
                 ${csrfField(c)}<input type="hidden" name="source" value="${u.source}"><input type="hidden" name="id" value="${u.id}">
                 <input type="hidden" name="entry_date" value="${u.date}"><input type="hidden" name="amount" value="${formatAmount(u.amount).replace(/\./g, '')}">
                 ${accountSelect(allAccounts, selectedAcc?.id)}
@@ -474,7 +475,11 @@ function register(app: App) {
     if (v.opening_date !== a.opening_date || v.opening_balance !== a.opening_balance) assertOpen(t, a.opening_date, v.opening_date);
     const first = await one<{ d: string | null }>('SELECT MIN(entry_date) d FROM cash_entries WHERE account_id = ?', a.id);
     if (first?.d && v.opening_date > String(first.d)) throw new UserError(`Es gibt Buchungen ab ${formatDate(String(first.d))} – das Eröffnungsdatum muss davor liegen.`);
-    await run('UPDATE cash_accounts SET name = ?, kind = ?, iban = ?, opening_date = ?, opening_balance = ? WHERE id = ?', v.name, v.kind, v.iban, v.opening_date, v.opening_balance, a.id);
+    await tx(async () => {
+      await run('UPDATE cash_accounts SET name = ?, kind = ?, iban = ?, opening_date = ?, opening_balance = ? WHERE id = ?', v.name, v.kind, v.iban, v.opening_date, v.opening_balance, a.id);
+      // geänderter Anfangsbestand verschiebt die Buchbestände aller Zählungen
+      if (v.opening_balance !== a.opening_balance || v.opening_date !== a.opening_date) await recalcCounts(t, a.id, '1000-01-01');
+    });
     await audit(c, 'cashbook.account.update', `${v.name}: Anfangsbestand ${formatMoney(v.opening_balance)} am ${formatDate(v.opening_date)}`);
     return redirectWith(c, '/cashbook/accounts', 'ok', 'Konto gespeichert.');
   });
@@ -764,7 +769,7 @@ function register(app: App) {
     return page(c, {
       title: 'Umbuchung',
       back: { href: '/cashbook', label: 'Kassenbuch' },
-      body: html`<form method="post" action="/cashbook/transfer" class="card stack narrow">
+      body: html`<form method="post" action="/cashbook/transfer" class="card stack narrow" data-count-check data-count-accounts="from_id,to_id">
         ${csrfField(c)}
         <p class="muted small">Geld wechselt das Konto, z. B. Bareinzahlung aus der Kasse aufs Girokonto oder Abhebung für das Wechselgeld. Keine Einnahme, keine Ausgabe.</p>
         <div class="grid-2">
@@ -870,7 +875,11 @@ function register(app: App) {
     const acc = cash.find((a) => a.id === Number(c.req.query('account') ?? 0)) ?? cash[0];
     if (!acc) throw new UserError('Es gibt noch keine Bargeldkasse.');
     const counts = await all<CashCount>('SELECT * FROM cash_counts WHERE account_id = ? ORDER BY count_date DESC, id DESC', acc.id);
-    const lastId = counts[0]?.id;
+    // Datumsgrenzen je Zählung: zwischen den Nachbarn, nicht vor Kontoeröffnung bzw. Abschluss
+    const lock = t.cashbook_locked_until ? addDays(t.cashbook_locked_until, 1) : '';
+    const minOf = (i: number) => [counts[i + 1]?.count_date ?? '', acc.opening_date, lock].sort().at(-1)!;
+    const maxOf = (i: number) => (i > 0 && counts[i - 1].count_date < today() ? counts[i - 1].count_date : today());
+    const isOpen = (k: CashCount) => !(t.cashbook_locked_until && k.count_date <= t.cashbook_locked_until);
     return page(c, {
       title: `Zählprotokolle ${acc.name}`,
       back: { href: `/cashbook?account=${acc.id}`, label: 'Kassenbuch' },
@@ -878,7 +887,7 @@ function register(app: App) {
       body: counts.length
         ? html`<div class="card flush"><table class="table">
             <thead><tr><th>Datum</th><th>Stückelung</th><th class="right">Buchbestand</th><th class="right">Gezählt</th><th class="right">Differenz</th><th></th></tr></thead>
-            <tbody>${counts.map((k) => {
+            <tbody>${counts.map((k, i) => {
               const den = JSON.parse(k.denominations) as Record<string, number>;
               return html`<tr>
                 <td>${formatDate(k.count_date)}${k.note ? html`<div class="muted small">${k.note}</div>` : ''}</td>
@@ -886,12 +895,42 @@ function register(app: App) {
                 <td class="right num">${formatMoney(k.book_balance)}</td>
                 <td class="right num">${formatMoney(k.counted)}</td>
                 <td class="right">${money(k.difference)}</td>
-                <td class="right">${k.id === lastId && !(t.cashbook_locked_until && k.count_date <= t.cashbook_locked_until)
-                  ? postButton(c, `/cashbook/counts/${k.id}/delete`, 'Löschen', 'link danger', 'Zählung samt Differenzbuchung löschen?') : ''}</td>
+                <td class="right">${isOpen(k)
+                  ? html`<form method="post" action="/cashbook/counts/${k.id}/date" class="inline count-date"
+                      data-confirm="Datum der Zählung ändern? Buchbestand und Differenz dieser und späterer Zählungen werden neu berechnet.">${csrfField(c)}
+                      <input type="date" name="count_date" value="${k.count_date}" min="${minOf(i)}" max="${maxOf(i)}" required aria-label="Neues Datum der Zählung">
+                      <button class="link">Datum ändern</button></form>
+                    ${postButton(c, `/cashbook/counts/${k.id}/delete`, 'Löschen', 'link danger',
+                      i > 0 ? 'Zählung samt Differenzbuchung löschen? Die späteren Zählungen werden neu berechnet.' : 'Zählung samt Differenzbuchung löschen?')}` : ''}</td>
               </tr>`;
             })}</tbody></table></div>`
         : empty('Noch keine Zählungen.'),
     });
+  });
+
+  app.post('/cashbook/counts/:id/date', async (c) => {
+    const t = cbTenant(c);
+    const k = await one<CashCount & { tenant_id: number }>('SELECT * FROM cash_counts WHERE tenant_id = ? AND id = ?', t.id, idParam(c)) ?? notFound();
+    const a = (await getAccount(t.id, k.account_id))!;
+    const form = await readForm(c);
+    const date = str(form, 'count_date');
+    const { changed } = await changeCountDate(t, a, k, date);
+    if (!changed) return redirectWith(c, `/cashbook/counts?account=${a.id}`, 'ok', 'Das Datum ist unverändert.');
+    await audit(c, 'cashbook.count.date', `${a.name}: ${formatDate(k.count_date)} → ${formatDate(date)}`);
+    return redirectWith(c, `/cashbook/counts?account=${a.id}`, 'ok', `Datum der Zählung auf ${formatDate(date)} geändert.`);
+  });
+
+  /** Zähltage je Bargeldkasse – für den Hinweis vor nachträglichen Buchungen (public/app.js) */
+  app.get('/cashbook/counts.json', async (c) => {
+    const t = tenantOf(c);
+    if (!cashbookEnabled(t)) return c.json({});
+    const rows = await all<{ account_id: number; name: string; count_date: string }>(
+      `SELECT k.account_id, a.name, k.count_date FROM cash_counts k JOIN cash_accounts a ON a.id = k.account_id
+       WHERE k.tenant_id = ? ORDER BY k.count_date`, t.id,
+    );
+    const out: Record<number, { name: string; dates: string[] }> = {};
+    for (const r of rows) (out[r.account_id] ??= { name: r.name, dates: [] }).dates.push(String(r.count_date));
+    return c.json(out);
   });
 
   app.post('/cashbook/counts/:id/delete', async (c) => {

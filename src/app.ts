@@ -7,7 +7,7 @@ import { serveStatic } from '@hono/node-server/serve-static';
 import { all, one } from './db/index.ts';
 import { loadSession, safeEqual, destroySession } from './lib/auth.ts';
 import { html } from './lib/html.ts';
-import { SESSION_COOKIE, UserError, clearSessionCookie, redirectWith } from './lib/http.ts';
+import { SESSION_COOKIE, UserError, clearSessionCookie, redirectWith, withNotes } from './lib/http.ts';
 import { page, barePage, setNav } from './views/layout.ts';
 import { modules } from './modules/index.ts';
 import type { AppEnv, Tenant, User, Role } from './types.ts';
@@ -54,6 +54,9 @@ export function createApp() {
   app.use('/static/*', serveStatic({ root: './public', rewriteRequestPath: (p) => p.replace(/^\/static/, '') }));
   app.use('/fonts/*', serveStatic({ root: './assets' }));
   app.get('/health', async (c) => c.json({ ok: true }));
+
+  // Hinweise aus der Fachlogik sammeln (werden an die Erfolgsmeldung angehängt)
+  app.use((c, next) => withNotes(() => next()));
 
   // Sitzung, Benutzer und aktiven Mandanten laden
   app.use(async (c, next) => {

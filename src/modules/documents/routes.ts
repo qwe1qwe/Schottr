@@ -396,7 +396,7 @@ function register(app: App, kind: Kind) {
       ${cashAccounts.length && doc.status === 'open'
         ? html`<section class="card">
             <h2>Zahlungseingang</h2>
-            <form method="post" action="${base}/${doc.id}/paid" class="inline-form">
+            <form method="post" action="${base}/${doc.id}/paid" class="inline-form" data-count-check data-count-date="paid_at">
               ${csrfField(c)}
               <label>Bezahlt am <input type="date" name="paid_at" value="${today()}" max="${today()}" required></label>
               <label>Konto ${accountSelect(cashAccounts, cashAccounts.find((a) => a.kind === 'bank')?.id)}</label>

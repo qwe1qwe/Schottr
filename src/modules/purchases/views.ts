@@ -178,7 +178,8 @@ export function purchaseForm(
         </section>`}
     <div class="form-actions sticky"><button class="btn primary">Speichern</button></div>`;
 
-  return html`<form method="post" action="${action}" class="purchase-form${opts.preview ? ' with-preview' : ''}" data-purchase-form>
+  return html`<form method="post" action="${action}" class="purchase-form${opts.preview ? ' with-preview' : ''}" data-purchase-form
+    data-count-check data-count-accounts="paid_account_id" data-count-date="paid_at">
     ${csrfField(c)}
     <div class="purchase-fields">${fields}</div>
     ${opts.preview ? html`<aside class="purchase-preview">${opts.preview}</aside>` : ''}

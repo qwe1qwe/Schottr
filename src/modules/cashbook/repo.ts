@@ -1,7 +1,8 @@
 import crypto from 'node:crypto';
 import { all, one, run, tx, nowIso } from '../../db/index.ts';
 import { addDays, formatDate, isIsoDate, today } from '../../lib/dates.ts';
-import { UserError } from '../../lib/http.ts';
+import { addNote, UserError } from '../../lib/http.ts';
+import { formatMoney } from '../../lib/money.ts';
 import type { Tenant } from '../../types.ts';
 import { detachAll, removePaths } from './files.ts';
 
@@ -195,6 +196,7 @@ export async function bookLinked(t: Tenant, source: LinkSource, refId: number, e
         t.id, e.account_id, e.entry_date, e.amount, source, refId, e.text, e.receipt_ref ?? '', userId, now, now,
       );
     }
+    await recalcAfter(t, existing && [existing.account_id, existing.entry_date], [e.account_id, e.entry_date]);
   });
 }
 
@@ -203,30 +205,40 @@ export async function unlink(t: Tenant, source: LinkSource, refId: number): Prom
   const existing = await linkedEntry(source, refId);
   if (!existing) return;
   assertOpen(t, existing.entry_date);
-  const paths = await detachAll('e.id = ?', existing.id);
-  await run('DELETE FROM cash_entries WHERE id = ?', existing.id);
+  const paths = await tx(async () => {
+    const p = await detachAll('e.id = ?', existing.id);
+    await run('DELETE FROM cash_entries WHERE id = ?', existing.id);
+    await recalcAfter(t, [existing.account_id, existing.entry_date]);
+    return p;
+  });
   await removePaths(paths);
 }
 
 export async function createManual(t: Tenant, e: EntryInput, userId: number): Promise<number> {
   await checkAccount(t, e.account_id, e.entry_date);
   const now = nowIso();
-  const res = await run(
-    `INSERT INTO cash_entries (tenant_id, account_id, entry_date, amount, source, text, receipt_ref, sphere, vat_rate, category, created_by, created_at, updated_at)
-     VALUES (?, ?, ?, ?, 'manual', ?, ?, ?, ?, ?, ?, ?, ?)`,
-    t.id, e.account_id, e.entry_date, e.amount, e.text, e.receipt_ref ?? '', e.sphere ?? '', e.vat_rate ?? 0, e.category ?? '', userId, now, now,
-  );
-  return Number(res.insertId);
+  return tx(async () => {
+    const res = await run(
+      `INSERT INTO cash_entries (tenant_id, account_id, entry_date, amount, source, text, receipt_ref, sphere, vat_rate, category, created_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 'manual', ?, ?, ?, ?, ?, ?, ?, ?)`,
+      t.id, e.account_id, e.entry_date, e.amount, e.text, e.receipt_ref ?? '', e.sphere ?? '', e.vat_rate ?? 0, e.category ?? '', userId, now, now,
+    );
+    await recalcAfter(t, [e.account_id, e.entry_date]);
+    return Number(res.insertId);
+  });
 }
 
 export async function updateManual(t: Tenant, entry: CashEntry, e: EntryInput): Promise<void> {
   if (entry.source !== 'manual') throw new UserError('Diese Buchung gehört zu einem Beleg und wird dort geändert.');
   assertOpen(t, entry.entry_date);
   await checkAccount(t, e.account_id, e.entry_date);
-  await run(
-    'UPDATE cash_entries SET account_id = ?, entry_date = ?, amount = ?, text = ?, receipt_ref = ?, sphere = ?, vat_rate = ?, category = ?, updated_at = ? WHERE id = ?',
-    e.account_id, e.entry_date, e.amount, e.text, e.receipt_ref ?? '', e.sphere ?? '', e.vat_rate ?? 0, e.category ?? '', nowIso(), entry.id,
-  );
+  await tx(async () => {
+    await run(
+      'UPDATE cash_entries SET account_id = ?, entry_date = ?, amount = ?, text = ?, receipt_ref = ?, sphere = ?, vat_rate = ?, category = ?, updated_at = ? WHERE id = ?',
+      e.account_id, e.entry_date, e.amount, e.text, e.receipt_ref ?? '', e.sphere ?? '', e.vat_rate ?? 0, e.category ?? '', nowIso(), entry.id,
+    );
+    await recalcAfter(t, [entry.account_id, entry.entry_date], [e.account_id, e.entry_date]);
+  });
 }
 
 /** Freie Buchung oder Umbuchung (beide Seiten) löschen */
@@ -237,12 +249,15 @@ export async function deleteEntry(t: Tenant, entry: CashEntry): Promise<void> {
   assertOpen(t, entry.entry_date);
   const paths = await tx(async () => {
     if (entry.source === 'transfer' && entry.transfer_group) {
+      const sides = await all<CashEntry>('SELECT * FROM cash_entries WHERE transfer_group = ? AND tenant_id = ?', entry.transfer_group, t.id);
       const p = await detachAll('e.transfer_group = ? AND e.tenant_id = ?', entry.transfer_group, t.id);
       await run('DELETE FROM cash_entries WHERE transfer_group = ? AND tenant_id = ?', entry.transfer_group, t.id);
+      await recalcAfter(t, ...sides.map((x) => [x.account_id, x.entry_date] as [number, string]));
       return p;
     }
     const p = await detachAll('e.id = ?', entry.id);
     await run('DELETE FROM cash_entries WHERE id = ?', entry.id);
+    await recalcAfter(t, [entry.account_id, entry.entry_date]);
     return p;
   });
   await removePaths(paths);
@@ -265,10 +280,16 @@ export async function createTransfer(t: Tenant, fromId: number, toId: number, da
         t.id, acc, date, amt, group, label, userId, now, now,
       );
     }
+    await recalcAfter(t, [from.id, date], [to.id, date]);
   });
 }
 
 /* ---------------- Kassenzählung ---------------- */
+
+const COUNT_TEXT_PLUS = 'Einnahmen ohne Einzelbeleg lt. Kassenzählung';
+const COUNT_TEXT_MINUS = 'Kassenfehlbetrag lt. Kassenzählung';
+const countText = (difference: number) => (difference > 0 ? COUNT_TEXT_PLUS : COUNT_TEXT_MINUS);
+const isDefaultCountText = (text: string) => text === COUNT_TEXT_PLUS || text === COUNT_TEXT_MINUS;
 
 export async function lastCount(accountId: number) {
   return one<CashCount>('SELECT * FROM cash_counts WHERE account_id = ? ORDER BY count_date DESC, id DESC LIMIT 1', accountId);
@@ -307,7 +328,7 @@ export async function saveCount(
         `INSERT INTO cash_entries (tenant_id, account_id, entry_date, amount, source, count_id, text, sphere, vat_rate, created_by, created_at, updated_at)
          VALUES (?, ?, ?, ?, 'count', ?, ?, ?, ?, ?, ?, ?)`,
         t.id, a.id, input.date, difference, id,
-        input.text || (difference > 0 ? 'Einnahmen ohne Einzelbeleg lt. Kassenzählung' : 'Kassenfehlbetrag lt. Kassenzählung'),
+        input.text || countText(difference),
         input.sphere, input.vat_rate, userId, now, now,
       );
     }
@@ -315,15 +336,122 @@ export async function saveCount(
   });
 }
 
-/** Nur die letzte Zählung einer Kasse lässt sich löschen (samt Differenzbuchung) */
+/**
+ * Buchbestand zu einer Zählung: Stand am Zähltag ohne die Differenzbuchungen dieser und
+ * späterer Zählungen desselben Tages.
+ */
+async function countBook(a: CashAccount, k: Pick<CashCount, 'id' | 'count_date'>): Promise<number> {
+  const own = await one<{ s: number | string }>(
+    `SELECT COALESCE(SUM(e.amount), 0) s FROM cash_entries e JOIN cash_counts k ON k.id = e.count_id
+     WHERE k.account_id = ? AND k.count_date = ? AND k.id >= ?`, a.id, k.count_date, k.id,
+  );
+  return (await balanceAt(a, k.count_date)) - Number(own?.s ?? 0);
+}
+
+/**
+ * Buchbestand und Differenz in die Zählung und ihre Differenzbuchung schreiben. Fällt die Differenz
+ * auf 0, entfällt die Buchung – außer es hängen Belege daran, dann bleibt sie mit 0,00 € stehen.
+ */
+async function applyCountResult(t: Tenant, a: CashAccount, k: CashCount, book: number, difference: number) {
+  const now = nowIso();
+  await run('UPDATE cash_counts SET book_balance = ?, difference = ? WHERE id = ?', book, difference, k.id);
+  const entry = await one<CashEntry>('SELECT * FROM cash_entries WHERE count_id = ?', k.id);
+  if (entry) {
+    const hasFiles = !!await one('SELECT 1 FROM cash_entry_files WHERE entry_id = ? LIMIT 1', entry.id);
+    if (difference === 0 && !hasFiles) {
+      await run('DELETE FROM cash_entries WHERE id = ?', entry.id);
+    } else {
+      // Standardtext an das (evtl. gedrehte) Vorzeichen anpassen, eigener Text bleibt
+      const text = difference !== 0 && isDefaultCountText(entry.text) ? countText(difference) : entry.text;
+      await run('UPDATE cash_entries SET entry_date = ?, amount = ?, text = ?, updated_at = ? WHERE id = ?', k.count_date, difference, text, now, entry.id);
+    }
+  } else if (difference !== 0) {
+    // bisher ohne Differenz: Buchung mit den Vorgaben des Zählformulars anlegen
+    await run(
+      `INSERT INTO cash_entries (tenant_id, account_id, entry_date, amount, source, count_id, text, sphere, vat_rate, created_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 'count', ?, ?, ?, ?, NULL, ?, ?)`,
+      t.id, a.id, k.count_date, difference, k.id, countText(difference), t.nonprofit ? 'business' : '', t.small_business ? 0 : 1900, now, now,
+    );
+  }
+}
+
+/**
+ * Zählungen einer Kasse ab `from` neu rechnen – nach einer nachträglichen Buchung, Änderung oder
+ * Löschung davor. Der gezählte Bestand bleibt; Buchbestand und Differenz (z. B. Bareinnahmen ohne
+ * Beleg) passen sich an. Geänderte Zählungen werden als Hinweis gemeldet.
+ */
+export async function recalcCounts(t: Tenant, accountId: number, from: string): Promise<void> {
+  const a = await getAccount(t.id, accountId);
+  if (!a || a.kind !== 'cash') return;
+  const counts = await all<CashCount>('SELECT * FROM cash_counts WHERE account_id = ? AND count_date >= ? ORDER BY count_date, id', a.id, from);
+  for (const k of counts) {
+    const book = await countBook(a, k);
+    const difference = Number(k.counted) - book;
+    if (book === Number(k.book_balance) && difference === Number(k.difference)) continue;
+    assertOpen(t, k.count_date);
+    await applyCountResult(t, a, k, book, difference);
+    addNote(`Kassenzählung „${a.name}“ vom ${formatDate(k.count_date)} neu berechnet: Differenz ${formatMoney(Number(k.difference))} → ${formatMoney(difference)}.`);
+  }
+}
+
+/** Nach Änderungen an Buchungen: betroffene Kassen ab dem frühesten Tag neu rechnen */
+async function recalcAfter(t: Tenant, ...changes: ([number, string] | null | undefined)[]) {
+  const from = new Map<number, string>();
+  for (const ch of changes) {
+    if (!ch) continue;
+    const [acc, date] = ch;
+    const d = from.get(acc);
+    if (!d || date < d) from.set(acc, date);
+  }
+  for (const [acc, date] of from) await recalcCounts(t, acc, date);
+}
+
+/** Nachbarn einer Zählung in der Reihenfolge Datum, ID */
+async function countNeighbours(accountId: number, k: CashCount) {
+  const prev = await one<CashCount>(
+    'SELECT * FROM cash_counts WHERE account_id = ? AND (count_date < ? OR (count_date = ? AND id < ?)) ORDER BY count_date DESC, id DESC LIMIT 1',
+    accountId, k.count_date, k.count_date, k.id,
+  );
+  const next = await one<CashCount>(
+    'SELECT * FROM cash_counts WHERE account_id = ? AND (count_date > ? OR (count_date = ? AND id > ?)) ORDER BY count_date, id LIMIT 1',
+    accountId, k.count_date, k.count_date, k.id,
+  );
+  return { prev, next };
+}
+
+/**
+ * Datum einer Zählung ändern (z. B. versehentlich mit dem heutigen Tag erfasst). Die Zählung bleibt
+ * zwischen ihren Nachbarn; die Differenzbuchung wandert mit, und die Zählung sowie alle späteren
+ * werden neu gerechnet.
+ */
+export async function changeCountDate(t: Tenant, a: CashAccount, count: CashCount, date: string): Promise<{ changed: boolean }> {
+  assertOpen(t, count.count_date);
+  await checkAccount(t, a.id, date);
+  if (date > today()) throw new UserError('Die Zählung liegt in der Zukunft.');
+  if (date === count.count_date) return { changed: false };
+  const { prev, next } = await countNeighbours(a.id, count);
+  if (prev && (date < prev.count_date || (date === prev.count_date && prev.id > count.id))) {
+    throw new UserError(`Die Zählung kann nicht vor der vorherigen Zählung (${formatDate(prev.count_date)}) liegen.`);
+  }
+  if (next && (date > next.count_date || (date === next.count_date && next.id < count.id))) {
+    throw new UserError(`Die Zählung kann nicht nach der nächsten Zählung (${formatDate(next.count_date)}) liegen.`);
+  }
+  await tx(async () => {
+    await run('UPDATE cash_counts SET count_date = ? WHERE id = ?', date, count.id);
+    await run('UPDATE cash_entries SET entry_date = ?, updated_at = ? WHERE count_id = ?', date, nowIso(), count.id);
+    await recalcCounts(t, a.id, date < count.count_date ? date : count.count_date);
+  });
+  return { changed: true };
+}
+
+/** Zählung samt Differenzbuchung löschen; spätere Zählungen werden neu gerechnet */
 export async function deleteCount(t: Tenant, a: CashAccount, count: CashCount) {
-  const last = await lastCount(a.id);
-  if (!last || last.id !== count.id) throw new UserError('Nur die letzte Zählung einer Kasse lässt sich löschen.');
   assertOpen(t, count.count_date);
   const paths = await tx(async () => {
     const p = await detachAll('e.count_id = ?', count.id);
     await run('DELETE FROM cash_entries WHERE count_id = ?', count.id);
     await run('DELETE FROM cash_counts WHERE id = ?', count.id);
+    await recalcCounts(t, a.id, count.count_date);
     return p;
   });
   await removePaths(paths);
@@ -548,13 +676,16 @@ export async function bookDue(t: Tenant, r: Recurring, due: string, userId: numb
   }
   const now = nowIso();
   const month = `${['Januar', 'Februar', 'März', 'April', 'Mai', 'Juni', 'Juli', 'August', 'September', 'Oktober', 'November', 'Dezember'][Number(due.slice(5, 7)) - 1]} ${due.slice(0, 4)}`;
-  const res = await run(
-    `INSERT INTO cash_entries (tenant_id, account_id, entry_date, amount, source, recurring_id, recurring_due, text, receipt_ref, sphere, vat_rate, category, created_by, created_at, updated_at)
-     VALUES (?, ?, ?, ?, 'manual', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    t.id, r.account_id, due, r.amount, r.id, due, `${r.text} ${r.rhythm === 'yearly' ? due.slice(0, 4) : month}`,
-    r.receipt_ref, r.sphere, r.vat_rate, r.category, userId, now, now,
-  );
-  return Number(res.insertId);
+  return tx(async () => {
+    const res = await run(
+      `INSERT INTO cash_entries (tenant_id, account_id, entry_date, amount, source, recurring_id, recurring_due, text, receipt_ref, sphere, vat_rate, category, created_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 'manual', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      t.id, r.account_id, due, r.amount, r.id, due, `${r.text} ${r.rhythm === 'yearly' ? due.slice(0, 4) : month}`,
+      r.receipt_ref, r.sphere, r.vat_rate, r.category, userId, now, now,
+    );
+    await recalcAfter(t, [r.account_id, due]);
+    return Number(res.insertId);
+  });
 }
 
 export async function skipDue(r: Recurring, due: string) {
