@@ -1360,6 +1360,43 @@ test('Kassenbuch: Konten, Zuordnung, Umbuchung, Kassenzählung, Abschluss, Steue
   r = await multipart('/capture', { target: 'later' }, [{ name: 'notiz.txt', data: Buffer.from('hallo'), type: 'text/plain' }]);
   assert.equal((await inboxRows()).length, 0);
 
+  // Foto zu einer vorhandenen Buchung hinterlegen
+  page = await (await req('/capture')).text();
+  assert.match(page, /value="existing"/);
+  assert.match(page, new RegExp(`<option value="e:${porto.id}">`));
+  const portoFiles = async () => (await all('SELECT id FROM cash_entry_files WHERE entry_id = ?', porto.id)).length;
+  const portoBefore = await portoFiles();
+  r = await multipart('/capture', { target: 'existing', existing: `e:${porto.id}` }, [{ name: 'image.jpg', data: Buffer.concat([jpeg, Buffer.from('porto')]), type: 'image/jpeg' }]);
+  assert.equal(location(r), `/cashbook/entries/${porto.id}/edit`);
+  assert.match(flashOf(r), /Beleg hinterlegt bei Buchung „Porto“/);
+  assert.equal(await portoFiles(), portoBefore + 1);
+  assert.equal((await inboxRows()).length, 0);
+  // ohne Auswahl → zurück zum Formular
+  r = await multipart('/capture', { target: 'existing', existing: '' }, [{ name: 'image.jpg', data: jpeg, type: 'image/jpeg' }]);
+  assert.equal(location(r), '/capture?target=existing');
+  // Buchung einer Eingangsrechnung: Beleg gehört zur Rechnung → abgelehnt, bleibt im Belegeingang
+  const pidEntry = (await one('SELECT id FROM cash_entries WHERE purchase_id = ?', pid))!;
+  r = await multipart('/capture', { target: 'existing', existing: `e:${pidEntry.id}` }, [{ name: 'image.jpg', data: Buffer.concat([jpeg, Buffer.from('x')]), type: 'image/jpeg' }]);
+  assert.equal(location(r), '/inbox');
+  inbox = await inboxRows();
+  assert.equal(inbox.length, 1);
+  // aus dem Belegeingang einer manuell erfassten Eingangsrechnung ohne Datei zuordnen
+  r = await req('/purchases', { form: { new_supplier: 'Elektro Maier', number: 'EM-1', issue_date: today, sphere: 'ideell', category: 'buero', 'tax_rate[]': '1900', 'tax_net[]': '', 'tax_tax[]': '', 'tax_gross[]': '30,00' } });
+  const pidNoFile = Number(location(r).split('/').pop());
+  page = await (await req('/inbox')).text();
+  assert.match(page, new RegExp(`action="/inbox/${inbox[0].id}/assign"`));
+  assert.match(page, new RegExp(`<option value="p:${pidNoFile}">[^<]*EM-1`));
+  r = await req(`/inbox/${inbox[0].id}/assign`, { form: { target: `p:${pidNoFile}` } });
+  assert.equal(location(r), `/purchases/${pidNoFile}`);
+  const withFile = (await one('SELECT * FROM purchase_invoices WHERE id = ?', pidNoFile))!;
+  assert.ok(withFile.file_path, 'Datei gesetzt');
+  assert.equal(withFile.file_mime, 'image/jpeg');
+  assert.equal((await req(`/purchases/${pidNoFile}/file`)).status, 200);
+  assert.equal((await inboxRows()).length, 0);
+  // Rechnung mit Datei wird nicht mehr angeboten
+  page = await (await req('/capture')).text();
+  assert.doesNotMatch(page, new RegExp(`value="p:${pidNoFile}"`));
+
   // Einnahmen haben keine Kostenart – auch wenn eine mitgeschickt wird
   r = await req('/cashbook/entries', { form: { account_id: String(kasse), entry_date: today, direction: 'in', amount: '5', text: 'Kuchenverkauf', category: 'verband', vat_rate: '0' } });
   assert.equal((await one("SELECT category FROM cash_entries WHERE tenant_id = ? AND text = 'Kuchenverkauf'", t.id))!.category, '');
@@ -1389,6 +1426,81 @@ test('Kassenbuch: Konten, Zuordnung, Umbuchung, Kassenzählung, Abschluss, Steue
   // zukünftige Termine lassen sich nicht vorab buchen
   r = await req(`/cashbook/recurring/${rec}/book?due=${year + 1}-01-03`, { form: {} });
   assert.equal(await one('SELECT 1 FROM cash_entries WHERE recurring_id = ? AND recurring_due = ?', rec, `${year + 1}-01-03`), undefined);
+
+  // Eingangsrechnung nachträglich mit einer freien Buchung verbinden (bar bezahlt, Rechnung kam später)
+  const bankBefore = await balance(bank);
+  r = await req('/cashbook/entries', { form: { account_id: String(bank), entry_date: today, direction: 'out', amount: '47,60', text: 'Druckerpatronen', sphere: 'ideell', vat_rate: '0' } });
+  const patronen = (await one("SELECT * FROM cash_entries WHERE tenant_id = ? AND text = 'Druckerpatronen'", t.id))!;
+  r = await req('/purchases', { form: { new_supplier: 'Bürobedarf Schmid', number: 'BS-77', issue_date: today, sphere: 'ideell', category: 'buero', 'tax_rate[]': '1900', 'tax_net[]': '', 'tax_tax[]': '', 'tax_gross[]': '47,60' } });
+  const pid2 = Number(location(r).split('/').pop());
+  assert.equal((await one('SELECT status FROM purchase_invoices WHERE id = ?', pid2))!.status, 'open');
+  page = await (await req(`/purchases/${pid2}`)).text();
+  assert.match(page, /Schon im Kassenbuch gebucht\?/);
+  assert.match(page, new RegExp(`<option value="${patronen.id}">[^<]*Druckerpatronen[^<]*✓ Betrag passt`));
+  r = await req(`/purchases/${pid2}/link-entry`, { form: { entry_id: String(patronen.id) } });
+  assert.match(flashOf(r), /verbunden/);
+  const linkedE = (await one('SELECT * FROM cash_entries WHERE id = ?', patronen.id))!;
+  assert.equal(linkedE.source, 'purchase');
+  assert.equal(linkedE.purchase_id, pid2);
+  const pv = (await one('SELECT status, paid_at FROM purchase_invoices WHERE id = ?', pid2))!;
+  assert.equal(pv.status, 'paid');
+  assert.equal(pv.paid_at, today);
+  assert.equal(await balance(bank), bankBefore - 4760, 'nicht doppelt gebucht');
+  page = await (await req(`/purchases/${pid2}`)).text();
+  assert.doesNotMatch(page, /Schon im Kassenbuch gebucht/);
+  r = await req(`/purchases/${pid2}/link-entry`, { form: { entry_id: String(patronen.id) } });
+  assert.match(flashOf(r), /Nur freie Buchungen/);
+  // von der Buchung aus: Einnahme passt nicht zu einer Eingangsrechnung, Ausgabe schon
+  r = await req('/cashbook/entries', { form: { account_id: String(bank), entry_date: today, direction: 'out', amount: '12', text: 'Toner nachgekauft', sphere: 'ideell', vat_rate: '0' } });
+  const toner = (await one("SELECT * FROM cash_entries WHERE tenant_id = ? AND text = 'Toner nachgekauft'", t.id))!;
+  r = await req('/purchases', { form: { new_supplier: 'Bürobedarf Schmid', number: 'BS-78', issue_date: today, sphere: 'ideell', category: 'buero', 'tax_rate[]': '1900', 'tax_net[]': '', 'tax_tax[]': '', 'tax_gross[]': '12,00' } });
+  const pid3 = Number(location(r).split('/').pop());
+  page = await (await req(`/cashbook/entries/${toner.id}/edit`)).text();
+  assert.match(page, /Oder mit einer bereits erfassten verbinden/);
+  assert.match(page, new RegExp(`<option value="${pid3}">[^<]*BS-78[^<]*✓ Betrag passt`));
+  assert.doesNotMatch(page, new RegExp(`<option value="${pid2}">`), 'schon verbundene Rechnung wird nicht angeboten');
+  r = await req(`/cashbook/entries/${toner.id}/purchase`, { form: { purchase_id: String(pid3) } });
+  assert.equal((await one('SELECT purchase_id FROM cash_entries WHERE id = ?', toner.id))!.purchase_id, pid3);
+  assert.equal((await one('SELECT status FROM purchase_invoices WHERE id = ?', pid3))!.status, 'paid');
+
+  // Aus einer Ausgabe-Buchung direkt eine Eingangsrechnung anlegen (mit Beleg der Buchung)
+  const bankBefore2 = await balance(bank);
+  r = await req('/cashbook/entries', { form: { account_id: String(bank), entry_date: today, direction: 'out', amount: '23,80', text: 'Vereinsfahne reinigen', category: 'buero', sphere: 'ideell', vat_rate: '1900' } });
+  const fahne = (await one("SELECT * FROM cash_entries WHERE tenant_id = ? AND text = 'Vereinsfahne reinigen'", t.id))!;
+  // Beleg wie beim Hochladen in der Ablage (data/verbindlichkeiten/<Mandant>/…)
+  const receipt = Buffer.from('%PDF-1.4\n%%EOF\n');
+  const receiptRel = `${t.id}/kasse_test_quittung.pdf`;
+  fs.mkdirSync(path.join(process.env.SCHOTTR_DATA_DIR!, 'verbindlichkeiten', String(t.id)), { recursive: true });
+  fs.writeFileSync(path.join(process.env.SCHOTTR_DATA_DIR!, 'verbindlichkeiten', receiptRel), receipt);
+  await run(
+    `INSERT INTO cash_entry_files (tenant_id, entry_id, file_name, file_path, file_mime, file_size, file_sha256, created_at)
+     VALUES (?, ?, 'quittung.pdf', ?, 'application/pdf', ?, ?, NOW())`, t.id, fahne.id, receiptRel, receipt.length, 'a'.repeat(64),
+  );
+  page = await (await req(`/cashbook/entries/${fahne.id}/edit`)).text();
+  assert.match(page, new RegExp(`href="/purchases/new\\?entry=${fahne.id}"`));
+  page = await (await req(`/purchases/new?entry=${fahne.id}`)).text();
+  assert.match(page, /name="from_entry" value="\d+"/);
+  assert.match(page, /Vereinsfahne reinigen/);
+  assert.match(page, /name="take_file"/);
+  assert.match(page, /23,80/);
+  r = await req('/purchases', { form: { from_entry: String(fahne.id), take_file: '1', new_supplier: 'Reinigung Weiß', number: 'RW-5', issue_date: today, description: 'Vereinsfahne reinigen', sphere: 'ideell', category: 'buero', 'tax_rate[]': '1900', 'tax_net[]': '', 'tax_tax[]': '', 'tax_gross[]': '23,80' } });
+  assert.match(flashOf(r), /mit der Buchung verbunden/);
+  const pid4 = Number(location(r).split('/').pop());
+  const p4 = (await one('SELECT * FROM purchase_invoices WHERE id = ?', pid4))!;
+  assert.equal(p4.status, 'paid');
+  assert.equal(p4.paid_at, today);
+  assert.equal(p4.gross_total, 2380);
+  assert.equal(p4.file_path, receiptRel);
+  assert.equal((await req(`/purchases/${pid4}/file`)).status, 200);
+  const fahneNow = (await one('SELECT * FROM cash_entries WHERE id = ?', fahne.id))!;
+  assert.equal(fahneNow.source, 'purchase');
+  assert.equal(fahneNow.purchase_id, pid4);
+  assert.equal((await all('SELECT id FROM cash_entries WHERE purchase_id = ?', pid4)).length, 1, 'keine zweite Buchung');
+  assert.equal((await all('SELECT id FROM cash_entry_files WHERE entry_id = ?', fahne.id)).length, 0, 'Beleg umgehängt');
+  assert.equal(await balance(bank), bankBefore2 - 2380);
+  // nochmal aus derselben Buchung → Fehler
+  r = await req(`/purchases/new?entry=${fahne.id}`);
+  assert.equal(r.status, 303);
 
   // Steuerbüro-Paket
   r = await req(`/export/package?year=${year}`);

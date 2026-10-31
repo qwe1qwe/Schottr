@@ -1,4 +1,4 @@
-import { all, one, run, nowIso } from '../../db/index.ts';
+import { all, one, run, tx, nowIso } from '../../db/index.ts';
 import { readStoredFile, removeStoredFile, saveFile } from '../../lib/files.ts';
 import { UserError } from '../../lib/http.ts';
 import { appendPdfs, imagesToPdf } from '../../lib/pdfmerge.ts';
@@ -124,6 +124,89 @@ export const removeInboxFile = (f: Pick<InboxFile, 'file_path'>) => removeStored
  * Beleg aus dem Belegeingang an eine Kassenbuch-Buchung hängen (innerhalb einer Transaktion
  * aufrufen). Liefert den Eintrag zurück – dessen Datei nach dem Commit mit removeInboxFile löschen.
  */
+/* ---------------- Zu vorhandener Buchung / Eingangsrechnung ---------------- */
+
+/** Ziel „vorhanden“: Eingangsrechnung ohne Datei (p:<id>) oder Kassenbuch-Buchung (e:<id>) */
+export interface AttachTargets {
+  purchases: { id: number; number: string; issue_date: string | null; supplier: string | null; gross_total: number; is_credit: number }[];
+  entries: { id: number; entry_date: string; text: string; amount: number; account: string; files: number }[];
+}
+
+/**
+ * Mögliche Ziele für einen Beleg: erfasste Eingangsrechnungen ohne Datei (z. B. manuell
+ * eingetragen, Quittung kommt nach) und Kassenbuch-Buchungen, an denen Belege hängen können
+ * (freie Buchungen, Umbuchungen, Zählungen – bei verknüpften ist die Rechnung bzw. Spende der Beleg).
+ */
+export async function attachTargets(t: Tenant, withEntries: boolean): Promise<AttachTargets> {
+  const purchases = await all<AttachTargets['purchases'][number]>(
+    `SELECT p.id, p.number, p.issue_date, p.gross_total, p.is_credit, COALESCE(NULLIF(c.company, ''), c.name) supplier
+     FROM purchase_invoices p LEFT JOIN contacts c ON c.id = p.contact_id
+     WHERE p.tenant_id = ? AND p.status <> 'draft' AND (p.file_path IS NULL OR p.file_path = '')
+     ORDER BY COALESCE(p.issue_date, DATE(p.created_at)) DESC, p.id DESC LIMIT 100`, t.id,
+  );
+  const entries = withEntries
+    ? await all<AttachTargets['entries'][number]>(
+      `SELECT e.id, e.entry_date, e.text, e.amount, a.name account,
+              (SELECT COUNT(*) FROM cash_entry_files f WHERE f.entry_id = e.id) files
+       FROM cash_entries e JOIN cash_accounts a ON a.id = e.account_id
+       WHERE e.tenant_id = ? AND e.source IN ('manual', 'transfer', 'count')
+       ORDER BY e.entry_date DESC, e.id DESC LIMIT 150`, t.id,
+    )
+    : [];
+  return { purchases, entries: entries.map((e) => ({ ...e, files: Number(e.files) })) };
+}
+
+/**
+ * Beleg aus dem Belegeingang einem vorhandenen Ziel zuordnen: als Datei einer Eingangsrechnung
+ * (nur, wenn sie noch keine hat) oder als weiterer Beleg einer Buchung. Liefert eine Beschreibung
+ * fürs Protokoll; die Datei im Eingang wird danach entfernt.
+ */
+export async function assignInbox(t: Tenant, inboxId: number, target: string, userId: number, cashbook: boolean): Promise<{ label: string; href: string }> {
+  const m = /^([pe]):(\d+)$/.exec(target);
+  if (!m) throw new UserError('Bitte die Buchung bzw. Eingangsrechnung auswählen.');
+  const id = Number(m[2]);
+  const f = await getInbox(t.id, inboxId);
+  if (!f) throw new UserError('Der Beleg ist nicht mehr im Belegeingang (schon zugeordnet oder gelöscht?).');
+  const data = new Uint8Array(await readInbox(f));
+  let result: { label: string; href: string };
+  if (m[1] === 'p') {
+    const p = await one<{ id: number; number: string; status: string; file_path: string | null }>(
+      'SELECT id, number, status, file_path FROM purchase_invoices WHERE tenant_id = ? AND id = ?', t.id, id,
+    );
+    if (!p || p.status === 'draft') throw new UserError('Eingangsrechnung nicht gefunden.');
+    if (p.file_path) throw new UserError('Die Eingangsrechnung hat schon eine Datei.');
+    const stored = await saveFile('verbindlichkeiten', t.id, f.file_name, data);
+    try {
+      await tx(async () => {
+        await run(
+          `UPDATE purchase_invoices SET file_name = ?, file_path = ?, file_mime = ?, file_size = ?, file_sha256 = ?, updated_at = ?
+           WHERE id = ? AND (file_path IS NULL OR file_path = '')`,
+          f.file_name, stored.path, f.file_mime, stored.size, stored.sha256, nowIso(), p.id,
+        );
+        await dropInbox(f);
+      });
+    } catch (err) {
+      await removeStoredFile('verbindlichkeiten', stored.path);
+      throw err;
+    }
+    result = { label: `Eingangsrechnung ${p.number || `ID ${p.id}`}`, href: `/purchases/${p.id}` };
+  } else {
+    if (!cashbook) throw new UserError('Das Kassenbuch gibt es nur für Vereine.');
+    const e = await one<{ id: number; source: string; text: string; entry_date: string }>(
+      'SELECT id, source, text, entry_date FROM cash_entries WHERE tenant_id = ? AND id = ?', t.id, id,
+    );
+    if (!e) throw new UserError('Buchung nicht gefunden.');
+    if (!['manual', 'transfer', 'count'].includes(e.source)) throw new UserError('Diese Buchung gehört zu einer Rechnung bzw. Spende – der Beleg ist dort hinterlegt.');
+    await tx(async () => {
+      await attachData(t, e.id, { name: f.file_name, data, mime: f.file_mime }, userId);
+      await dropInbox(f);
+    });
+    result = { label: `Buchung „${e.text}“ vom ${e.entry_date.split('-').reverse().join('.')}`, href: `/cashbook/entries/${e.id}/edit` };
+  }
+  await removeInboxFile(f);
+  return result;
+}
+
 export async function assignToEntry(t: Tenant, inboxId: number, entryId: number, userId: number): Promise<InboxFile> {
   const f = await getInbox(t.id, inboxId);
   if (!f) throw new UserError('Der Beleg ist nicht mehr im Belegeingang (schon zugeordnet oder gelöscht?).');

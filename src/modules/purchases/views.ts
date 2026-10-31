@@ -113,6 +113,8 @@ export function purchaseForm(
     locked?: Purchase; taxes?: PurchaseTax[]; preview?: SafeHtml; smallBusiness?: boolean; defaultSphere?: string | null;
     /** Kassenbuch: Konten zur Auswahl, wenn „Bezahlt am“ gesetzt ist */
     accounts?: { id: number; name: string; kind: string }[]; paidAccountId?: number | null;
+    /** zusätzliche Felder/Hinweise oben im Formular (z. B. „aus Buchung anlegen“) */
+    extra?: SafeHtml;
   } = {},
 ): SafeHtml {
   const locked = opts.locked;
@@ -179,8 +181,8 @@ export function purchaseForm(
     <div class="form-actions sticky"><button class="btn primary">Speichern</button></div>`;
 
   return html`<form method="post" action="${action}" class="purchase-form${opts.preview ? ' with-preview' : ''}" data-purchase-form
-    data-count-check data-count-accounts="paid_account_id" data-count-date="paid_at">
-    ${csrfField(c)}
+    ${opts.extra ? '' : html`data-count-check data-count-accounts="paid_account_id" data-count-date="paid_at"`}>
+    ${csrfField(c)}${opts.extra ?? ''}
     <div class="purchase-fields">${fields}</div>
     ${opts.preview ? html`<aside class="purchase-preview">${opts.preview}</aside>` : ''}
   </form>`;

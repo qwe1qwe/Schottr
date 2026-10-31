@@ -15,7 +15,7 @@ import type { App, Ctx, Module, Tenant } from '../../types.ts';
 import { assignToEntry, getInbox, inboxOf, removeInboxFile, type InboxFile } from '../inbox/repo.ts';
 import {
   bookDue, getRecurring, nextDue, pendingDues, recurringOf, RHYTHMS, skipDue, type PendingDue, type Recurring, type Rhythm,
-  accountsOf, assertOpen, balanceAt, balances, bookLinked, cashbookEnabled, changeCountDate, createManual, recalcCounts, createTransfer, deleteCount, deleteEntry, DENOMINATIONS,
+  accountsOf, assertOpen, balanceAt, balances, bookLinked, cashbookEnabled, changeCountDate, createManual, linkEntryToPurchase, purchaseCandidates, recalcCounts, createTransfer, deleteCount, deleteEntry, DENOMINATIONS,
   entriesOf, entrySphere, getAccount, history, lastCount, saveCount, SOURCE_LABELS, unassigned, updateManual,
   type CashAccount, type CashCount, type CashEntry, type EntryInput, type EntryRow, type LinkSource,
 } from './repo.ts';
@@ -171,6 +171,28 @@ function filesList(c: Ctx, files: EntryFile[], canDelete: boolean): SafeHtml {
     </a>
     ${canDelete ? postButton(c, `/cashbook/files/${f.id}/delete`, 'Entfernen', 'link danger', `Beleg „${f.file_name}“ entfernen?`) : ''}
   </li>`)}</ul>`;
+}
+
+/** Auf der Buchungsseite: freie Ausgabe mit einer später eingegangenen Eingangsrechnung verbinden */
+async function linkPurchaseCard(c: Ctx, t: Tenant, e: CashEntry): Promise<SafeHtml | ''> {
+  if (!e.amount) return '';
+  const list = await purchaseCandidates(t, e);
+  return html`<section class="card">
+    <h2>Eingangsrechnung</h2>
+    <p class="muted small">Gehört zu dieser ${e.amount < 0 ? 'Ausgabe' : 'Einnahme'} eine ${e.amount < 0 ? 'Rechnung' : 'Gutschrift'}? Die Buchung wird zu ihrer Zahlung
+      (Betrag, Datum und Konto bleiben), die Rechnung gilt ab ${formatDate(e.entry_date)} als bezahlt – es entsteht keine zweite Buchung.</p>
+    <p><a class="btn" href="/purchases/new?entry=${e.id}">${e.amount < 0 ? 'Als Eingangsrechnung anlegen' : 'Als Gutschrift anlegen'}</a></p>
+    ${list.length ? html`<p class="muted small">Oder mit einer bereits erfassten verbinden:</p>
+    <form method="post" action="/cashbook/entries/${e.id}/purchase" class="inline-form"
+      data-confirm="Buchung mit der gewählten Eingangsrechnung verbinden? Bearbeitet wird sie danach über die Eingangsrechnung.">
+      ${csrfField(c)}
+      <select name="purchase_id" required aria-label="Eingangsrechnung">
+        ${list.map((p) => html`<option value="${p.id}">${[p.supplier || 'ohne Lieferant', p.number || 'ohne Nr.', p.issue_date ? formatDate(p.issue_date) : '', formatMoney(p.amount),
+          p.status === 'paid' ? '(als bezahlt markiert)' : '', p.amount === Math.abs(e.amount) ? '✓ Betrag passt' : ''].filter(Boolean).join(' · ')}</option>`)}
+      </select>
+      <button class="btn">Verbinden</button>
+    </form>` : ''}
+  </section>`;
 }
 
 function entryForm(c: Ctx, t: Tenant, accounts: CashAccount[], action: string, e: Partial<CashEntry>, inbox: InboxFile[] = [], inboxId?: number): SafeHtml {
@@ -679,6 +701,7 @@ function register(app: App) {
               : ''}
           </section>`
         : ''}
+      ${e.source === 'manual' && !locked ? await linkPurchaseCard(c, t, e) : ''}
       ${!locked && (e.source === 'manual' || e.source === 'transfer')
         ? html`<div class="danger-zone">${postButton(c, `/cashbook/entries/${e.id}/delete`, e.source === 'transfer' ? 'Umbuchung löschen' : 'Buchung löschen', 'btn danger', 'Wirklich löschen?')}</div>`
         : ''}`,
@@ -699,6 +722,16 @@ function register(app: App) {
     if (taken) await removeInboxFile(taken);
     await audit(c, 'cashbook.entry.update', `${formatDate(e.entry_date)} ${formatMoney(e.amount)} → ${formatDate(input.entry_date)} ${formatMoney(input.amount)}: ${input.text}`);
     return redirectWith(c, `/cashbook?account=${input.account_id}&year=${input.entry_date.slice(0, 4)}`, 'ok', 'Buchung gespeichert.');
+  });
+
+  /** Freie Buchung nachträglich mit einer Eingangsrechnung verbinden */
+  app.post('/cashbook/entries/:id/purchase', async (c) => {
+    const t = cbTenant(c);
+    const form = await readForm(c);
+    const { entry, purchase } = await linkEntryToPurchase(t, idParam(c), Number(str(form, 'purchase_id')));
+    await audit(c, 'cashbook.entry.link', `${formatDate(entry.entry_date)} ${formatMoney(entry.amount)} „${entry.text}“ → Eingangsrechnung ${purchase.number || `ID ${purchase.id}`}`);
+    return redirectWith(c, `/cashbook/entries/${entry.id}/edit`, 'ok',
+      `Buchung mit der Eingangsrechnung verbunden – sie gilt ab ${formatDate(entry.entry_date)} als bezahlt.`);
   });
 
   /** Belege nachreichen – auch zu Zählungen, Umbuchungen und in abgeschlossenen Zeiträumen */

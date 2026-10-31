@@ -241,6 +241,94 @@ export async function updateManual(t: Tenant, entry: CashEntry, e: EntryInput): 
   });
 }
 
+/* ---------------- Freie Buchung ↔ Eingangsrechnung ---------------- */
+
+/** Mögliche Gegenstücke: Eingangsrechnungen ohne Buchung bzw. freie Buchungen ohne Rechnung */
+export interface PurchaseCandidate { id: number; number: string; issue_date: string | null; supplier: string | null; amount: number; status: string }
+export interface EntryCandidate { id: number; entry_date: string; text: string; amount: number; account: string }
+
+/**
+ * Freie Buchung nachträglich mit einer Eingangsrechnung verbinden – die Ausgabe wurde schon
+ * gebucht (z. B. bar bezahlt), die Rechnung kam später. Betrag, Datum und Konto der Buchung
+ * bleiben, sie ist die Zahlung: Die Rechnung gilt ab dem Buchungstag als bezahlt.
+ */
+export async function linkEntryToPurchase(t: Tenant, entryId: number, purchaseId: number): Promise<{ entry: CashEntry; purchase: { id: number; number: string } }> {
+  const entry = await one<CashEntry>('SELECT * FROM cash_entries WHERE tenant_id = ? AND id = ?', t.id, entryId);
+  if (!entry) throw new UserError('Buchung nicht gefunden.');
+  const p = await one<{ id: number; number: string; status: string; is_credit: number }>(
+    'SELECT id, number, status, is_credit FROM purchase_invoices WHERE tenant_id = ? AND id = ?', t.id, purchaseId,
+  );
+  if (!p) throw new UserError('Bitte eine Eingangsrechnung auswählen.');
+  if (p.status === 'draft') throw new UserError('Die Eingangsrechnung ist noch nicht erfasst – bitte zuerst die Angaben vervollständigen.');
+  if (entry.source !== 'manual') throw new UserError('Nur freie Buchungen lassen sich mit einer Eingangsrechnung verbinden.');
+  assertOpen(t, entry.entry_date);
+  if (await linkedEntry('purchase', p.id)) throw new UserError('Die Eingangsrechnung ist schon mit einer Buchung verbunden.');
+  if (p.is_credit ? entry.amount <= 0 : entry.amount >= 0) {
+    throw new UserError(p.is_credit ? 'Eine Gutschrift passt nur zu einer Einnahme.' : 'Eine Eingangsrechnung passt nur zu einer Ausgabe.');
+  }
+  const now = nowIso();
+  await tx(async () => {
+    await run("UPDATE cash_entries SET source = 'purchase', purchase_id = ?, updated_at = ? WHERE id = ?", p.id, now, entry.id);
+    await run("UPDATE purchase_invoices SET status = 'paid', paid_at = ?, updated_at = ? WHERE id = ?", entry.entry_date, now, p.id);
+  });
+  return { entry, purchase: p };
+}
+
+/** Freie Buchung, aus der eine Eingangsrechnung angelegt werden kann (sonst Fehler) */
+export async function entryForPurchase(t: Tenant, entryId: number): Promise<CashEntry & { file_count: number }> {
+  const e = await one<CashEntry & { file_count: number }>(
+    `SELECT e.*, (SELECT COUNT(*) FROM cash_entry_files f WHERE f.entry_id = e.id) file_count
+     FROM cash_entries e WHERE e.tenant_id = ? AND e.id = ?`, t.id, entryId,
+  );
+  if (!e) throw new UserError('Buchung nicht gefunden.');
+  if (e.source !== 'manual') throw new UserError('Nur aus freien Buchungen lässt sich eine Eingangsrechnung anlegen.');
+  if (e.amount === 0) throw new UserError('Die Buchung hat keinen Betrag.');
+  assertOpen(t, e.entry_date);
+  return { ...e, file_count: Number(e.file_count) };
+}
+
+/**
+ * Ersten Beleg einer Buchung (Foto der Quittung, PDF) als Datei der Eingangsrechnung übernehmen.
+ * Beide liegen in derselben Ablage (data/verbindlichkeiten), es wird nur der Verweis umgehängt.
+ */
+export async function moveEntryFileToPurchase(entryId: number, purchaseId: number): Promise<boolean> {
+  const f = await one<{ id: number; file_name: string; file_path: string; file_mime: string; file_size: number; file_sha256: string }>(
+    'SELECT * FROM cash_entry_files WHERE entry_id = ? ORDER BY id LIMIT 1', entryId,
+  );
+  if (!f) return false;
+  await run(
+    "UPDATE purchase_invoices SET file_name = ?, file_path = ?, file_mime = ?, file_size = ?, file_sha256 = ?, updated_at = ? WHERE id = ? AND file_path = ''",
+    f.file_name, f.file_path, f.file_mime, f.file_size, f.file_sha256, nowIso(), purchaseId,
+  );
+  await run('DELETE FROM cash_entry_files WHERE id = ?', f.id);
+  return true;
+}
+
+/** Eingangsrechnungen ohne Buchung, die zu einer freien Buchung passen könnten (passender Betrag zuerst) */
+export async function purchaseCandidates(t: Tenant, entry: CashEntry): Promise<PurchaseCandidate[]> {
+  const rows = await all<PurchaseCandidate & { gross_total: number; prepaid_total: number }>(
+    `SELECT p.id, p.number, p.issue_date, p.status, p.gross_total, p.prepaid_total, COALESCE(NULLIF(c.company, ''), c.name) supplier
+     FROM purchase_invoices p LEFT JOIN contacts c ON c.id = p.contact_id
+     WHERE p.tenant_id = ? AND p.status IN ('open', 'paid') AND p.is_credit = ?
+       AND NOT EXISTS (SELECT 1 FROM cash_entries e WHERE e.purchase_id = p.id)
+     ORDER BY (p.gross_total - p.prepaid_total = ?) DESC, ABS(DATEDIFF(COALESCE(p.issue_date, p.created_at), ?)), p.id DESC
+     LIMIT 100`,
+    t.id, entry.amount > 0 ? 1 : 0, Math.abs(entry.amount), entry.entry_date,
+  );
+  return rows.map((r) => ({ ...r, amount: Number(r.gross_total) - Number(r.prepaid_total) }));
+}
+
+/** Freie Buchungen, die zu einer Eingangsrechnung passen könnten (passender Betrag, nahes Datum zuerst) */
+export async function entryCandidates(t: Tenant, p: { is_credit: number; gross_total: number; prepaid_total: number; issue_date: string | null }): Promise<EntryCandidate[]> {
+  return all<EntryCandidate>(
+    `SELECT e.id, e.entry_date, e.text, e.amount, a.name account FROM cash_entries e JOIN cash_accounts a ON a.id = e.account_id
+     WHERE e.tenant_id = ? AND e.source = 'manual' AND ${p.is_credit ? 'e.amount > 0' : 'e.amount < 0'} AND e.entry_date > ?
+     ORDER BY (ABS(e.amount) = ?) DESC, ABS(DATEDIFF(e.entry_date, ?)), e.id DESC
+     LIMIT 100`,
+    t.id, t.cashbook_locked_until ?? '0000-01-01', Number(p.gross_total) - Number(p.prepaid_total), p.issue_date ?? today(),
+  );
+}
+
 /** Freie Buchung oder Umbuchung (beide Seiten) löschen */
 export async function deleteEntry(t: Tenant, entry: CashEntry): Promise<void> {
   if (entry.source !== 'manual' && entry.source !== 'transfer') {

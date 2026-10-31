@@ -9,7 +9,7 @@ import { cashbookEnabled } from '../cashbook/repo.ts';
 import { filesFrom } from '../cashbook/files.ts';
 import { fileUploader } from '../cashbook/routes.ts';
 import { importPurchaseFile, importRedirect } from '../purchases/routes.ts';
-import { addInbox, combine, dropInbox, getInbox, inboxOf, readInbox, removeInboxFile, type InboxFile } from './repo.ts';
+import { addInbox, assignInbox, attachTargets, combine, dropInbox, getInbox, inboxOf, readInbox, removeInboxFile, type AttachTargets, type InboxFile } from './repo.ts';
 import type { App, Ctx, Module, Tenant } from '../../types.ts';
 
 /**
@@ -21,7 +21,20 @@ import type { App, Ctx, Module, Tenant } from '../../types.ts';
  * - „Alle Belege“: Eingangsrechnungen, Kassenbuch-Belege und Belegeingang in einer Liste.
  */
 
-type Target = 'purchase' | 'cash' | 'later';
+type Target = 'purchase' | 'cash' | 'existing' | 'later';
+
+/** Auswahl einer vorhandenen Eingangsrechnung (ohne Datei) oder Buchung */
+function existingSelect(x: AttachTargets, name = 'existing'): SafeHtml {
+  return html`<select name="${name}" aria-label="Vorhandene Buchung oder Eingangsrechnung">
+    <option value="">– bitte wählen –</option>
+    ${x.purchases.length ? html`<optgroup label="Eingangsrechnungen ohne Beleg">${x.purchases.map((p) => html`<option value="p:${p.id}">${
+      [p.supplier || 'ohne Lieferant', p.number || 'ohne Nr.', p.issue_date ? formatDate(p.issue_date) : '', formatMoney(p.is_credit ? -p.gross_total : p.gross_total)].filter(Boolean).join(' · ')}</option>`)}</optgroup>` : ''}
+    ${x.entries.length ? html`<optgroup label="Kassenbuch-Buchungen">${x.entries.map((e) => html`<option value="e:${e.id}">${
+      [formatDate(e.entry_date), e.account, e.text, formatMoney(e.amount), e.files ? `📎 ${e.files}` : ''].filter(Boolean).join(' · ')}</option>`)}</optgroup>` : ''}
+  </select>`;
+}
+
+const hasTargets = (x: AttachTargets) => x.purchases.length + x.entries.length > 0;
 
 function postButton(c: Ctx, action: string, label: string, cls = 'btn', confirm?: string): SafeHtml {
   return html`<form method="post" action="${action}" class="inline" ${confirm ? html`data-confirm="${confirm}"` : ''}>${csrfField(c)}<button class="${cls}">${label}</button></form>`;
@@ -36,7 +49,7 @@ function thumb(f: InboxFile): SafeHtml {
   </a>`;
 }
 
-function inboxCard(c: Ctx, t: Tenant, f: InboxFile): SafeHtml {
+function inboxCard(c: Ctx, t: Tenant, f: InboxFile, targets: AttachTargets): SafeHtml {
   return html`<li class="inbox-item">
     ${thumb(f)}
     <div class="inbox-meta">
@@ -47,17 +60,24 @@ function inboxCard(c: Ctx, t: Tenant, f: InboxFile): SafeHtml {
         ${cashbookEnabled(t) ? html`<a class="btn small" href="/cashbook/new?inbox=${f.id}">Als Buchung</a>` : ''}
         ${postButton(c, `/inbox/${f.id}/delete`, 'Löschen', 'btn small ghost danger', `Beleg „${f.file_name}“ endgültig löschen?`)}
       </div>
+      ${hasTargets(targets) ? html`<form method="post" action="/inbox/${f.id}/assign" class="inline-form">
+        ${csrfField(c)}${existingSelect(targets, 'target')}<button class="btn small">Zuordnen</button>
+      </form>` : ''}
     </div>
   </li>`;
 }
 
-function targetChoice(t: Tenant, current: Target): SafeHtml {
+function targetChoice(t: Tenant, current: Target, targets: AttachTargets): SafeHtml {
   const opt = (value: Target, label: string, hint: string) => html`<label class="target-option">
     <input type="radio" name="target" value="${value}"${checked(current === value)}>
     <span><strong>${label}</strong><small class="muted">${hint}</small></span></label>`;
   return html`<fieldset class="target-choice"><legend>Was ist das für ein Beleg?</legend>
     ${opt('purchase', 'Eingangsrechnung', 'Rechnung eines Lieferanten – danach Betrag, Lieferant und Kostenart erfassen. E-Rechnungen werden automatisch übernommen.')}
     ${cashbookEnabled(t) ? opt('cash', 'Kassenbuch-Buchung', 'Quittung, Kassenbon, Auslage aus der Barkasse – danach direkt die Buchung erfassen.') : ''}
+    ${hasTargets(targets) ? html`${opt('existing', 'Zu vorhandener Buchung oder Eingangsrechnung', cashbookEnabled(t)
+        ? 'Die Ausgabe ist schon gebucht bzw. die Rechnung schon erfasst – der Beleg wird nur noch hinterlegt.'
+        : 'Die Rechnung ist schon erfasst – der Beleg wird nur noch hinterlegt.')}
+      <label data-show-if="target=existing">Zuordnen zu ${existingSelect(targets)}</label>` : ''}
     ${opt('later', 'Später zuordnen', 'Erst einmal ablegen – im Belegeingang wartet der Beleg auf die Zuordnung.')}
   </fieldset>`;
 }
@@ -68,14 +88,15 @@ function register(app: App) {
   app.get('/capture', async (c) => {
     const t = tenantOf(c);
     const q = c.req.query('target');
-    const target: Target = q === 'purchase' || q === 'later' || (q === 'cash' && cashbookEnabled(t)) ? q : 'later';
+    const target: Target = q === 'purchase' || q === 'later' || q === 'existing' || (q === 'cash' && cashbookEnabled(t)) ? q : 'later';
+    const targets = await attachTargets(t, cashbookEnabled(t));
     return page(c, {
       title: 'Beleg erfassen',
       back: { href: '/', label: 'Übersicht' },
       body: html`<form method="post" action="/capture" enctype="multipart/form-data" class="card stack capture-form">
         ${csrfField(c)}
         ${fileUploader('Beleg', [], undefined, 'Mehrere Fotos nacheinander aufnehmen, wenn der Beleg mehrere Seiten hat – sie werden zu einem PDF zusammengefasst. PDF, JPEG oder PNG, je höchstens 10 MB.')}
-        ${targetChoice(t, target)}
+        ${targetChoice(t, target, targets)}
         <label>Notiz (optional) <input name="note" maxlength="300" placeholder="z. B. Getränke fürs Sommerfest, bar bezahlt"></label>
         <div class="form-actions"><button class="btn primary">Weiter</button> <a class="btn ghost" href="/inbox">Belegeingang</a></div>
       </form>`,
@@ -87,7 +108,9 @@ function register(app: App) {
     const user = userOf(c);
     const form = await readForm(c);
     const raw = str(form, 'target');
-    const target: Target = raw === 'cash' && cashbookEnabled(t) ? 'cash' : raw === 'later' ? 'later' : 'purchase';
+    const target: Target = raw === 'cash' && cashbookEnabled(t) ? 'cash' : raw === 'later' ? 'later' : raw === 'existing' ? 'existing' : 'purchase';
+    const existing = str(form, 'existing');
+    if (target === 'existing' && !existing) return redirectWith(c, '/capture?target=existing', 'error', 'Bitte die Buchung bzw. Eingangsrechnung auswählen.');
     const note = str(form, 'note', 300);
     let prepared;
     try {
@@ -108,6 +131,17 @@ function register(app: App) {
     }
     const id = await addInbox(t, user.id, prepared, note);
     await audit(c, 'inbox.add', prepared.name);
+    if (target === 'existing') {
+      try {
+        const r = await assignInbox(t, id, existing, user.id, cashbookEnabled(t));
+        await audit(c, 'inbox.assign', `${prepared.name} → ${r.label}`);
+        return redirectWith(c, r.href, 'ok', `Beleg hinterlegt bei ${r.label}.`);
+      } catch (err) {
+        // Beleg nicht verlieren – er bleibt im Belegeingang
+        if (err instanceof UserError) return redirectWith(c, '/inbox', 'error', `${err.message} Der Beleg liegt im Belegeingang.`);
+        throw err;
+      }
+    }
     if (target === 'cash') return redirectWith(c, `/cashbook/new?inbox=${id}`, 'ok', 'Beleg gespeichert – jetzt die Buchung erfassen.');
     return redirectWith(c, '/inbox', 'ok', 'Beleg im Belegeingang abgelegt.');
   });
@@ -118,6 +152,7 @@ function register(app: App) {
     const t = tenantOf(c);
     const tab = c.req.query('tab') === 'all' ? 'all' : 'open';
     const items = await inboxOf(t.id);
+    const targets = items.length ? await attachTargets(t, cashbookEnabled(t)) : { purchases: [], entries: [] };
     const tabs = html`<div class="tabs">
       <a href="/inbox" class="${tab === 'open' ? 'active' : ''}">Nicht zugeordnet <span class="count">${items.length}</span></a>
       <a href="/inbox?tab=all" class="${tab === 'all' ? 'active' : ''}">Alle Belege</a>
@@ -136,7 +171,7 @@ function register(app: App) {
         actions: html`<a class="btn primary" href="/capture">Beleg erfassen</a>`,
         body: html`${tabs}
         ${items.length
-          ? html`<ul class="plain inbox-grid">${items.map((f) => inboxCard(c, t, f))}</ul>`
+          ? html`<ul class="plain inbox-grid">${items.map((f) => inboxCard(c, t, f, targets))}</ul>`
           : empty('Keine offenen Belege – alles zugeordnet.')}
         ${uploadCard}
         <p class="muted small">Belege im Eingang liegen unter <code>data/other</code> und werden beim Zuordnen zur Eingangsrechnung bzw. Buchung verschoben.</p>`,
@@ -225,6 +260,15 @@ function register(app: App) {
     await dropInbox(f);
     await removeInboxFile(f);
     return importRedirect(c, r);
+  });
+
+  /** Vorhandener Eingangsrechnung (ohne Datei) oder Buchung zuordnen */
+  app.post('/inbox/:id/assign', async (c) => {
+    const t = tenantOf(c);
+    const f = await getInbox(t.id, idParam(c)) ?? notFound();
+    const r = await assignInbox(t, f.id, str(await readForm(c), 'target'), userOf(c).id, cashbookEnabled(t));
+    await audit(c, 'inbox.assign', `${f.file_name} → ${r.label}`);
+    return redirectWith(c, r.href, 'ok', `Beleg hinterlegt bei ${r.label}.`);
   });
 
   app.post('/inbox/:id/delete', async (c) => {

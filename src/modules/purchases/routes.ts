@@ -1,11 +1,11 @@
 import { sphereLabel } from '../../lib/nonprofit.ts';
-import { accountsOf, bookLinked, cashbookEnabled, getAccount, linkedEntry, unlink } from '../cashbook/repo.ts';
+import { accountsOf, bookLinked, cashbookEnabled, entryCandidates, entryForPurchase, getAccount, linkEntryToPurchase, linkedEntry, moveEntryFileToPurchase, unlink } from '../cashbook/repo.ts';
 import { accountSelect } from '../cashbook/routes.ts';
 import { all, one, tx } from '../../db/index.ts';
 import { audit } from '../../lib/audit.ts';
 import { formatDate, isIsoDate, monthEnd, monthLabel, paidPeriod, today } from '../../lib/dates.ts';
 import { readStoredFile } from '../../lib/files.ts';
-import { categoryLabel } from '../../lib/expenses.ts';
+import { categoryLabel, isExpenseCategory } from '../../lib/expenses.ts';
 import { html, type SafeHtml } from '../../lib/html.ts';
 import { attachment, idParam, notFound, readForm, redirectWith, str, tenantOf, userOf, UserError, type Form } from '../../lib/http.ts';
 import { formatIban } from '../../lib/validate.ts';
@@ -15,7 +15,7 @@ import { EInvoiceError, readEInvoice } from '../../einvoice/parse.ts';
 import { contactLabel, getContact, supplierOptions } from '../contacts.ts';
 import {
   createFromEInvoice, createFromUpload, deletePurchase, detectFile, emptyInput, findBySha, getPurchase, getTaxes, MAX_FILE_SIZE,
-  parsePurchaseForm, payable, purchaseToInput, savePurchase, setPaid, sha256, SIGNED, type EInvoiceInfo, type Purchase,
+  parsePurchaseForm, payable, purchaseToInput, savePurchase, setPaid, sha256, SIGNED, taxRow, type EInvoiceInfo, type Purchase,
 } from './repo.ts';
 import {
   einvoiceDetails, previewFrame, purchaseBadge, purchaseForm, purchaseStatus, purchaseTable, purchaseTitle, taxSummary, uploadCard,
@@ -200,30 +200,62 @@ function register(app: App) {
   app.get('/purchases/new', async (c) => {
     const t = tenantOf(c);
     const contact = c.req.query('contact') ? await getContact(t.id, Number(c.req.query('contact'))) : undefined;
+    const input = emptyInput(contact);
+    // aus einer freien Buchung anlegen: Datum, Betrag, Text, Kostenart, Bereich und Zahlung übernehmen
+    const entryId = cashbookEnabled(t) ? Number(c.req.query('entry') ?? 0) : 0;
+    const entry = entryId ? await entryForPurchase(t, entryId) : null;
+    if (entry) {
+      const gross = Math.abs(entry.amount);
+      const rate = t.small_business ? 0 : entry.vat_rate;
+      Object.assign(input, {
+        issue_date: entry.entry_date, paid_at: entry.entry_date, description: entry.text, is_credit: entry.amount > 0,
+        category: isExpenseCategory(entry.category) ? entry.category : input.category, sphere: entry.sphere,
+        taxes: [taxRow(rate, null, null, gross)!],
+      });
+    }
     return page(c, {
       title: 'Eingangsrechnung erfassen',
-      back: { href: '/purchases', label: 'Eingangsrechnungen' },
-      body: purchaseForm(c, '/purchases', emptyInput(contact), await supplierOptions(t.id, contact?.id), {
+      back: entry ? { href: `/cashbook/entries/${entry.id}/edit`, label: 'Buchung' } : { href: '/purchases', label: 'Eingangsrechnungen' },
+      body: purchaseForm(c, '/purchases', input, await supplierOptions(t.id, contact?.id), {
         smallBusiness: !!t.small_business, defaultSphere: t.nonprofit ? t.default_sphere : null,
-        accounts: cashbookEnabled(t) ? await accountsOf(t.id) : [],
+        accounts: cashbookEnabled(t) ? await accountsOf(t.id) : [], paidAccountId: entry?.account_id ?? null,
+        extra: entry ? html`<input type="hidden" name="from_entry" value="${entry.id}">
+          <div class="notice soft">Aus der Buchung vom ${formatDate(entry.entry_date)} „${entry.text}“ (${formatMoney(entry.amount)}): Die Buchung wird zur Zahlung
+            dieser Rechnung – es entsteht keine zweite Buchung, die Rechnung gilt ab dem Buchungstag als bezahlt.
+            Bitte noch Lieferant und Rechnungsnummer ergänzen.
+            ${entry.file_count ? html`<label class="check"><input type="checkbox" name="take_file" value="1" checked> Beleg der Buchung als Rechnungsdatei übernehmen</label>` : ''}</div>` : undefined,
       }),
     });
   });
 
   app.post('/purchases', async (c) => {
     const t = tenantOf(c);
+    let fromEntry = 0;
     try {
       const form = await readForm(c);
+      fromEntry = cashbookEnabled(t) ? Number(str(form, 'from_entry')) || 0 : 0;
       const input = parsePurchaseForm(form, false);
-      const accountId = await requiredAccount(t, input.paid_at, form);
+      if (fromEntry) {
+        // die Buchung ist die Zahlung – kein eigenes Konto nötig, keine zweite Buchung
+        const entry = await entryForPurchase(t, fromEntry);
+        input.paid_at = entry.entry_date;
+        if (input.is_credit !== entry.amount > 0) throw new UserError(entry.amount > 0 ? 'Zu einer Einnahme passt nur eine Gutschrift.' : 'Zu einer Ausgabe passt keine Gutschrift.');
+      }
+      const accountId = fromEntry ? 0 : await requiredAccount(t, input.paid_at, form);
       const id = await tx(async () => {
         const newId = await savePurchase(t, userOf(c).id, null, input);
-        await syncPayment(t, newId, input.paid_at, accountId, userOf(c).id);
+        if (fromEntry) {
+          await linkEntryToPurchase(t, fromEntry, newId);
+          if (str(form, 'take_file')) await moveEntryFileToPurchase(fromEntry, newId);
+        } else {
+          await syncPayment(t, newId, input.paid_at, accountId, userOf(c).id);
+        }
         return newId;
       });
-      return redirectWith(c, `/purchases/${id}`, 'ok', 'Eingangsrechnung gespeichert.');
+      if (fromEntry) await audit(c, 'cashbook.entry.link', `Eingangsrechnung (ID ${id}) aus Buchung ID ${fromEntry} angelegt`);
+      return redirectWith(c, `/purchases/${id}`, 'ok', fromEntry ? 'Eingangsrechnung angelegt und mit der Buchung verbunden.' : 'Eingangsrechnung gespeichert.');
     } catch (err) {
-      if (err instanceof UserError) return redirectWith(c, '/purchases/new', 'error', err.message);
+      if (err instanceof UserError) return redirectWith(c, fromEntry ? `/purchases/new?entry=${fromEntry}` : '/purchases/new', 'error', err.message);
       throw err;
     }
   });
@@ -251,6 +283,8 @@ function register(app: App) {
     if (t.nonprofit) meta.push(['Bereich', sphereLabel(p.sphere || t.default_sphere)]);
     const payment = await linkedEntry('purchase', p.id);
     const cashAccounts = cashbookEnabled(t) ? await accountsOf(t.id) : [];
+    // schon frei im Kassenbuch gebucht? → verbinden statt doppelt buchen
+    const candidates = cashAccounts.length && !payment ? await entryCandidates(t, p) : [];
     if (payment) meta.push(['Zahlung', html`${formatMoney(-payment.amount)} von <a href="/cashbook?account=${payment.account_id}">${(await getAccount(t.id, payment.account_id))?.name ?? 'Konto'}</a>`]);
     if (p.description) meta.push(['Beschreibung', p.description]);
     if (p.iban) meta.push(['Bankverbindung', `${formatIban(p.iban)}${info?.bic ? ` · ${info.bic}` : ''}`]);
@@ -280,6 +314,20 @@ function register(app: App) {
         <div>
           <section class="card"><dl class="dl cols">${meta.map(([l, v]) => html`<dt>${l}</dt><dd>${v}</dd>`)}</dl></section>
           ${taxSummary(taxes, p)}
+          ${candidates.length ? html`<section class="card">
+            <h2>Schon im Kassenbuch gebucht?</h2>
+            <p class="muted small">Wurde die Ausgabe bereits als freie Buchung erfasst (z. B. bar bezahlt, Rechnung kam später), hier verbinden statt nochmals
+              „Als bezahlt buchen“ – sonst steht sie doppelt im Kassenbuch. Betrag, Datum und Konto der Buchung bleiben; die Rechnung gilt ab dem Buchungstag als bezahlt.</p>
+            <form method="post" action="/purchases/${p.id}/link-entry" class="inline-form"
+              data-confirm="Eingangsrechnung mit der gewählten Buchung verbinden?">
+              ${csrfField(c)}
+              <select name="entry_id" required aria-label="Buchung">
+                ${candidates.map((e) => html`<option value="${e.id}">${[formatDate(e.entry_date), e.account, e.text, formatMoney(e.amount),
+                  Math.abs(e.amount) === payable(p) ? '✓ Betrag passt' : ''].filter(Boolean).join(' · ')}</option>`)}
+              </select>
+              <button class="btn">Verbinden</button>
+            </form>
+          </section>` : ''}
           ${info ? einvoiceDetails(info) : ''}
         </div>
         ${p.file_path && p.file_mime !== 'application/xml' ? html`<aside>${previewFrame(p)}</aside>` : ''}
@@ -349,6 +397,17 @@ function register(app: App) {
       }
     });
     return redirectWith(c, `/purchases/${p.id}`, 'ok', accountId ? 'Als bezahlt gebucht.' : 'Als bezahlt markiert.');
+  });
+
+  /** Bereits frei gebuchte Zahlung nachträglich mit der Eingangsrechnung verbinden */
+  app.post('/purchases/:id/link-entry', async (c) => {
+    const t = tenantOf(c);
+    const p = (await getPurchase(t.id, idParam(c))) ?? notFound();
+    if (!cashbookEnabled(t)) notFound();
+    const form = await readForm(c);
+    const { entry } = await linkEntryToPurchase(t, Number(str(form, 'entry_id')), p.id);
+    await audit(c, 'cashbook.entry.link', `${formatDate(entry.entry_date)} ${formatMoney(entry.amount)} „${entry.text}“ → Eingangsrechnung ${purchaseTitle(p)} (ID ${p.id})`);
+    return redirectWith(c, `/purchases/${p.id}`, 'ok', `Mit der Buchung vom ${formatDate(entry.entry_date)} verbunden – als bezahlt markiert.`);
   });
 
   app.post('/purchases/:id/open', async (c) => {
