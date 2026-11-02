@@ -153,7 +153,7 @@ async function revenueYears(tenantId: number, current: string): Promise<string[]
   const rows = await all<{ y: string }>(
     `SELECT DISTINCT substr(issue_date, 1, 4) y FROM documents WHERE tenant_id = ? AND kind = 'invoice' AND finalized_at IS NOT NULL
      UNION SELECT DISTINCT substr(paid_at, 1, 4) y FROM documents WHERE tenant_id = ? AND kind = 'invoice' AND paid_at IS NOT NULL
-     UNION SELECT DISTINCT substr(issue_date, 1, 4) y FROM purchase_invoices WHERE tenant_id = ? AND status <> 'draft' AND issue_date IS NOT NULL
+     UNION SELECT DISTINCT substr(issue_date, 1, 4) y FROM purchase_invoices WHERE tenant_id = ? AND status NOT IN ('draft', 'archived') AND issue_date IS NOT NULL
      UNION SELECT DISTINCT substr(paid_at, 1, 4) y FROM purchase_invoices WHERE tenant_id = ? AND status = 'paid' AND paid_at IS NOT NULL
      UNION SELECT DISTINCT substr(entry_date, 1, 4) y FROM cash_entries WHERE tenant_id = ?`,
     tenantId, tenantId, tenantId, tenantId, tenantId,

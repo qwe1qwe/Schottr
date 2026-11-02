@@ -341,7 +341,7 @@ function register(app: App, kind: Kind) {
           ? (doc.status !== 'paid' && cashAccounts.length
               ? ''
               : postButton(c, `${base}/${doc.id}/paid`, doc.status === 'paid' ? 'Als offen markieren' : 'Als bezahlt markieren', doc.status === 'paid' ? 'btn ghost' : 'btn primary',
-                  payment ? 'Wieder als offen markieren? Die Buchung im Kassenbuch wird entfernt.' : undefined))
+                  payment ? 'Wieder als offen markieren? Die Zahlung bleibt im Kassenbuch stehen und wird storniert.' : undefined))
           : ''}`;
     }
 
@@ -552,7 +552,7 @@ function register(app: App, kind: Kind) {
       const date = str(form, 'paid_at') || today();
       if (!isIsoDate(date)) throw new UserError('Ungültiges Datum.');
       const accountId = Number(str(form, 'account_id')) || 0;
-      if (!paid) await unlink(t, 'invoice', doc.id);
+      if (!paid) await unlink(t, 'invoice', doc.id, userOf(c).id);
       await tx(async () => {
         await run('UPDATE documents SET status = ?, paid_at = ?, updated_at = ? WHERE id = ?', paid ? 'paid' : 'open', paid ? date : null, nowIso(), doc.id);
         if (paid && accountId) {

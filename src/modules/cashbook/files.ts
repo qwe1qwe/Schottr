@@ -1,5 +1,5 @@
 import { all, one, run, nowIso } from '../../db/index.ts';
-import { readStoredFile, removeStoredFile, saveFile } from '../../lib/files.ts';
+import { readStoredFile, saveFile } from '../../lib/files.ts';
 import { UserError } from '../../lib/http.ts';
 import type { Tenant } from '../../types.ts';
 
@@ -8,6 +8,8 @@ import type { Tenant } from '../../types.ts';
  * fotografiert). Die Dateien liegen in der Belegablage neben den Eingangsrechnungen
  * (data/verbindlichkeiten/<Mandant>/…, Name beginnt mit „kasse_“) – so braucht es kein
  * zusätzliches Docker-Volume. In der Datenbank stehen Verweis, Typ und Prüfsumme.
+ * Belege sind aufbewahrungspflichtig: Sie lassen sich nicht löschen oder austauschen, nur
+ * archivieren (z. B. versehentlich angehängtes Foto) – auch die Datenbank verhindert das Löschen.
  */
 export const MAX_ENTRY_FILE = 10 * 1024 * 1024;
 const AREA = 'verbindlichkeiten' as const;
@@ -20,6 +22,7 @@ export interface EntryFile {
   file_mime: string;
   file_size: number;
   created_at: string;
+  archived_at: string | null;
 }
 
 /** Dateityp anhand des Inhalts – nur PDF, JPEG und PNG */
@@ -71,7 +74,7 @@ export async function filesOf(entryId: number): Promise<EntryFile[]> {
 export async function fileCounts(entryIds: number[]): Promise<Map<number, number>> {
   if (!entryIds.length) return new Map();
   const rows = await all<{ entry_id: number; n: number }>(
-    `SELECT entry_id, COUNT(*) n FROM cash_entry_files WHERE entry_id IN (${entryIds.map(() => '?').join(',')}) GROUP BY entry_id`,
+    `SELECT entry_id, COUNT(*) n FROM cash_entry_files WHERE archived_at IS NULL AND entry_id IN (${entryIds.map(() => '?').join(',')}) GROUP BY entry_id`,
     ...entryIds,
   );
   return new Map(rows.map((r) => [r.entry_id, Number(r.n)]));
@@ -83,20 +86,13 @@ export async function getFile(tenantId: number, id: number) {
 
 export const readEntryFile = (f: Pick<EntryFile, 'file_path'>) => readStoredFile(AREA, f.file_path);
 
-export async function deleteFile(f: EntryFile) {
-  await run('DELETE FROM cash_entry_files WHERE id = ?', f.id);
-  await removeStoredFile(AREA, f.file_path);
+/** Beleg archivieren bzw. wiederherstellen – die Datei bleibt unverändert gespeichert */
+export async function setFileArchived(f: EntryFile, archived: boolean) {
+  await run('UPDATE cash_entry_files SET archived_at = ? WHERE id = ?', archived ? nowIso() : null, f.id);
 }
 
-/** Vor dem Löschen von Buchungen: Datensätze entfernen, Dateipfade zum anschließenden Aufräumen liefern */
-export async function detachAll(where: string, ...params: (string | number)[]): Promise<string[]> {
-  const rows = await all<{ id: number; file_path: string }>(
-    `SELECT f.id, f.file_path FROM cash_entry_files f JOIN cash_entries e ON e.id = f.entry_id WHERE ${where}`, ...params,
-  );
-  if (rows.length) await run(`DELETE FROM cash_entry_files WHERE id IN (${rows.map(() => '?').join(',')})`, ...rows.map((r) => r.id));
-  return rows.map((r) => r.file_path);
-}
-
-export async function removePaths(paths: string[]) {
-  for (const p of paths) await removeStoredFile(AREA, p);
+/** Hängen an Buchungen (auch archivierte) Belege? Dann lassen sich die Buchungen nicht löschen. */
+export async function hasFiles(entryIds: number[]): Promise<boolean> {
+  if (!entryIds.length) return false;
+  return !!await one(`SELECT 1 FROM cash_entry_files WHERE entry_id IN (${entryIds.map(() => '?').join(',')}) LIMIT 1`, ...entryIds);
 }

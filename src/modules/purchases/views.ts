@@ -12,6 +12,7 @@ import { dueOf, payable, type EInvoiceInfo, type Purchase, type PurchaseInput, t
 
 export const PURCHASE_STATUS: Record<string, string> = {
   draft: 'Zu erfassen',
+  archived: 'Archiviert',
   open: 'Offen',
   overdue: 'Überfällig',
   paid: 'Bezahlt',
@@ -26,7 +27,7 @@ export function purchaseStatus(p: Pick<Purchase, 'status' | 'due_date' | 'issue_
 }
 
 export function purchaseBadge(status: string): SafeHtml {
-  const cls = status === 'draft' ? 'todo' : status;
+  const cls = status === 'draft' ? 'todo' : status === 'archived' ? 'cancelled' : status;
   return html`<span class="badge badge-${cls}">${PURCHASE_STATUS[status] ?? status}</span>`;
 }
 

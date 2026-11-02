@@ -145,6 +145,8 @@ export function createApp() {
   );
 
   app.onError((err, c) => {
+    // Sperre der Datenbank (Trigger, z. B. „Belege sind aufbewahrungspflichtig“) wie einen fachlichen Fehler melden
+    if ((err as { code?: string }).code === 'ER_SIGNAL_EXCEPTION') err = new UserError((err as Error).message.replace(/ae/g, 'ä').replace(/oe/g, 'ö').replace(/ue/g, 'ü'));
     if (err instanceof UserError) {
       const back = c.req.header('referer');
       let target = '/';

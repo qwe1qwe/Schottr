@@ -9,7 +9,7 @@ import { cashbookEnabled } from '../cashbook/repo.ts';
 import { filesFrom } from '../cashbook/files.ts';
 import { fileUploader } from '../cashbook/routes.ts';
 import { importPurchaseFile, importRedirect } from '../purchases/routes.ts';
-import { addInbox, assignInbox, attachTargets, combine, dropInbox, getInbox, inboxOf, readInbox, removeInboxFile, type AttachTargets, type InboxFile } from './repo.ts';
+import { addInbox, archivedInbox, assignInbox, attachTargets, combine, getInbox, inboxOf, markAssigned, openInbox, readInbox, setInboxArchived, type AttachTargets, type InboxFile } from './repo.ts';
 import type { App, Ctx, Module, Tenant } from '../../types.ts';
 
 /**
@@ -17,7 +17,8 @@ import type { App, Ctx, Module, Tenant } from '../../types.ts';
  * - „Beleg erfassen“ (/capture): mit dem Handy fotografieren oder Datei wählen und gleich sagen,
  *   wohin damit – Eingangsrechnung, Kassenbuch-Buchung oder „später zuordnen“.
  * - Belegeingang (/inbox): noch nicht zugeordnete Belege (data/other/…), mit einem Klick als
- *   Eingangsrechnung übernehmen oder einer Buchung zuordnen – die Datei wird dabei verschoben.
+ *   Eingangsrechnung übernehmen oder einer Buchung zuordnen – die Datei wird dabei kopiert,
+ *   das Original bleibt erhalten. Belege sind aufbewahrungspflichtig: archivieren statt löschen.
  * - „Alle Belege“: Eingangsrechnungen, Kassenbuch-Belege und Belegeingang in einer Liste.
  */
 
@@ -58,7 +59,7 @@ function inboxCard(c: Ctx, t: Tenant, f: InboxFile, targets: AttachTargets): Saf
       <div class="inline-form">
         ${postButton(c, `/inbox/${f.id}/purchase`, 'Als Eingangsrechnung', 'btn small primary')}
         ${cashbookEnabled(t) ? html`<a class="btn small" href="/cashbook/new?inbox=${f.id}">Als Buchung</a>` : ''}
-        ${postButton(c, `/inbox/${f.id}/delete`, 'Löschen', 'btn small ghost danger', `Beleg „${f.file_name}“ endgültig löschen?`)}
+        ${postButton(c, `/inbox/${f.id}/archive`, 'Archivieren', 'btn small ghost danger', `Beleg „${f.file_name}“ archivieren? Er bleibt unverändert aufbewahrt (Aufbewahrungspflicht) und lässt sich wiederherstellen.`)}
       </div>
       ${hasTargets(targets) ? html`<form method="post" action="/inbox/${f.id}/assign" class="inline-form">
         ${csrfField(c)}${existingSelect(targets, 'target')}<button class="btn small">Zuordnen</button>
@@ -150,13 +151,34 @@ function register(app: App) {
 
   app.get('/inbox', async (c) => {
     const t = tenantOf(c);
-    const tab = c.req.query('tab') === 'all' ? 'all' : 'open';
+    const tabParam = c.req.query('tab');
+    const tab = tabParam === 'all' ? 'all' : tabParam === 'archived' ? 'archived' : 'open';
     const items = await inboxOf(t.id);
     const targets = items.length ? await attachTargets(t, cashbookEnabled(t)) : { purchases: [], entries: [] };
     const tabs = html`<div class="tabs">
       <a href="/inbox" class="${tab === 'open' ? 'active' : ''}">Nicht zugeordnet <span class="count">${items.length}</span></a>
       <a href="/inbox?tab=all" class="${tab === 'all' ? 'active' : ''}">Alle Belege</a>
+      <a href="/inbox?tab=archived" class="${tab === 'archived' ? 'active' : ''}">Archiviert</a>
     </div>`;
+    if (tab === 'archived') {
+      const archived = await archivedInbox(t.id);
+      return page(c, {
+        title: 'Belege',
+        actions: html`<a class="btn primary" href="/capture">Beleg erfassen</a>`,
+        body: html`${tabs}
+        ${archived.length
+          ? html`<ul class="plain inbox-grid">${archived.map((f) => html`<li class="inbox-item">
+              ${thumb(f)}
+              <div class="inbox-meta">
+                <strong class="truncate">${f.file_name}</strong>
+                <span class="muted small">hochgeladen ${formatDate(f.created_at.slice(0, 10))} · archiviert ${formatDate(String(f.archived_at).slice(0, 10))} · ${kb(f.file_size)}${f.note ? html` · ${f.note}` : ''}</span>
+                <div class="inline-form">${postButton(c, `/inbox/${f.id}/archive`, 'Wiederherstellen', 'btn small')}</div>
+              </div>
+            </li>`)}</ul>`
+          : empty('Keine archivierten Belege.')}
+        <p class="muted small">Archivierte Belege bleiben unverändert aufbewahrt (Aufbewahrungspflicht nach § 147 AO) und lassen sich jederzeit wiederherstellen.</p>`,
+      });
+    }
     const uploadCard = html`<section class="card">
       <form method="post" action="/capture" enctype="multipart/form-data" class="stack">
         ${csrfField(c)}<input type="hidden" name="target" value="later">
@@ -174,12 +196,13 @@ function register(app: App) {
           ? html`<ul class="plain inbox-grid">${items.map((f) => inboxCard(c, t, f, targets))}</ul>`
           : empty('Keine offenen Belege – alles zugeordnet.')}
         ${uploadCard}
-        <p class="muted small">Belege im Eingang liegen unter <code>data/other</code> und werden beim Zuordnen zur Eingangsrechnung bzw. Buchung verschoben.</p>`,
+        <p class="muted small">Belege im Eingang liegen unter <code>data/other</code> und werden beim Zuordnen zur Eingangsrechnung bzw. Buchung kopiert – das Original bleibt erhalten. Löschen ist nicht möglich, nur archivieren.</p>`,
       });
     }
 
     const q = (c.req.query('q') ?? '').trim().slice(0, 100);
     const like = `%${q}%`;
+    const archivedItems = await archivedInbox(t.id);
     type Row = { kind: 'purchase' | 'cash' | 'inbox'; date: string; title: string; sub: string; amount: number | null; href: string; file: string; name: string };
     const purchases = await all<{ id: number; issue_date: string | null; created_at: string; number: string; description: string; file_name: string; gross_total: number; is_credit: number; status: string; label: string | null }>(
       `SELECT p.id, p.issue_date, p.created_at, p.number, p.description, p.file_name, p.gross_total, p.is_credit, p.status,
@@ -191,10 +214,13 @@ function register(app: App) {
       t.id, ...(q ? Array(5).fill(like) : []),
     );
     const cash = cashbookEnabled(t)
-      ? await all<{ id: number; entry_id: number; file_name: string; entry_date: string; text: string; amount: number; account: string }>(
-        `SELECT f.id, f.entry_id, f.file_name, e.entry_date, e.text, e.amount, a.name account
+      ? await all<{ id: number; entry_id: number; file_name: string; entry_date: string; text: string; amount: number; account: string; archived_at: string | null }>(
+        `SELECT f.id, f.entry_id, f.file_name, f.archived_at, e.entry_date, e.text, e.amount, a.name account
          FROM cash_entry_files f JOIN cash_entries e ON e.id = f.entry_id JOIN cash_accounts a ON a.id = e.account_id
-         WHERE f.tenant_id = ? ${q ? 'AND (f.file_name LIKE ? OR e.text LIKE ? OR e.receipt_ref LIKE ?)' : ''}
+         WHERE f.tenant_id = ?
+           -- dieselbe Datei auch als Rechnungsdatei verwendet: nur einmal (bei der Eingangsrechnung) zeigen
+           AND NOT EXISTS (SELECT 1 FROM purchase_invoices p WHERE p.tenant_id = f.tenant_id AND p.file_path = f.file_path)
+           ${q ? 'AND (f.file_name LIKE ? OR e.text LIKE ? OR e.receipt_ref LIKE ?)' : ''}
          ORDER BY e.entry_date DESC, f.id DESC LIMIT 500`,
         t.id, ...(q ? Array(3).fill(like) : []),
       )
@@ -202,16 +228,16 @@ function register(app: App) {
     const rows: Row[] = [
       ...purchases.map((p): Row => ({
         kind: 'purchase', date: p.issue_date ?? p.created_at.slice(0, 10), title: p.label || (p.status === 'draft' ? 'Noch nicht erfasst' : 'Eingangsrechnung'),
-        sub: [p.number, p.description].filter(Boolean).join(' · '), amount: p.status === 'draft' ? null : (p.is_credit ? -p.gross_total : p.gross_total),
+        sub: [p.status === 'archived' ? 'archiviert' : '', p.number, p.description].filter(Boolean).join(' · '), amount: p.status === 'draft' || p.status === 'archived' ? null : (p.is_credit ? -p.gross_total : p.gross_total),
         href: p.status === 'draft' ? `/purchases/${p.id}/edit` : `/purchases/${p.id}`, file: `/purchases/${p.id}/file?inline=1`, name: p.file_name,
       })),
       ...cash.map((f): Row => ({
-        kind: 'cash', date: f.entry_date, title: f.text, sub: f.account, amount: f.amount,
+        kind: 'cash', date: f.entry_date, title: f.text, sub: f.archived_at ? `${f.account} · archiviert` : f.account, amount: f.amount,
         href: `/cashbook/entries/${f.entry_id}/edit`, file: `/cashbook/files/${f.id}?inline=1`, name: f.file_name,
       })),
-      ...items.filter((f) => !q || `${f.file_name} ${f.note}`.toLowerCase().includes(q.toLowerCase())).map((f): Row => ({
-        kind: 'inbox', date: f.created_at.slice(0, 10), title: 'Nicht zugeordnet', sub: f.note, amount: null,
-        href: '/inbox', file: `/inbox/${f.id}/file?inline=1`, name: f.file_name,
+      ...[...items, ...archivedItems].filter((f) => !q || `${f.file_name} ${f.note}`.toLowerCase().includes(q.toLowerCase())).map((f): Row => ({
+        kind: 'inbox', date: f.created_at.slice(0, 10), title: f.archived_at ? 'Archiviert' : 'Nicht zugeordnet', sub: f.note, amount: null,
+        href: f.archived_at ? '/inbox?tab=archived' : '/inbox', file: `/inbox/${f.id}/file?inline=1`, name: f.file_name,
       })),
     ].sort((a, b) => b.date.localeCompare(a.date));
     const KIND = { purchase: 'Eingangsrechnung', cash: 'Kassenbuch', inbox: 'Belegeingang' } as const;
@@ -250,15 +276,14 @@ function register(app: App) {
   /** Als Eingangsrechnung übernehmen – die Datei wandert in die Belegablage der Eingangsrechnungen */
   app.post('/inbox/:id/purchase', async (c) => {
     const t = tenantOf(c);
-    const f = await getInbox(t.id, idParam(c)) ?? notFound();
+    const f = await openInbox(t.id, idParam(c));
     const r = await importPurchaseFile(c, t, userOf(c).id, { name: f.file_name, data: new Uint8Array(await readInbox(f)) });
     if (r.kind === 'skipped') {
       return r.id
         ? redirectWith(c, '/inbox', 'error', `„${f.file_name}“ ist bereits als Eingangsrechnung erfasst – den Eintrag im Belegeingang kannst du löschen.`)
         : redirectWith(c, '/inbox', 'error', `„${f.file_name}“: ${r.message}.`);
     }
-    await dropInbox(f);
-    await removeInboxFile(f);
+    await markAssigned(f, `Eingangsrechnung ID ${r.id}`);
     return importRedirect(c, r);
   });
 
@@ -271,13 +296,13 @@ function register(app: App) {
     return redirectWith(c, r.href, 'ok', `Beleg hinterlegt bei ${r.label}.`);
   });
 
-  app.post('/inbox/:id/delete', async (c) => {
+  /** Archivieren statt Löschen – Belege sind aufbewahrungspflichtig */
+  app.post('/inbox/:id/archive', async (c) => {
     const t = tenantOf(c);
     const f = await getInbox(t.id, idParam(c)) ?? notFound();
-    await tx(() => dropInbox(f));
-    await removeInboxFile(f);
-    await audit(c, 'inbox.delete', f.file_name);
-    return redirectWith(c, '/inbox', 'ok', 'Beleg gelöscht.');
+    await setInboxArchived(f, !f.archived_at);
+    await audit(c, f.archived_at ? 'inbox.restore' : 'inbox.archive', f.file_name);
+    return redirectWith(c, f.archived_at ? '/inbox' : '/inbox?tab=archived', 'ok', f.archived_at ? 'Beleg wiederhergestellt.' : 'Beleg archiviert – er bleibt unverändert aufbewahrt.');
   });
 }
 

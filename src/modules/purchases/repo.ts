@@ -5,7 +5,7 @@ import { UserError, list, str, type Form } from '../../lib/http.ts';
 import { parseDecimal, roundDiv } from '../../lib/money.ts';
 import { isValidEmail, isValidVatId, normalizeVatId, isCountryCode } from '../../lib/validate.ts';
 import { DEFAULT_CATEGORY, isExpenseCategory } from '../../lib/expenses.ts';
-import { removeStoredFile, saveFile, sha256 } from '../../lib/files.ts';
+import { discardUnreferenced, saveFile, sha256 } from '../../lib/files.ts';
 import type { IncomingInvoice, IncomingParty } from '../../einvoice/parse.ts';
 import { getContact, insertContact, isSupplier, type Contact } from '../contacts.ts';
 import type { Tenant } from '../../types.ts';
@@ -15,13 +15,17 @@ import type { Tenant } from '../../types.ts';
  * Status: draft = Beleg hochgeladen, Angaben fehlen noch · open = zu zahlen · paid = bezahlt.
  * Beträge positiv in Cent; Gutschriften (is_credit) zählen in Auswertungen negativ.
  */
-export type PurchaseStatus = 'draft' | 'open' | 'paid';
+export type PurchaseStatus = 'draft' | 'open' | 'paid' | 'archived';
 
 export interface Purchase {
   id: number;
   tenant_id: number;
   contact_id: number | null;
   status: PurchaseStatus;
+  /** beim Archivieren: vorheriger Status (zum Wiederherstellen) */
+  archived_from: string;
+  archived_at: string | null;
+  archive_reason: string;
   is_credit: number;
   number: string;
   issue_date: string | null;
@@ -120,7 +124,7 @@ export function detectFile(data: Uint8Array): FileKind | null {
 }
 
 export async function findBySha(tenantId: number, hash: string) {
-  return one<{ id: number }>('SELECT id FROM purchase_invoices WHERE tenant_id = ? AND file_sha256 = ? LIMIT 1', tenantId, hash);
+  return one<{ id: number }>("SELECT id FROM purchase_invoices WHERE tenant_id = ? AND file_sha256 = ? AND status <> 'archived' LIMIT 1", tenantId, hash);
 }
 
 /* ---------------- Lieferanten ---------------- */
@@ -194,7 +198,7 @@ export async function createFromUpload(t: Tenant, userId: number, file: Uploaded
   try {
     return await insertPurchase(t, userId, { status: 'draft', category: DEFAULT_CATEGORY, ...fileColumns(file, stored) });
   } catch (err) {
-    await removeStoredFile('verbindlichkeiten', stored.path);
+    await discardUnreferenced('verbindlichkeiten', stored.path);
     throw err;
   }
 }
@@ -206,7 +210,7 @@ export async function createFromEInvoice(t: Tenant, userId: number, file: Upload
     return await tx(async () => {
       const { contact, created } = await findOrCreateSupplier(t, inv.seller);
       const dup = await one<{ id: number }>(
-        "SELECT id FROM purchase_invoices WHERE tenant_id = ? AND contact_id = ? AND number = ? AND number <> '' LIMIT 1",
+        "SELECT id FROM purchase_invoices WHERE tenant_id = ? AND contact_id = ? AND number = ? AND number <> '' AND status <> 'archived' LIMIT 1",
         t.id, contact.id, inv.number,
       );
       if (dup) throw new UserError(`Die Rechnung ${inv.number} von ${contact.company || contact.name} ist bereits erfasst.`);
@@ -243,7 +247,7 @@ export async function createFromEInvoice(t: Tenant, userId: number, file: Upload
       return { id, supplierCreated: created };
     });
   } catch (err) {
-    await removeStoredFile('verbindlichkeiten', stored.path);
+    await discardUnreferenced('verbindlichkeiten', stored.path);
     throw err;
   }
 }
@@ -358,6 +362,7 @@ async function resolveSupplier(t: Tenant, input: PurchaseInput): Promise<number>
 
 /** Neu anlegen (ohne Datei) oder einen Beleg speichern. Liefert die ID. */
 export async function savePurchase(t: Tenant, userId: number, existing: Purchase | null, input: PurchaseInput): Promise<number> {
+  if (existing) assertNotArchived(existing);
   const locked = !!existing?.einvoice_format;
   return tx(async () => {
     const status = input.paid_at ? 'paid' : existing && existing.status !== 'draft' && locked && payable(existing) <= 0 ? 'paid' : 'open';
@@ -382,7 +387,7 @@ export async function savePurchase(t: Tenant, userId: number, existing: Purchase
       contactId = await resolveSupplier(t, input);
       if (input.number) {
         const dup = await one<{ id: number }>(
-          'SELECT id FROM purchase_invoices WHERE tenant_id = ? AND contact_id = ? AND number = ? AND id <> ? LIMIT 1',
+          "SELECT id FROM purchase_invoices WHERE tenant_id = ? AND contact_id = ? AND number = ? AND id <> ? AND status <> 'archived' LIMIT 1",
           t.id, contactId, input.number, existing?.id ?? 0,
         );
         if (dup) throw new UserError(`Die Rechnungsnummer ${input.number} ist für diesen Lieferanten bereits erfasst.`);
@@ -417,15 +422,37 @@ export async function savePurchase(t: Tenant, userId: number, existing: Purchase
 }
 
 export async function setPaid(p: Purchase, paidAt: string | null) {
+  assertNotArchived(p);
   await run(
     'UPDATE purchase_invoices SET status = ?, paid_at = ?, updated_at = ? WHERE id = ?',
     paidAt ? 'paid' : 'open', paidAt, nowIso(), p.id,
   );
 }
 
-export async function deletePurchase(p: Purchase) {
-  await run('DELETE FROM purchase_invoices WHERE id = ?', p.id);
-  if (p.file_path) await removeStoredFile('verbindlichkeiten', p.file_path);
+export function assertNotArchived(p: Pick<Purchase, 'status'>) {
+  if (p.status === 'archived') throw new UserError('Die Eingangsrechnung ist archiviert – zum Bearbeiten zuerst wiederherstellen.');
+}
+
+/**
+ * Archivieren statt Löschen: Eingangsrechnungen und ihre Belegdateien sind aufbewahrungspflichtig
+ * und bleiben unverändert gespeichert (Datenbank-Trigger verhindern das Löschen). Archivierte
+ * zählen in keiner Auswertung, lassen sich aber jederzeit wiederherstellen.
+ */
+export async function archivePurchase(p: Purchase, reason: string) {
+  if (p.status === 'archived') return;
+  if (await one('SELECT 1 FROM cash_entries WHERE purchase_id = ? LIMIT 1', p.id)) {
+    throw new UserError('Die Zahlung ist im Kassenbuch gebucht – erst „Als offen markieren“, dann archivieren.');
+  }
+  await run(
+    "UPDATE purchase_invoices SET status = 'archived', archived_from = ?, archived_at = ?, archive_reason = ?, updated_at = ? WHERE id = ?",
+    p.status, nowIso(), reason.slice(0, 300), nowIso(), p.id,
+  );
+}
+
+export async function restorePurchase(p: Purchase) {
+  if (p.status !== 'archived') return;
+  const status = ['draft', 'open', 'paid'].includes(p.archived_from) ? p.archived_from : 'open';
+  await run("UPDATE purchase_invoices SET status = ?, archived_from = '', archived_at = NULL, archive_reason = '', updated_at = ? WHERE id = ?", status, nowIso(), p.id);
 }
 
 /** Vorgaben für eine neue, manuelle Erfassung */

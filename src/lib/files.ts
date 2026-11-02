@@ -9,10 +9,14 @@ import { config } from '../config.ts';
  *   <data>/nachweise/<Mandant>/…           Nachweisdokumentationen
  *   <data>/verbindlichkeiten/<Mandant>/…   Eingangsrechnungen (PDF, XML, Scans) und Kassenbuch-Belege
  *   <data>/other/<Mandant>/…               Belegeingang: hochgeladen, aber noch nicht zugeordnet –
- *                                          beim Zuordnen wird die Datei in den passenden Bereich verschoben
+ *                                          beim Zuordnen wird die Datei in den passenden Bereich kopiert,
+ *                                          das Original bleibt erhalten
  *
  * In der Datenbank steht nur der relative Pfad "<Mandant>/<Datei>" samt SHA-256.
- * Dateien werden nie überschrieben (neuer Name je Upload) und atomar geschrieben.
+ * Belege sind aufbewahrungspflichtig (§ 147 AO, GoBD): Dateien werden einmal atomar geschrieben,
+ * danach schreibgeschützt und nie überschrieben, verschoben oder gelöscht. Einzige Ausnahme:
+ * eine gerade geschriebene Datei, deren Datensatz gar nicht erst angelegt werden konnte
+ * (discardUnreferenced) – sie war nie ein gespeicherter Beleg.
  */
 export type FileArea = 'nachweise' | 'verbindlichkeiten' | 'other';
 export const FILE_AREAS: FileArea[] = ['nachweise', 'verbindlichkeiten', 'other'];
@@ -50,17 +54,25 @@ export async function saveFile(area: FileArea, tenantId: number, originalName: s
   const abs = resolveIn(area, rel);
   await fs.mkdir(path.dirname(abs), { recursive: true });
   const tmp = `${abs}.part`;
-  await fs.writeFile(tmp, data, { flag: 'wx' });
+  await fs.writeFile(tmp, data, { flag: 'wx', mode: 0o444 });
+  // nie eine vorhandene Datei ersetzen
+  if (fsSync.existsSync(abs)) {
+    await fs.rm(tmp, { force: true });
+    throw new Error(`Datei existiert bereits: ${rel}`);
+  }
   await fs.rename(tmp, abs);
+  await fs.chmod(abs, 0o444).catch(() => {});
   return { path: rel, sha256: sha256(data), size: data.length };
 }
 
-/** Datei in einen anderen Bereich verschieben (neu schreiben, prüfen, alte löschen) */
-export async function moveStoredFile(from: FileArea, rel: string, to: FileArea, tenantId: number, name: string): Promise<StoredFile> {
+/** Datei in einen anderen Bereich kopieren (neu schreiben, Prüfsumme kontrollieren) – das Original bleibt */
+export async function copyStoredFile(from: FileArea, rel: string, to: FileArea, tenantId: number, name: string): Promise<StoredFile> {
   const data = await readStoredFile(from, rel);
   const stored = await saveFile(to, tenantId, name, data);
-  if (sha256(await readStoredFile(to, stored.path)) !== sha256(data)) throw new Error(`Verschieben von ${rel} fehlgeschlagen (Prüfsumme)`);
-  await removeStoredFile(from, rel);
+  if (sha256(await readStoredFile(to, stored.path)) !== sha256(data)) {
+    await discardUnreferenced(to, stored.path);
+    throw new Error(`Kopieren von ${rel} fehlgeschlagen (Prüfsumme)`);
+  }
   return stored;
 }
 
@@ -68,12 +80,47 @@ export async function readStoredFile(area: FileArea, rel: string): Promise<Buffe
   return fs.readFile(resolveIn(area, rel));
 }
 
-export async function removeStoredFile(area: FileArea, rel: string): Promise<void> {
+/**
+ * Nur für eine gerade mit saveFile geschriebene Datei, deren Datensatz nicht angelegt werden
+ * konnte (Fehler/Rollback). Gespeicherte Belege werden nie gelöscht – dafür sorgen auch die
+ * Datenbank-Trigger, die das Löschen der Datensätze verhindern.
+ */
+export async function discardUnreferenced(area: FileArea, rel: string): Promise<void> {
   if (!rel) return;
   await fs.rm(resolveIn(area, rel), { force: true });
 }
 
 /* ---------- Prüfung beim Start ---------- */
+
+/**
+ * Beim Start: alle gespeicherten Belege schreibgeschützt setzen (auch solche aus älteren
+ * Versionen, die noch beschreibbar abgelegt wurden). Liefert die Anzahl geänderter Dateien.
+ */
+export async function protectStoredFiles(): Promise<number> {
+  let n = 0;
+  const walk = async (dir: string) => {
+    let entries: fsSync.Dirent[];
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      const abs = path.join(dir, e.name);
+      if (e.isDirectory()) await walk(abs);
+      else if (e.isFile() && !e.name.endsWith('.part') && !e.name.startsWith('.schreibtest')) {
+        const st = await fs.stat(abs);
+        if (st.mode & 0o222) {
+          await fs.chmod(abs, 0o444).catch(() => {});
+          n++;
+        }
+      }
+    }
+  };
+  for (const area of FILE_AREAS) await walk(areaRoot(area));
+  return n;
+}
+
 
 /** Liegt das Verzeichnis (oder ein übergeordnetes, außer "/") auf einem eigenen Mount (Docker-Volume)? */
 function isOnMount(dir: string): boolean {

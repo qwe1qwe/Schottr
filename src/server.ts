@@ -3,7 +3,7 @@ import { config } from './config.ts';
 import { openDatabase, closeDatabase } from './db/index.ts';
 import { purgeExpiredSessions } from './lib/auth.ts';
 import { createApp } from './app.ts';
-import { checkStorage } from './lib/files.ts';
+import { checkStorage, protectStoredFiles } from './lib/files.ts';
 import { migrateProofBlobs } from './modules/proofs.ts';
 
 try {
@@ -14,6 +14,9 @@ try {
 }
 await openDatabase(config.databaseUrl);
 await migrateProofBlobs();
+// Belege sind unveränderbar: auch ältere Dateien schreibgeschützt setzen
+const protectedFiles = await protectStoredFiles();
+if (protectedFiles) console.log(`${protectedFiles} Beleg-Datei(en) schreibgeschützt gesetzt`);
 await purgeExpiredSessions();
 setInterval(() => purgeExpiredSessions().catch(console.error), 6 * 3_600_000).unref();
 

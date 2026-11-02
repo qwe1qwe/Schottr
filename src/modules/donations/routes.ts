@@ -148,7 +148,7 @@ async function syncCash(t: Tenant, donationId: number, d: DonationInput, account
   if (accountId && d.kind !== 'goods') {
     await bookLinked(t, 'donation', donationId, { account_id: accountId, entry_date: d.donation_date, amount: d.amount, text: d.note }, userId);
   } else {
-    await unlink(t, 'donation', donationId);
+    await unlink(t, 'donation', donationId, userId);
   }
 }
 
@@ -348,8 +348,8 @@ function register(app: App) {
       ${canConfirm && d.kind !== 'goods'
         ? html`<p class="muted small">Weitere Zuwendungen desselben Zuwendenden lassen sich am Jahresende gesammelt bestätigen – siehe <a href="/donations?year=${year}">Spenden ${year}</a>.</p>`
         : ''}
-      ${!d.receipt_id
-        ? html`<div class="danger-zone">${postButton(c, `/donations/${d.id}/delete`, 'Löschen', 'btn danger', 'Zuwendung löschen?')}</div>`
+      ${!d.receipt_id && !d.receipted_at
+        ? html`<div class="danger-zone">${postButton(c, `/donations/${d.id}/delete`, 'Löschen', 'btn danger', 'Zuwendung löschen? Eine Buchung im Kassenbuch bleibt stehen und wird storniert.')}</div>`
         : ''}`,
     });
   });
@@ -380,9 +380,11 @@ function register(app: App) {
   app.post('/donations/:id/delete', async (c) => {
     const t = npoTenant(c);
     const d = await getDonation(t.id, idParam(c)) ?? notFound();
-    if (d.receipt_id) throw new UserError('Bestätigte Zuwendungen können nicht gelöscht werden. Erst die Bestätigung stornieren.');
-    await unlink(t, 'donation', d.id);
-    await deleteDonation(d);
+    if (d.receipt_id || d.receipted_at) throw new UserError('Für diese Zuwendung wurde eine Zuwendungsbestätigung erstellt – sie lässt sich deshalb nicht löschen (auch nicht nach dem Storno der Bestätigung).');
+    await tx(async () => {
+      await unlink(t, 'donation', d.id, userOf(c).id);
+      await deleteDonation(d);
+    });
     return redirectWith(c, `/donations?year=${d.donation_date.slice(0, 4)}`, 'ok', 'Zuwendung gelöscht.');
   });
 

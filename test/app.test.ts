@@ -377,7 +377,10 @@ test('Teil-/Schlussrechnung, Skonto, Logo und Export', opts, async () => {
   assert.match(lines[0], /^"EXTF";700;21;"Buchungsstapel";13;/);
   assert.match(lines[0], /;1234567;12345;20260101;4;20261101;20261130;/);
   // 875: 1190 S, 877: 3570 S, Verrechnung 875: 1190 H
-  assert.deepEqual(lines.slice(2).map((l) => l.split(';').slice(0, 2).join(' ')), ['1190,00 "S"', '3570,00 "S"', '1190,00 "H"']);
+  // nur die Rechnungen dieses Tests (Teil- und Schlussrechnung) – andere Tests legen Belege mit „heute“ an, die im selben Monat liegen können
+  const ownNumbers = (await all<{ number: string }>("SELECT number FROM documents WHERE tenant_id = ? AND type_code IN ('875', '877') AND number <> ''", first.id)).map((d) => `"${d.number}"`);
+  const outgoing = lines.slice(2).filter((l) => ownNumbers.includes(l.split(';')[10]));
+  assert.deepEqual(outgoing.map((l) => l.split(';').slice(0, 2).join(' ')), ['1190,00 "S"', '3570,00 "S"', '1190,00 "H"'], datev);
   const journal = await (await req('/export/journal?from=2026-11-01&to=2026-11-30')).text();
   assert.match(journal, /Schlussrechnung/);
   const zip = Buffer.from(await (await req('/export/zip?from=2026-11-01&to=2026-11-30')).arrayBuffer());
@@ -431,9 +434,11 @@ test('Nachweisdokumentationen', opts, async () => {
   assert.equal((pdf.match(/\/Type \/Page\b/g) ?? []).length, 2, 'Rechnung + 1 Seite Nachweis');
   assert.match(pdf, /factur-x\.xml/);
 
-  // Verwendete Nachweise lassen sich nicht löschen, nur archivieren
-  await req(`/proofs/${proof.id}/delete`, { form: {} });
+  // Nachweise lassen sich nicht löschen, nur archivieren – auch nicht direkt in der Datenbank
+  assert.equal((await req(`/proofs/${proof.id}/delete`, { form: {} })).status, 404, 'kein Löschen mehr');
   assert.ok(await one('SELECT 1 FROM proof_documents WHERE id = ?', proof.id));
+  await assert.rejects(run('DELETE FROM proof_documents WHERE id = ?', proof.id), /aufbewahrungspflichtig/);
+  await assert.rejects(run("UPDATE proof_documents SET sha256 = 'x' WHERE id = ?", proof.id), /unveraenderbar/);
   await assert.rejects(run('DELETE FROM document_proofs WHERE document_id = ?', Number(id)), /Festgeschriebene/);
 });
 
@@ -797,15 +802,38 @@ test('Eingangsrechnungen: E-Rechnung, Scan, manuell, Export und Übersicht', opt
     await run('UPDATE tenants SET small_business = 0 WHERE id = ?', first.id);
   }
 
-  // 6) Bezahlt / offen, Löschen entfernt die Datei
+  // 6) Bezahlt / offen; archivieren statt löschen – die Datei bleibt unverändert
   await req(`/purchases/${pm.id}/paid`, { form: { paid_at: '2026-10-01' } });
   assert.equal((await one('SELECT status, paid_at FROM purchase_invoices WHERE id = ?', pm.id))!.paid_at, '2026-10-01');
   await req(`/purchases/${pm.id}/open`, { form: {} });
   assert.equal((await one('SELECT status FROM purchase_invoices WHERE id = ?', pm.id))!.status, 'open');
   const pdfDraft = (await one('SELECT * FROM purchase_invoices WHERE file_name = ?', 'rechnung.pdf'))!;
-  await req(`/purchases/${pdfDraft.id}/delete`, { form: {} });
-  assert.equal(await one('SELECT 1 FROM purchase_invoices WHERE id = ?', pdfDraft.id), undefined);
-  assert.equal(fs.existsSync(path.join(dataDir, 'verbindlichkeiten', pdfDraft.file_path)), false);
+  assert.equal((await req(`/purchases/${pdfDraft.id}/delete`, { form: {} })).status, 404, 'kein Löschen mehr');
+  let rs = await req(`/purchases/${pdfDraft.id}/archive`, { form: { reason: 'versehentlich hochgeladen' } });
+  assert.equal(rs.headers.get('location'), '/purchases?status=archived');
+  let arch = (await one('SELECT * FROM purchase_invoices WHERE id = ?', pdfDraft.id))!;
+  assert.equal(arch.status, 'archived');
+  assert.equal(arch.archived_from, 'draft');
+  assert.equal(arch.archive_reason, 'versehentlich hochgeladen');
+  const draftFile = path.join(dataDir, 'verbindlichkeiten', pdfDraft.file_path);
+  assert.ok(fs.existsSync(draftFile), 'Datei bleibt');
+  assert.equal(fs.statSync(draftFile).mode & 0o222, 0, 'Datei schreibgeschützt');
+  assert.doesNotMatch(await (await req('/purchases')).text(), new RegExp(`/purchases/${pdfDraft.id}/edit`));
+  assert.match(await (await req('/purchases?status=archived')).text(), new RegExp(`/purchases/${pdfDraft.id}`));
+  assert.equal((await req(`/purchases/${pdfDraft.id}/file`)).status, 200);
+  // archiviert: nicht bearbeitbar, aber wiederherstellbar
+  rs = await req(`/purchases/${pdfDraft.id}/paid`, { form: { paid_at: '2026-10-01' } });
+  assert.equal((await one('SELECT status FROM purchase_invoices WHERE id = ?', pdfDraft.id))!.status, 'archived');
+  await req(`/purchases/${pdfDraft.id}/restore`, { form: {} });
+  assert.equal((await one('SELECT status FROM purchase_invoices WHERE id = ?', pdfDraft.id))!.status, 'draft');
+  await req(`/purchases/${pdfDraft.id}/archive`, { form: {} });
+  // auch direkt in der Datenbank: kein Löschen, keine andere Datei
+  await assert.rejects(run('DELETE FROM purchase_invoices WHERE id = ?', pdfDraft.id), /aufbewahrungspflichtig/);
+  await assert.rejects(run("UPDATE purchase_invoices SET file_path = 'x.pdf' WHERE id = ?", pdfDraft.id), /unveraenderbar/);
+  await assert.rejects(run("UPDATE purchase_invoices SET file_sha256 = '0' WHERE id = ?", pdfDraft.id), /unveraenderbar/);
+  // bezahlte mit Buchung lassen sich erst nach dem Zurücknehmen der Zahlung archivieren (hier ohne Kassenbuch: direkt)
+  arch = (await one('SELECT * FROM purchase_invoices WHERE id = ?', pm.id))!;
+  assert.equal(arch.status, 'open');
 
   // Lieferant mit Eingangsrechnungen lässt sich nicht löschen
   await req(`/contacts/${meier.id}/delete`, { form: {} });
@@ -1048,6 +1076,15 @@ test('Spenden: erfassen, Einzel-, Sach- und Sammelbestätigung, Storno', opts, a
   assert.equal((await one('SELECT receipt_id FROM donations WHERE id = ?', m2))!.receipt_id, null);
   r = await req(`/donations/${m2}`, { form: { contact_id: String(erika), kind: 'money', donation_date: d('01-20'), amount: '55', waiver: '1' } });
   assert.equal((await one('SELECT amount FROM donations WHERE id = ?', m2))!.amount, 5500);
+  // einmal bestätigt → auch nach dem Storno der Bestätigung nicht mehr löschbar (auch nicht in der Datenbank)
+  assert.ok((await one('SELECT receipted_at FROM donations WHERE id = ?', m2))!.receipted_at);
+  page = await (await req(`/donations/${m2}`)).text();
+  assert.doesNotMatch(page, new RegExp(`/donations/${m2}/delete`));
+  r = await req(`/donations/${m2}/delete`, { form: {} });
+  assert.match(flashOf(r), /Zuwendungsbestätigung erstellt/);
+  assert.ok(await one('SELECT 1 FROM donations WHERE id = ?', m2), 'nicht gelöscht');
+  await assert.rejects(run('DELETE FROM donations WHERE id = ?', m2), /Zuwendungsbestaetigung/);
+  await assert.rejects(run('UPDATE donations SET receipted_at = NULL WHERE id = ?', m2), /Zuwendungsbestaetigung/);
   r = await req(`/donations/receipts/collective?year=${year}&contact=${erika}`, { form: {} });
   const neu = (await one("SELECT * FROM donation_receipts WHERE tenant_id = ? AND status = 'issued' AND kind = 'collective'", t.id))!;
   assert.equal(neu.total, 10000 + 5500 + 6000);
@@ -1219,9 +1256,14 @@ test('Kassenbuch: Konten, Zuordnung, Umbuchung, Kassenzählung, Abschluss, Steue
   assert.equal((await one('SELECT amount FROM cash_entries WHERE count_id = ?', count.id))!.amount, 10000);
   assert.equal((await one('SELECT difference FROM cash_counts WHERE id = ?', count2.id))!.difference, -2550);
   assert.equal(await balance(kasse), 20050, 'Kassenstand = zuletzt gezählter Bestand');
-  // Buchung wieder löschen → zurück auf 90 €
+  // Buchungen lassen sich nicht löschen (auch nicht in der Datenbank) – Storno → zurück auf 90 €
   const nachtrag = (await one("SELECT id FROM cash_entries WHERE tenant_id = ? AND text = 'Briefmarken nachgetragen'", t.id))!;
-  r = await req(`/cashbook/entries/${nachtrag.id}/delete`, { form: {} });
+  assert.equal((await req(`/cashbook/entries/${nachtrag.id}/delete`, { form: {} })).status, 404, 'kein Löschen mehr');
+  await assert.rejects(run('DELETE FROM cash_entries WHERE id = ?', nachtrag.id), /nur stornieren/);
+  page = await (await req(`/cashbook/entries/${nachtrag.id}/edit`)).text();
+  assert.match(page, /Buchung stornieren/);
+  r = await req(`/cashbook/entries/${nachtrag.id}/reverse`, { form: { date: today } });
+  assert.match(flashOf(r), /Kassenzählung „[^“]+“ vom .* neu berechnet: Differenz 100,00.€ → 90,00.€/);
   k1 = (await one('SELECT * FROM cash_counts WHERE id = ?', count.id))!;
   assert.equal(k1.difference, 9000);
   assert.equal(k1.book_balance, 13600);
@@ -1288,22 +1330,54 @@ test('Kassenbuch: Konten, Zuordnung, Umbuchung, Kassenzählung, Abschluss, Steue
   assert.equal((await all('SELECT id FROM cash_entry_files WHERE entry_id = ?', putz.id)).length, 2);
   r = await multipart(`/cashbook/entries/${putz.id}/files`, {}, [{ name: 'nachtrag.png', data: Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(50)]), type: 'image/png' }]);
   assert.equal((await all('SELECT id FROM cash_entry_files WHERE entry_id = ?', putz.id)).length, 3);
-  // Beleg entfernen und Buchung samt Belegen löschen
-  r = await req(`/cashbook/files/${att[1].id}/delete`, { form: {} });
-  att = await all('SELECT * FROM cash_entry_files WHERE entry_id = ?', putz.id);
-  assert.equal(att.length, 2);
-  const putzFile = path.join(process.env.SCHOTTR_DATA_DIR!, 'verbindlichkeiten', att[0].file_path);
-  r = await req(`/cashbook/entries/${putz.id}/delete`, { form: {} });
-  assert.equal(await one('SELECT 1 FROM cash_entries WHERE id = ?', putz.id), undefined);
-  assert.equal((await all('SELECT id FROM cash_entry_files WHERE entry_id = ?', putz.id)).length, 0);
-  assert.ok(!fs.existsSync(putzFile), 'Datei aufgeräumt');
+  // Beleg archivieren statt entfernen – Datensatz und Datei bleiben
+  assert.equal((await req(`/cashbook/files/${att[1].id}/delete`, { form: {} })).status, 404, 'kein Löschen mehr');
+  r = await req(`/cashbook/files/${att[1].id}/archive`, { form: {} });
+  assert.match(flashOf(r), /archiviert/);
+  att = await all('SELECT * FROM cash_entry_files WHERE entry_id = ? ORDER BY id', putz.id);
+  assert.equal(att.length, 3);
+  assert.ok(att[1].archived_at);
+  const putzFile = path.join(process.env.SCHOTTR_DATA_DIR!, 'verbindlichkeiten', att[1].file_path);
+  assert.ok(fs.existsSync(putzFile), 'archivierte Datei bleibt');
+  page = await (await req(`/cashbook?account=${kasse}`)).text();
+  assert.match(page, /2 Belege/, 'archivierte zählen nicht');
+  page = await (await req(`/cashbook/entries/${putz.id}/edit`)).text();
+  assert.match(page, /archiviert/);
+  assert.match(page, /Buchung stornieren/);
+  assert.doesNotMatch(page, /Buchung löschen/);
+  // auch direkt in der Datenbank: Belege nicht löschen, nicht austauschen
+  await assert.rejects(run('DELETE FROM cash_entry_files WHERE id = ?', att[0].id), /aufbewahrungspflichtig/);
+  await assert.rejects(run("UPDATE cash_entry_files SET file_path = 'x.jpg' WHERE id = ?", att[0].id), /unveraenderbar/);
+  await assert.rejects(run('UPDATE cash_entry_files SET entry_id = ? WHERE id = ?', porto.id, att[0].id), /unveraenderbar/);
+  await assert.rejects(run('DELETE FROM cash_entries WHERE id = ?', putz.id), /nur stornieren/);
+  // Buchung mit Belegen: löschen geht nicht, stornieren schon
+  const kasseBefore = await balance(kasse);
+  assert.equal((await req(`/cashbook/entries/${putz.id}/delete`, { form: {} })).status, 404);
+  assert.ok(await one('SELECT 1 FROM cash_entries WHERE id = ?', putz.id), 'nicht gelöscht');
+  r = await req(`/cashbook/entries/${putz.id}/reverse`, { form: { date: today } });
+  assert.match(flashOf(r), /storniert/);
+  const storno = (await one('SELECT * FROM cash_entries WHERE reversal_of = ?', putz.id))!;
+  assert.equal(storno.amount, 1240);
+  assert.equal(storno.text, 'Storno: Putzmittel Vereinsheim');
+  assert.equal(storno.category, 'vereinsheim');
+  assert.equal(location(r), `/cashbook/entries/${storno.id}/edit`);
+  assert.equal(storno.amount + putz.amount, 0, 'Gegenbuchung hebt die Buchung auf');
+  assert.equal(await balance(kasse), kasseBefore, 'Kassenstand = gezählter Bestand (Zählung von heute wird neu gerechnet)');
+  assert.equal((await all('SELECT id FROM cash_entry_files WHERE entry_id = ?', putz.id)).length, 3, 'Belege bleiben am Original');
+  page = await (await req(`/cashbook/entries/${putz.id}/edit`)).text();
+  assert.match(page, /Storniert am/);
+  assert.doesNotMatch(page, /name="amount"/, 'stornierte Buchung nicht mehr änderbar');
+  r = await req(`/cashbook/entries/${putz.id}/reverse`, { form: { date: today } });
+  assert.match(flashOf(r), /bereits storniert/);
+  r = await req(`/cashbook/entries/${putz.id}`, { form: { account_id: String(kasse), entry_date: today, direction: 'out', amount: '1', text: 'x', vat_rate: '0' } });
+  assert.equal((await one('SELECT amount FROM cash_entries WHERE id = ?', putz.id))!.amount, -1240);
   // ein Beleg bleibt für das Steuerbüro-Paket
   r = await multipart('/cashbook/entries', { account_id: String(kasse), entry_date: today, direction: 'out', amount: '3', text: 'Briefmarken', vat_rate: '0' },
     [{ name: 'briefmarken.jpg', data: jpeg, type: 'image/jpeg' }]);
 
   // Beleg erfassen (Handy): zwei Fotos → ein PDF im Belegeingang (data/other), dann als Buchung zugeordnet
   const png = fs.readFileSync(path.join(import.meta.dirname, 'logo.png'));
-  const inboxRows = () => all('SELECT * FROM inbox_files WHERE tenant_id = ? ORDER BY id', t.id);
+  const inboxRows = () => all('SELECT * FROM inbox_files WHERE tenant_id = ? AND assigned_at IS NULL AND archived_at IS NULL ORDER BY id', t.id);
   page = await (await req('/capture')).text();
   assert.match(page, /Kassenbuch-Buchung/);
   r = await multipart('/capture', { target: 'cash', note: 'Getränke Sommerfest' }, [{ name: 'image.png', data: png, type: 'image/png' }, { name: 'image.png', data: png, type: 'image/png' }]);
@@ -1329,7 +1403,11 @@ test('Kassenbuch: Konten, Zuordnung, Umbuchung, Kassenzählung, Abschluss, Steue
   assert.equal(att.length, 1);
   assert.equal(att[0].file_mime, 'application/pdf');
   assert.ok(fs.existsSync(path.join(process.env.SCHOTTR_DATA_DIR!, 'verbindlichkeiten', att[0].file_path)), 'in die Belegablage verschoben');
-  assert.ok(!fs.existsSync(inboxFile), 'aus data/other entfernt');
+  assert.ok(fs.existsSync(inboxFile), 'Original bleibt in data/other');
+  const assignedRow = (await one('SELECT * FROM inbox_files WHERE file_path = ?', path.relative(path.join(process.env.SCHOTTR_DATA_DIR!, 'other'), inboxFile)))!;
+  assert.ok(assignedRow.assigned_at, 'als zugeordnet markiert');
+  await assert.rejects(run('DELETE FROM inbox_files WHERE id = ?', assignedRow.id), /aufbewahrungspflichtig/);
+  await assert.rejects(run('UPDATE inbox_files SET assigned_at = NULL WHERE id = ?', assignedRow.id), /unveraenderbar/);
   assert.equal((await inboxRows()).length, 0);
 
   // „Später zuordnen“ und dann als Eingangsrechnung übernehmen
@@ -1359,6 +1437,22 @@ test('Kassenbuch: Konten, Zuordnung, Umbuchung, Kassenzählung, Abschluss, Steue
   // falscher Typ: nichts abgelegt
   r = await multipart('/capture', { target: 'later' }, [{ name: 'notiz.txt', data: Buffer.from('hallo'), type: 'text/plain' }]);
   assert.equal((await inboxRows()).length, 0);
+  // Belegeingang: archivieren statt löschen, wiederherstellen
+  r = await multipart('/capture', { target: 'later' }, [{ name: 'fehlfoto.jpg', data: Buffer.concat([jpeg, Buffer.from('fehl')]), type: 'image/jpeg' }]);
+  const fehl = (await inboxRows())[0];
+  assert.equal((await req(`/inbox/${fehl.id}/delete`, { form: {} })).status, 404, 'kein Löschen mehr');
+  r = await req(`/inbox/${fehl.id}/archive`, { form: {} });
+  assert.equal(location(r), '/inbox?tab=archived');
+  assert.equal((await inboxRows()).length, 0);
+  page = await (await req('/inbox?tab=archived')).text();
+  assert.match(page, /fehlfoto\.jpg/);
+  assert.ok(fs.existsSync(path.join(process.env.SCHOTTR_DATA_DIR!, 'other', fehl.file_path)));
+  r = await req(`/inbox/${fehl.id}/assign`, { form: { target: `e:${porto.id}` } });
+  assert.match(flashOf(r), /archiviert/);
+  r = await req(`/inbox/${fehl.id}/archive`, { form: {} });
+  assert.equal((await inboxRows()).length, 1, 'wiederhergestellt');
+  r = await req(`/inbox/${fehl.id}/archive`, { form: {} });
+  await assert.rejects(run('DELETE FROM inbox_files WHERE id = ?', fehl.id), /aufbewahrungspflichtig/);
 
   // Foto zu einer vorhandenen Buchung hinterlegen
   page = await (await req('/capture')).text();
@@ -1450,6 +1544,19 @@ test('Kassenbuch: Konten, Zuordnung, Umbuchung, Kassenzählung, Abschluss, Steue
   assert.doesNotMatch(page, /Schon im Kassenbuch gebucht/);
   r = await req(`/purchases/${pid2}/link-entry`, { form: { entry_id: String(patronen.id) } });
   assert.match(flashOf(r), /Nur freie Buchungen/);
+  // Zahlung zurücknehmen („Als offen markieren“): Buchung bleibt als freie Buchung stehen und wird storniert
+  r = await req(`/purchases/${pid2}/open`, { form: {} });
+  assert.match(flashOf(r), /storniert/);
+  assert.equal((await one('SELECT status FROM purchase_invoices WHERE id = ?', pid2))!.status, 'open');
+  const freed = (await one('SELECT * FROM cash_entries WHERE id = ?', patronen.id))!;
+  assert.equal(freed.source, 'manual');
+  assert.equal(freed.purchase_id, null);
+  const patronenStorno = (await one('SELECT * FROM cash_entries WHERE reversal_of = ?', patronen.id))!;
+  assert.equal(patronenStorno.amount, 4760);
+  assert.equal(await balance(bank), bankBefore, 'Zahlung und Storno heben sich auf');
+  // erneut bezahlt buchen (neue Buchung)
+  r = await req(`/purchases/${pid2}/paid`, { form: { paid_at: today, account_id: String(bank), amount: '47,60' } });
+  assert.equal(await balance(bank), bankBefore - 4760);
   // von der Buchung aus: Einnahme passt nicht zu einer Eingangsrechnung, Ausgabe schon
   r = await req('/cashbook/entries', { form: { account_id: String(bank), entry_date: today, direction: 'out', amount: '12', text: 'Toner nachgekauft', sphere: 'ideell', vat_rate: '0' } });
   const toner = (await one("SELECT * FROM cash_entries WHERE tenant_id = ? AND text = 'Toner nachgekauft'", t.id))!;
@@ -1496,7 +1603,7 @@ test('Kassenbuch: Konten, Zuordnung, Umbuchung, Kassenzählung, Abschluss, Steue
   assert.equal(fahneNow.source, 'purchase');
   assert.equal(fahneNow.purchase_id, pid4);
   assert.equal((await all('SELECT id FROM cash_entries WHERE purchase_id = ?', pid4)).length, 1, 'keine zweite Buchung');
-  assert.equal((await all('SELECT id FROM cash_entry_files WHERE entry_id = ?', fahne.id)).length, 0, 'Beleg umgehängt');
+  assert.equal((await all('SELECT id FROM cash_entry_files WHERE entry_id = ?', fahne.id)).length, 1, 'Beleg bleibt auch an der Buchung');
   assert.equal(await balance(bank), bankBefore2 - 2380);
   // nochmal aus derselben Buchung → Fehler
   r = await req(`/purchases/new?entry=${fahne.id}`);

@@ -772,4 +772,74 @@ export const migrations: { version: number; statements: string[] }[] = [
        IF OLD.count_date <= COALESCE((SELECT cashbook_locked_until FROM tenants WHERE id = OLD.tenant_id), '0000-01-01') OR NEW.count_date <= COALESCE((SELECT cashbook_locked_until FROM tenants WHERE id = NEW.tenant_id), '0000-01-01') THEN ${forbid('Das Kassenbuch ist fuer diesen Zeitraum abgeschlossen')}; END IF`,
     ],
   },
+  {
+    version: 15,
+    statements: [
+      // Belege sind aufbewahrungspflichtig (§ 147 AO, GoBD) und werden unveränderbar gespeichert:
+      // Datensätze mit Belegdatei lassen sich nicht löschen und ihre Datei nicht austauschen –
+      // nur archivieren. Die Sperren gelten auch direkt in der Datenbank.
+      `ALTER TABLE purchase_invoices
+        MODIFY status ENUM('draft', 'open', 'paid', 'archived') NOT NULL DEFAULT 'draft',
+        ADD COLUMN archived_from VARCHAR(10) NOT NULL DEFAULT '' AFTER status,
+        ADD COLUMN archived_at DATETIME(3) NULL AFTER archived_from,
+        ADD COLUMN archive_reason VARCHAR(300) NOT NULL DEFAULT '' AFTER archived_at`,
+      `ALTER TABLE cash_entry_files ADD COLUMN archived_at DATETIME(3) NULL`,
+      `ALTER TABLE inbox_files
+        ADD COLUMN archived_at DATETIME(3) NULL,
+        ADD COLUMN assigned_at DATETIME(3) NULL,
+        ADD COLUMN assigned_to VARCHAR(300) NOT NULL DEFAULT '',
+        ADD KEY inbox_open (tenant_id, assigned_at, archived_at)`,
+      // Storno statt Löschen für Buchungen mit Belegen
+      `ALTER TABLE cash_entries
+        ADD COLUMN reversal_of INT NULL,
+        ADD UNIQUE KEY cash_entries_reversal (reversal_of),
+        ADD CONSTRAINT cash_entries_reversal FOREIGN KEY (reversal_of) REFERENCES cash_entries(id)`,
+
+      `CREATE TRIGGER purchase_invoices_keep BEFORE DELETE ON purchase_invoices FOR EACH ROW
+       ${forbid('Eingangsrechnungen sind aufbewahrungspflichtig und koennen nur archiviert werden')}`,
+      `CREATE TRIGGER purchase_invoices_file_lock BEFORE UPDATE ON purchase_invoices FOR EACH ROW
+       IF OLD.file_path <> '' AND (NEW.file_path <> OLD.file_path OR NEW.file_sha256 <> OLD.file_sha256 OR NEW.file_mime <> OLD.file_mime OR NEW.file_size <> OLD.file_size)
+       THEN ${forbid('Die Belegdatei einer Eingangsrechnung ist unveraenderbar')}; END IF`,
+
+      `CREATE TRIGGER cash_entry_files_keep BEFORE DELETE ON cash_entry_files FOR EACH ROW
+       ${forbid('Belege sind aufbewahrungspflichtig und koennen nur archiviert werden')}`,
+      `CREATE TRIGGER cash_entry_files_lock BEFORE UPDATE ON cash_entry_files FOR EACH ROW
+       IF NEW.entry_id <> OLD.entry_id OR NEW.tenant_id <> OLD.tenant_id OR NEW.file_path <> OLD.file_path OR NEW.file_sha256 <> OLD.file_sha256
+          OR NEW.file_mime <> OLD.file_mime OR NEW.file_size <> OLD.file_size OR NEW.file_name <> OLD.file_name
+       THEN ${forbid('Belege sind unveraenderbar - nur archivieren ist moeglich')}; END IF`,
+
+      `CREATE TRIGGER inbox_files_keep BEFORE DELETE ON inbox_files FOR EACH ROW
+       ${forbid('Belege sind aufbewahrungspflichtig und koennen nur archiviert werden')}`,
+      `CREATE TRIGGER inbox_files_lock BEFORE UPDATE ON inbox_files FOR EACH ROW
+       IF NEW.tenant_id <> OLD.tenant_id OR NEW.file_path <> OLD.file_path OR NEW.file_sha256 <> OLD.file_sha256
+          OR NEW.file_mime <> OLD.file_mime OR NEW.file_size <> OLD.file_size OR NEW.file_name <> OLD.file_name
+          OR (OLD.assigned_at IS NOT NULL AND NOT (NEW.assigned_at <=> OLD.assigned_at))
+       THEN ${forbid('Belege sind unveraenderbar - nur archivieren ist moeglich')}; END IF`,
+
+      `CREATE TRIGGER proof_documents_keep BEFORE DELETE ON proof_documents FOR EACH ROW
+       ${forbid('Nachweise sind aufbewahrungspflichtig und koennen nur archiviert werden')}`,
+      `CREATE TRIGGER proof_documents_lock BEFORE UPDATE ON proof_documents FOR EACH ROW
+       IF OLD.path IS NOT NULL AND (NOT (NEW.path <=> OLD.path) OR NEW.sha256 <> OLD.sha256 OR NEW.size <> OLD.size OR NOT (NEW.data <=> OLD.data))
+       THEN ${forbid('Nachweise sind unveraenderbar - nur archivieren ist moeglich')}; END IF`,
+    ],
+  },
+  {
+    version: 16,
+    statements: [
+      // Buchungen werden nie gelöscht, nur storniert (GoBD). Ausnahme: die automatisch geführte
+      // Differenzbuchung einer Kassenzählung, wenn die Differenz bei einer Neuberechnung auf 0 fällt.
+      `CREATE TRIGGER cash_entries_storno_only BEFORE DELETE ON cash_entries FOR EACH ROW
+       IF OLD.source <> 'count' THEN ${forbid('Buchungen koennen nicht geloescht werden - nur stornieren')}; END IF`,
+
+      // Zuwendungen, für die schon einmal eine Bestätigung erstellt wurde, bleiben – auch wenn die
+      // Bestätigung später storniert wird
+      `ALTER TABLE donations ADD COLUMN receipted_at DATETIME(3) NULL`,
+      `UPDATE donations SET receipted_at = updated_at WHERE receipt_id IS NOT NULL`,
+      `DROP TRIGGER donations_no_delete`,
+      `CREATE TRIGGER donations_no_delete BEFORE DELETE ON donations FOR EACH ROW
+       IF OLD.receipt_id IS NOT NULL OR OLD.receipted_at IS NOT NULL THEN ${forbid('Zuwendungen mit Zuwendungsbestaetigung koennen nicht geloescht werden')}; END IF`,
+      `CREATE TRIGGER donations_receipted_keep BEFORE UPDATE ON donations FOR EACH ROW
+       IF OLD.receipted_at IS NOT NULL AND NOT (NEW.receipted_at <=> OLD.receipted_at) THEN ${forbid('Zuwendungen mit Zuwendungsbestaetigung koennen nicht geloescht werden')}; END IF`,
+    ],
+  },
 ];

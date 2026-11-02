@@ -4,7 +4,6 @@ import { addDays, formatDate, isIsoDate, today } from '../../lib/dates.ts';
 import { addNote, UserError } from '../../lib/http.ts';
 import { formatMoney } from '../../lib/money.ts';
 import type { Tenant } from '../../types.ts';
-import { detachAll, removePaths } from './files.ts';
 
 /**
  * Kassenbuch für Vereine: Bankkonten und Bargeldkassen mit Buchungen.
@@ -47,6 +46,8 @@ export interface CashEntry {
   category: string;
   recurring_id: number | null;
   recurring_due: string | null;
+  /** Stornobuchung zu dieser Buchung */
+  reversal_of: number | null;
 }
 
 export interface CashCount {
@@ -200,18 +201,40 @@ export async function bookLinked(t: Tenant, source: LinkSource, refId: number, e
   });
 }
 
-/** Verknüpfte Buchung entfernen (z. B. Rechnung wieder „offen“) */
-export async function unlink(t: Tenant, source: LinkSource, refId: number): Promise<void> {
+/** Bezeichnung einer verknüpften Zahlung, wenn sie zur freien Buchung wird */
+async function linkLabel(source: LinkSource, refId: number): Promise<string> {
+  if (source === 'invoice') {
+    const d = await one<{ number: string | null }>('SELECT number FROM documents WHERE id = ?', refId);
+    return `Zahlung Rechnung ${d?.number || `ID ${refId}`}`;
+  }
+  if (source === 'purchase') {
+    const p = await one<{ number: string; supplier: string | null }>(
+      `SELECT p.number, COALESCE(NULLIF(c.company, ''), c.name) supplier FROM purchase_invoices p LEFT JOIN contacts c ON c.id = p.contact_id WHERE p.id = ?`, refId,
+    );
+    return `Zahlung Eingangsrechnung ${[p?.supplier, p?.number].filter(Boolean).join(' ') || `ID ${refId}`}`;
+  }
+  return `Zuwendung ID ${refId}`;
+}
+
+/**
+ * Verknüpfte Zahlung zurücknehmen (z. B. Rechnung wieder „offen“). Buchungen werden nie gelöscht:
+ * Die Zahlung bleibt als freie Buchung stehen und wird storniert (Gegenbuchung) – so bleibt
+ * nachvollziehbar, dass sie gebucht war.
+ */
+export async function unlink(t: Tenant, source: LinkSource, refId: number, userId: number | null = null): Promise<void> {
   const existing = await linkedEntry(source, refId);
   if (!existing) return;
   assertOpen(t, existing.entry_date);
-  const paths = await tx(async () => {
-    const p = await detachAll('e.id = ?', existing.id);
-    await run('DELETE FROM cash_entries WHERE id = ?', existing.id);
-    await recalcAfter(t, [existing.account_id, existing.entry_date]);
-    return p;
+  const text = existing.text || await linkLabel(source, refId);
+  const date = existing.entry_date > today() ? existing.entry_date : today();
+  await tx(async () => {
+    await run(
+      "UPDATE cash_entries SET source = 'manual', document_id = NULL, purchase_id = NULL, donation_id = NULL, text = ?, updated_at = ? WHERE id = ?",
+      text, nowIso(), existing.id,
+    );
+    await reverseEntry(t, { ...existing, source: 'manual', document_id: null, purchase_id: null, donation_id: null, text }, date, userId);
   });
-  await removePaths(paths);
+  addNote(`Die Zahlung bleibt im Kassenbuch stehen und wurde zum ${formatDate(date)} storniert.`);
 }
 
 export async function createManual(t: Tenant, e: EntryInput, userId: number): Promise<number> {
@@ -230,6 +253,7 @@ export async function createManual(t: Tenant, e: EntryInput, userId: number): Pr
 
 export async function updateManual(t: Tenant, entry: CashEntry, e: EntryInput): Promise<void> {
   if (entry.source !== 'manual') throw new UserError('Diese Buchung gehört zu einem Beleg und wird dort geändert.');
+  if (entry.reversal_of || await reversalOf(entry.id)) throw new UserError('Stornierte Buchungen und Stornobuchungen lassen sich nicht ändern.');
   assertOpen(t, entry.entry_date);
   await checkAccount(t, e.account_id, e.entry_date);
   await tx(async () => {
@@ -260,6 +284,7 @@ export async function linkEntryToPurchase(t: Tenant, entryId: number, purchaseId
   );
   if (!p) throw new UserError('Bitte eine Eingangsrechnung auswählen.');
   if (p.status === 'draft') throw new UserError('Die Eingangsrechnung ist noch nicht erfasst – bitte zuerst die Angaben vervollständigen.');
+  if (p.status === 'archived') throw new UserError('Die Eingangsrechnung ist archiviert – zuerst wiederherstellen.');
   if (entry.source !== 'manual') throw new UserError('Nur freie Buchungen lassen sich mit einer Eingangsrechnung verbinden.');
   assertOpen(t, entry.entry_date);
   if (await linkedEntry('purchase', p.id)) throw new UserError('Die Eingangsrechnung ist schon mit einer Buchung verbunden.');
@@ -288,19 +313,19 @@ export async function entryForPurchase(t: Tenant, entryId: number): Promise<Cash
 }
 
 /**
- * Ersten Beleg einer Buchung (Foto der Quittung, PDF) als Datei der Eingangsrechnung übernehmen.
- * Beide liegen in derselben Ablage (data/verbindlichkeiten), es wird nur der Verweis umgehängt.
+ * Ersten Beleg einer Buchung (Foto der Quittung, PDF) auch als Datei der Eingangsrechnung
+ * verwenden. Beide liegen in derselben Ablage (data/verbindlichkeiten); die Rechnung verweist
+ * auf dieselbe, unveränderte Datei – am Beleg der Buchung ändert sich nichts.
  */
-export async function moveEntryFileToPurchase(entryId: number, purchaseId: number): Promise<boolean> {
+export async function shareEntryFileWithPurchase(entryId: number, purchaseId: number): Promise<boolean> {
   const f = await one<{ id: number; file_name: string; file_path: string; file_mime: string; file_size: number; file_sha256: string }>(
-    'SELECT * FROM cash_entry_files WHERE entry_id = ? ORDER BY id LIMIT 1', entryId,
+    'SELECT * FROM cash_entry_files WHERE entry_id = ? AND archived_at IS NULL ORDER BY id LIMIT 1', entryId,
   );
   if (!f) return false;
   await run(
     "UPDATE purchase_invoices SET file_name = ?, file_path = ?, file_mime = ?, file_size = ?, file_sha256 = ?, updated_at = ? WHERE id = ? AND file_path = ''",
     f.file_name, f.file_path, f.file_mime, f.file_size, f.file_sha256, nowIso(), purchaseId,
   );
-  await run('DELETE FROM cash_entry_files WHERE id = ?', f.id);
   return true;
 }
 
@@ -329,26 +354,48 @@ export async function entryCandidates(t: Tenant, p: { is_credit: number; gross_t
   );
 }
 
-/** Freie Buchung oder Umbuchung (beide Seiten) löschen */
-export async function deleteEntry(t: Tenant, entry: CashEntry): Promise<void> {
+/** Beide Seiten einer Umbuchung bzw. die Buchung selbst */
+async function sidesOf(t: Tenant, entry: CashEntry): Promise<CashEntry[]> {
+  return entry.source === 'transfer' && entry.transfer_group
+    ? all<CashEntry>('SELECT * FROM cash_entries WHERE transfer_group = ? AND tenant_id = ? ORDER BY id', entry.transfer_group, t.id)
+    : [entry];
+}
+
+/** Ist die Buchung (bzw. eine Seite der Umbuchung) schon storniert? */
+export async function reversalOf(entryId: number) {
+  return one<CashEntry>('SELECT * FROM cash_entries WHERE reversal_of = ?', entryId);
+}
+
+/**
+ * Storno: Gegenbuchung mit umgekehrtem Vorzeichen (bei Umbuchungen beide Seiten), verweist auf die
+ * Originalbuchung. Original und Belege bleiben unverändert stehen – so bleibt alles nachvollziehbar.
+ */
+export async function reverseEntry(t: Tenant, entry: CashEntry, date: string, userId: number | null): Promise<number[]> {
   if (entry.source !== 'manual' && entry.source !== 'transfer') {
-    throw new UserError(entry.source === 'count' ? 'Buchungen aus einer Kassenzählung werden mit der Zählung gelöscht.' : 'Diese Buchung gehört zu einem Beleg – dort die Zahlung zurücknehmen.');
+    throw new UserError('Nur freie Buchungen und Umbuchungen lassen sich stornieren – Zahlungen von Rechnungen bzw. Spenden dort zurücknehmen.');
   }
-  assertOpen(t, entry.entry_date);
-  const paths = await tx(async () => {
-    if (entry.source === 'transfer' && entry.transfer_group) {
-      const sides = await all<CashEntry>('SELECT * FROM cash_entries WHERE transfer_group = ? AND tenant_id = ?', entry.transfer_group, t.id);
-      const p = await detachAll('e.transfer_group = ? AND e.tenant_id = ?', entry.transfer_group, t.id);
-      await run('DELETE FROM cash_entries WHERE transfer_group = ? AND tenant_id = ?', entry.transfer_group, t.id);
-      await recalcAfter(t, ...sides.map((x) => [x.account_id, x.entry_date] as [number, string]));
-      return p;
+  if (entry.reversal_of) throw new UserError('Das ist bereits eine Stornobuchung.');
+  if (!isIsoDate(date)) throw new UserError('Bitte ein gültiges Storno-Datum angeben.');
+  if (date < entry.entry_date) throw new UserError(`Das Storno kann nicht vor der Buchung (${formatDate(entry.entry_date)}) liegen.`);
+  if (date > today()) throw new UserError('Das Storno-Datum liegt in der Zukunft.');
+  const sides = await sidesOf(t, entry);
+  for (const x of sides) if (await reversalOf(x.id)) throw new UserError('Die Buchung ist bereits storniert.');
+  for (const x of sides) await checkAccount(t, x.account_id, date);
+  const now = nowIso();
+  const group = entry.source === 'transfer' ? crypto.randomBytes(8).toString('hex') : null;
+  return tx(async () => {
+    const ids: number[] = [];
+    for (const x of sides) {
+      const res = await run(
+        `INSERT INTO cash_entries (tenant_id, account_id, entry_date, amount, source, transfer_group, text, receipt_ref, sphere, vat_rate, category, reversal_of, created_by, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        t.id, x.account_id, date, -x.amount, x.source, group, `Storno: ${x.text}`.slice(0, 300), x.receipt_ref, x.sphere, x.vat_rate, x.category ?? '', x.id, userId, now, now,
+      );
+      ids.push(Number(res.insertId));
     }
-    const p = await detachAll('e.id = ?', entry.id);
-    await run('DELETE FROM cash_entries WHERE id = ?', entry.id);
-    await recalcAfter(t, [entry.account_id, entry.entry_date]);
-    return p;
+    await recalcAfter(t, ...sides.map((x) => [x.account_id, date] as [number, string]));
+    return ids;
   });
-  await removePaths(paths);
 }
 
 /** Umbuchung zwischen zwei Konten (z. B. Bareinzahlung der Kasse auf die Bank) */
@@ -532,18 +579,6 @@ export async function changeCountDate(t: Tenant, a: CashAccount, count: CashCoun
   return { changed: true };
 }
 
-/** Zählung samt Differenzbuchung löschen; spätere Zählungen werden neu gerechnet */
-export async function deleteCount(t: Tenant, a: CashAccount, count: CashCount) {
-  assertOpen(t, count.count_date);
-  const paths = await tx(async () => {
-    const p = await detachAll('e.count_id = ?', count.id);
-    await run('DELETE FROM cash_entries WHERE count_id = ?', count.id);
-    await run('DELETE FROM cash_counts WHERE id = ?', count.id);
-    await recalcCounts(t, a.id, count.count_date);
-    return p;
-  });
-  await removePaths(paths);
-}
 
 /* ---------------- Noch nicht zugeordnet ---------------- */
 

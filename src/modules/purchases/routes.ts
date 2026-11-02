@@ -1,5 +1,5 @@
 import { sphereLabel } from '../../lib/nonprofit.ts';
-import { accountsOf, bookLinked, cashbookEnabled, entryCandidates, entryForPurchase, getAccount, linkEntryToPurchase, linkedEntry, moveEntryFileToPurchase, unlink } from '../cashbook/repo.ts';
+import { accountsOf, bookLinked, cashbookEnabled, entryCandidates, entryForPurchase, getAccount, linkEntryToPurchase, linkedEntry, shareEntryFileWithPurchase, unlink } from '../cashbook/repo.ts';
 import { accountSelect } from '../cashbook/routes.ts';
 import { all, one, tx } from '../../db/index.ts';
 import { audit } from '../../lib/audit.ts';
@@ -14,8 +14,8 @@ import { csrfField, empty, page } from '../../views/layout.ts';
 import { EInvoiceError, readEInvoice } from '../../einvoice/parse.ts';
 import { contactLabel, getContact, supplierOptions } from '../contacts.ts';
 import {
-  createFromEInvoice, createFromUpload, deletePurchase, detectFile, emptyInput, findBySha, getPurchase, getTaxes, MAX_FILE_SIZE,
-  parsePurchaseForm, payable, purchaseToInput, savePurchase, setPaid, sha256, SIGNED, taxRow, type EInvoiceInfo, type Purchase,
+  archivePurchase, assertNotArchived, createFromEInvoice, createFromUpload, detectFile, emptyInput, findBySha, getPurchase, getTaxes, MAX_FILE_SIZE,
+  parsePurchaseForm, payable, purchaseToInput, restorePurchase, savePurchase, setPaid, sha256, SIGNED, taxRow, type EInvoiceInfo, type Purchase,
 } from './repo.ts';
 import {
   einvoiceDetails, previewFrame, purchaseBadge, purchaseForm, purchaseStatus, purchaseTable, purchaseTitle, taxSummary, uploadCard,
@@ -28,6 +28,7 @@ const FILTERS = [
   { value: 'open', label: 'Offen' },
   { value: 'overdue', label: 'Überfällig' },
   { value: 'paid', label: 'Bezahlt' },
+  { value: 'archived', label: 'Archiviert' },
 ];
 
 /** Mit Kassenbuch: bei „Bezahlt am“ muss ein Konto gewählt sein */
@@ -51,6 +52,19 @@ async function syncPayment(t: Tenant, id: number, paidAt: string | null, account
 
 function postButton(c: Ctx, action: string, label: string, cls = 'btn', confirm?: string): SafeHtml {
   return html`<form method="post" action="${action}" class="inline" ${confirm ? html`data-confirm="${confirm}"` : ''}>${csrfField(c)}<button class="${cls}">${label}</button></form>`;
+}
+
+/** Archivieren (statt Löschen) mit optionalem Grund */
+function archiveForm(c: Ctx, p: Purchase): SafeHtml {
+  return html`<div class="danger-zone">
+    <form method="post" action="/purchases/${p.id}/archive" class="inline-form"
+      data-confirm="${p.status === 'draft' ? 'Beleg archivieren?' : 'Eingangsrechnung archivieren?'} Sie bleibt unverändert aufbewahrt, zählt aber in keiner Auswertung mehr – wiederherstellen ist jederzeit möglich.">
+      ${csrfField(c)}
+      <input name="reason" maxlength="300" placeholder="Grund (optional), z. B. versehentlich doppelt erfasst" aria-label="Grund">
+      <button class="btn danger">Archivieren</button>
+    </form>
+    <p class="muted small">Belege sind aufbewahrungspflichtig und lassen sich nicht löschen.</p>
+  </div>`;
 }
 
 /** Hochgeladene Dateien aus dem Formular (ein oder mehrere Felder "files[]") */
@@ -110,12 +124,14 @@ function register(app: App) {
     if (status === 'overdue') {
       where += " AND p.status = 'open' AND COALESCE(p.due_date, p.issue_date) < ?";
       params.push(today());
-    } else if (['draft', 'open', 'paid'].includes(status)) {
+    } else if (['draft', 'open', 'paid', 'archived'].includes(status)) {
       where += ' AND p.status = ?';
       params.push(status);
+    } else {
+      where += " AND p.status <> 'archived'";
     }
     if (month) {
-      where += " AND p.status <> 'draft' AND p.issue_date >= ? AND p.issue_date <= ?";
+      where += " AND p.status NOT IN ('draft', 'archived') AND p.issue_date >= ? AND p.issue_date <= ?";
       params.push(`${month}-01`, monthEnd(month));
     }
     // Zahlungszeitraum (aus der Übersicht): in Jahr/Monat bezahlte Eingangsrechnungen
@@ -137,7 +153,7 @@ function register(app: App) {
       ...params,
     );
     const drafts = (await one<{ n: number }>("SELECT COUNT(*) n FROM purchase_invoices WHERE tenant_id = ? AND status = 'draft'", t.id))?.n ?? 0;
-    const counted = rows.filter((r) => r.status !== 'draft');
+    const counted = rows.filter((r) => r.status !== 'draft' && r.status !== 'archived');
     const sum = counted.reduce((s, p) => s + (p.is_credit ? -p.gross_total : p.gross_total), 0);
     const netSum = counted.reduce((s, p) => s + (p.is_credit ? -p.net_total : p.net_total), 0);
     const link = (st: string) => {
@@ -223,7 +239,7 @@ function register(app: App) {
           <div class="notice soft">Aus der Buchung vom ${formatDate(entry.entry_date)} „${entry.text}“ (${formatMoney(entry.amount)}): Die Buchung wird zur Zahlung
             dieser Rechnung – es entsteht keine zweite Buchung, die Rechnung gilt ab dem Buchungstag als bezahlt.
             Bitte noch Lieferant und Rechnungsnummer ergänzen.
-            ${entry.file_count ? html`<label class="check"><input type="checkbox" name="take_file" value="1" checked> Beleg der Buchung als Rechnungsdatei übernehmen</label>` : ''}</div>` : undefined,
+            ${entry.file_count ? html`<label class="check"><input type="checkbox" name="take_file" value="1" checked> Beleg der Buchung auch als Rechnungsdatei verwenden</label>` : ''}</div>` : undefined,
       }),
     });
   });
@@ -246,7 +262,7 @@ function register(app: App) {
         const newId = await savePurchase(t, userOf(c).id, null, input);
         if (fromEntry) {
           await linkEntryToPurchase(t, fromEntry, newId);
-          if (str(form, 'take_file')) await moveEntryFileToPurchase(fromEntry, newId);
+          if (str(form, 'take_file')) await shareEntryFileWithPurchase(fromEntry, newId);
         } else {
           await syncPayment(t, newId, input.paid_at, accountId, userOf(c).id);
         }
@@ -266,6 +282,7 @@ function register(app: App) {
     const t = tenantOf(c);
     const p = (await getPurchase(t.id, idParam(c))) ?? notFound();
     if (p.status === 'draft') return c.redirect(`/purchases/${p.id}/edit`);
+    const archived = p.status === 'archived';
     const contact = p.contact_id ? await getContact(t.id, p.contact_id) : undefined;
     const taxes = await getTaxes(p.id);
     const info = p.einvoice_data ? (JSON.parse(p.einvoice_data) as EInvoiceInfo) : null;
@@ -284,7 +301,7 @@ function register(app: App) {
     const payment = await linkedEntry('purchase', p.id);
     const cashAccounts = cashbookEnabled(t) ? await accountsOf(t.id) : [];
     // schon frei im Kassenbuch gebucht? → verbinden statt doppelt buchen
-    const candidates = cashAccounts.length && !payment ? await entryCandidates(t, p) : [];
+    const candidates = cashAccounts.length && !payment && !archived ? await entryCandidates(t, p) : [];
     if (payment) meta.push(['Zahlung', html`${formatMoney(-payment.amount)} von <a href="/cashbook?account=${payment.account_id}">${(await getAccount(t.id, payment.account_id))?.name ?? 'Konto'}</a>`]);
     if (p.description) meta.push(['Beschreibung', p.description]);
     if (p.iban) meta.push(['Bankverbindung', `${formatIban(p.iban)}${info?.bic ? ` · ${info.bic}` : ''}`]);
@@ -299,15 +316,17 @@ function register(app: App) {
       back: { href: '/purchases', label: 'Eingangsrechnungen' },
       actions: html`
         ${p.file_path ? html`<a class="btn" href="/purchases/${p.id}/file">Datei herunterladen</a>` : ''}
-        <a class="btn" href="/purchases/${p.id}/edit">Bearbeiten</a>
-        ${p.status === 'paid'
-          ? postButton(c, `/purchases/${p.id}/open`, 'Als offen markieren', 'btn ghost', payment ? 'Wieder als offen markieren? Die Buchung im Kassenbuch wird entfernt.' : undefined)
+        ${archived ? postButton(c, `/purchases/${p.id}/restore`, 'Wiederherstellen', 'btn primary') : html`<a class="btn" href="/purchases/${p.id}/edit">Bearbeiten</a>`}
+        ${archived ? '' : p.status === 'paid'
+          ? postButton(c, `/purchases/${p.id}/open`, 'Als offen markieren', 'btn ghost', payment ? 'Wieder als offen markieren? Die Zahlung bleibt im Kassenbuch stehen und wird storniert.' : undefined)
           : html`<form method="post" action="/purchases/${p.id}/paid" class="inline paid-form" data-count-check data-count-date="paid_at">${csrfField(c)}
               <input type="date" name="paid_at" value="${today()}" aria-label="Bezahlt am" required>
               ${cashAccounts.length ? html`${accountSelect(cashAccounts, cashAccounts.find((a) => a.kind === 'bank')?.id)}
                 <input name="amount" class="num amount-input" inputmode="decimal" aria-label="Betrag" value="${formatAmount(payable(p)).replace(/\./g, '')}">` : ''}
               <button class="btn primary">${cashAccounts.length ? 'Als bezahlt buchen' : 'Als bezahlt markieren'}</button></form>`}`,
       body: html`
+      ${archived ? html`<div class="notice soft">Archiviert am ${formatDate(String(p.archived_at).slice(0, 10))}${p.archive_reason ? html` – ${p.archive_reason}` : ''}.
+        Der Beleg bleibt unverändert aufbewahrt, zählt aber in keiner Auswertung.</div>` : ''}
       <div class="status-line">${purchaseBadge(st)}${p.is_credit ? html` <span class="tag">Gutschrift</span>` : ''}
         ${p.status === 'open' ? html`<span class="subject">zu zahlen: ${formatMoney(payable(p))}</span>` : ''}</div>
       <div class="purchase-layout${p.file_path && p.file_mime !== 'application/xml' ? '' : ' no-preview'}">
@@ -332,15 +351,14 @@ function register(app: App) {
         </div>
         ${p.file_path && p.file_mime !== 'application/xml' ? html`<aside>${previewFrame(p)}</aside>` : ''}
       </div>
-      <div class="danger-zone">
-        ${postButton(c, `/purchases/${p.id}/delete`, 'Löschen', 'btn danger', 'Eingangsrechnung samt Datei endgültig löschen? Belege sind aufbewahrungspflichtig – nur löschen, wenn sie versehentlich erfasst wurde.')}
-      </div>`,
+      ${archived ? '' : archiveForm(c, p)}`,
     });
   });
 
   app.get('/purchases/:id/edit', async (c) => {
     const t = tenantOf(c);
     const p = (await getPurchase(t.id, idParam(c))) ?? notFound();
+    if (p.status === 'archived') return c.redirect(`/purchases/${p.id}`);
     const taxes = await getTaxes(p.id);
     const locked = p.einvoice_format ? p : undefined;
     const draft = p.status === 'draft';
@@ -354,7 +372,7 @@ function register(app: App) {
         accounts: cashbookEnabled(t) ? await accountsOf(t.id) : [], paidAccountId: (await linkedEntry('purchase', p.id))?.account_id ?? null,
       })}
       ${draft
-        ? html`<div class="danger-zone">${postButton(c, `/purchases/${p.id}/delete`, 'Beleg verwerfen', 'btn danger', 'Hochgeladenen Beleg verwerfen?')}</div>`
+        ? archiveForm(c, p)
         : ''}`,
     });
   });
@@ -362,12 +380,13 @@ function register(app: App) {
   app.post('/purchases/:id', async (c) => {
     const t = tenantOf(c);
     const p = (await getPurchase(t.id, idParam(c))) ?? notFound();
+    assertNotArchived(p);
     try {
       const form = await readForm(c);
       const input = parsePurchaseForm(form, !!p.einvoice_format);
       const accountId = await requiredAccount(t, input.paid_at, form);
       // Kassenbuch: Zahlung entfernen, buchen bzw. Datum/Konto nachziehen
-      if (!input.paid_at) await unlink(t, 'purchase', p.id);
+      if (!input.paid_at) await unlink(t, 'purchase', p.id, userOf(c).id);
       await tx(async () => {
         await savePurchase(t, userOf(c).id, p, input);
         await syncPayment(t, p.id, input.paid_at, accountId, userOf(c).id);
@@ -383,6 +402,7 @@ function register(app: App) {
   app.post('/purchases/:id/paid', async (c) => {
     const t = tenantOf(c);
     const p = (await getPurchase(t.id, idParam(c))) ?? notFound();
+    assertNotArchived(p);
     if (p.status === 'draft') return redirectWith(c, `/purchases/${p.id}/edit`, 'error', 'Bitte zuerst die Angaben erfassen.');
     const form = await readForm(c);
     const date = str(form, 'paid_at') || today();
@@ -403,6 +423,7 @@ function register(app: App) {
   app.post('/purchases/:id/link-entry', async (c) => {
     const t = tenantOf(c);
     const p = (await getPurchase(t.id, idParam(c))) ?? notFound();
+    assertNotArchived(p);
     if (!cashbookEnabled(t)) notFound();
     const form = await readForm(c);
     const { entry } = await linkEntryToPurchase(t, Number(str(form, 'entry_id')), p.id);
@@ -413,21 +434,30 @@ function register(app: App) {
   app.post('/purchases/:id/open', async (c) => {
     const t = tenantOf(c);
     const p = (await getPurchase(t.id, idParam(c))) ?? notFound();
-    await unlink(t, 'purchase', p.id);
+    assertNotArchived(p);
+    await unlink(t, 'purchase', p.id, userOf(c).id);
     await setPaid(p, null);
     return redirectWith(c, `/purchases/${p.id}`, 'ok', 'Wieder als offen markiert.');
   });
 
-  app.post('/purchases/:id/delete', async (c) => {
+  /** Archivieren statt Löschen – Belege sind aufbewahrungspflichtig */
+  app.post('/purchases/:id/archive', async (c) => {
     const t = tenantOf(c);
     const p = (await getPurchase(t.id, idParam(c))) ?? notFound();
-    await unlink(t, 'purchase', p.id);
-    await deletePurchase(p);
-    await audit(c, 'purchase.delete', `${purchaseTitle(p)} (${p.file_name || 'ohne Datei'}, ${formatMoney(p.gross_total)})`);
-    return redirectWith(c, '/purchases', 'ok', p.status === 'draft' ? 'Beleg verworfen.' : 'Eingangsrechnung gelöscht.');
+    const reason = str(await readForm(c), 'reason', 300);
+    await archivePurchase(p, reason);
+    await audit(c, 'purchase.archive', `${purchaseTitle(p)} (ID ${p.id}, ${p.file_name || 'ohne Datei'}, ${formatMoney(p.gross_total)})${reason ? `: ${reason}` : ''}`);
+    return redirectWith(c, '/purchases?status=archived', 'ok', `${p.status === 'draft' ? 'Beleg' : 'Eingangsrechnung'} archiviert – er bleibt unverändert aufbewahrt.`);
   });
 
-  /** Datei – ?inline=1 zur Vorschau (nur PDF und Bilder, XML immer als Download) */
+  app.post('/purchases/:id/restore', async (c) => {
+    const t = tenantOf(c);
+    const p = (await getPurchase(t.id, idParam(c))) ?? notFound();
+    await restorePurchase(p);
+    await audit(c, 'purchase.restore', `${purchaseTitle(p)} (ID ${p.id})`);
+    return redirectWith(c, p.archived_from === 'draft' ? `/purchases/${p.id}/edit` : `/purchases/${p.id}`, 'ok', 'Wiederhergestellt.');
+  });
+
   app.get('/purchases/:id/file', async (c) => {
     const t = tenantOf(c);
     const p = (await getPurchase(t.id, idParam(c))) ?? notFound();

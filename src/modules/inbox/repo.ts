@@ -1,5 +1,5 @@
 import { all, one, run, tx, nowIso } from '../../db/index.ts';
-import { readStoredFile, removeStoredFile, saveFile } from '../../lib/files.ts';
+import { discardUnreferenced, readStoredFile, saveFile } from '../../lib/files.ts';
 import { UserError } from '../../lib/http.ts';
 import { appendPdfs, imagesToPdf } from '../../lib/pdfmerge.ts';
 import { attachData, MAX_ENTRY_FILE, mimeOf } from '../cashbook/files.ts';
@@ -9,7 +9,8 @@ import type { Tenant } from '../../types.ts';
  * Belegeingang: Belege (PDF oder Foto), die schon hochgeladen, aber noch keiner
  * Eingangsrechnung oder Kassenbuch-Buchung zugeordnet sind. Sie liegen unter
  * data/other/<Mandant>/ und werden beim Zuordnen in die Belegablage
- * (data/verbindlichkeiten/…) verschoben; der Eintrag hier verschwindet dann.
+ * (data/verbindlichkeiten/…) kopiert. Belege sind aufbewahrungspflichtig: Das Original und
+ * der Eintrag bleiben erhalten (als „zugeordnet“ markiert); statt Löschen gibt es nur Archivieren.
  */
 const AREA = 'other' as const;
 
@@ -24,6 +25,9 @@ export interface InboxFile {
   note: string;
   created_by: number | null;
   created_at: string;
+  archived_at: string | null;
+  assigned_at: string | null;
+  assigned_to: string;
 }
 
 export interface Prepared {
@@ -96,16 +100,21 @@ export async function addInbox(t: Tenant, userId: number, p: Prepared, note = ''
     );
     return Number(r.insertId);
   } catch (err) {
-    await removeStoredFile(AREA, stored.path);
+    await discardUnreferenced(AREA, stored.path);
     throw err;
   }
 }
 
+/** Offene (noch nicht zugeordnete, nicht archivierte) Belege */
 export const inboxOf = (tenantId: number) =>
-  all<InboxFile>('SELECT * FROM inbox_files WHERE tenant_id = ? ORDER BY created_at DESC, id DESC', tenantId);
+  all<InboxFile>('SELECT * FROM inbox_files WHERE tenant_id = ? AND assigned_at IS NULL AND archived_at IS NULL ORDER BY created_at DESC, id DESC', tenantId);
+
+/** Archivierte (nicht zugeordnete) Belege */
+export const archivedInbox = (tenantId: number) =>
+  all<InboxFile>('SELECT * FROM inbox_files WHERE tenant_id = ? AND assigned_at IS NULL AND archived_at IS NOT NULL ORDER BY archived_at DESC, id DESC', tenantId);
 
 export async function inboxCount(tenantId: number): Promise<number> {
-  return Number((await one<{ n: number }>('SELECT COUNT(*) n FROM inbox_files WHERE tenant_id = ?', tenantId))?.n ?? 0);
+  return Number((await one<{ n: number }>('SELECT COUNT(*) n FROM inbox_files WHERE tenant_id = ? AND assigned_at IS NULL AND archived_at IS NULL', tenantId))?.n ?? 0);
 }
 
 export const getInbox = (tenantId: number, id: number) =>
@@ -113,17 +122,25 @@ export const getInbox = (tenantId: number, id: number) =>
 
 export const readInbox = (f: Pick<InboxFile, 'file_path'>) => readStoredFile(AREA, f.file_path);
 
-/** Eintrag entfernen; die Datei erst danach (nach erfolgreicher Transaktion) löschen */
-export async function dropInbox(f: InboxFile): Promise<void> {
-  await run('DELETE FROM inbox_files WHERE id = ?', f.id);
+/** Noch offener Beleg (zum Zuordnen) – sonst Fehler */
+export async function openInbox(tenantId: number, id: number): Promise<InboxFile> {
+  const f = await getInbox(tenantId, id);
+  if (!f || f.assigned_at) throw new UserError('Der Beleg ist nicht mehr im Belegeingang (schon zugeordnet?).');
+  if (f.archived_at) throw new UserError('Der Beleg ist archiviert – zum Zuordnen zuerst wiederherstellen.');
+  return f;
 }
 
-export const removeInboxFile = (f: Pick<InboxFile, 'file_path'>) => removeStoredFile(AREA, f.file_path);
+/** Als zugeordnet markieren – Eintrag und Original bleiben erhalten (Aufbewahrungspflicht) */
+export async function markAssigned(f: InboxFile, to: string): Promise<void> {
+  await run('UPDATE inbox_files SET assigned_at = ?, assigned_to = ? WHERE id = ? AND assigned_at IS NULL', nowIso(), to.slice(0, 300), f.id);
+}
 
-/**
- * Beleg aus dem Belegeingang an eine Kassenbuch-Buchung hängen (innerhalb einer Transaktion
- * aufrufen). Liefert den Eintrag zurück – dessen Datei nach dem Commit mit removeInboxFile löschen.
- */
+/** Archivieren statt Löschen bzw. wiederherstellen */
+export async function setInboxArchived(f: InboxFile, archived: boolean): Promise<void> {
+  if (f.assigned_at) throw new UserError('Der Beleg ist schon zugeordnet.');
+  await run('UPDATE inbox_files SET archived_at = ? WHERE id = ?', archived ? nowIso() : null, f.id);
+}
+
 /* ---------------- Zu vorhandener Buchung / Eingangsrechnung ---------------- */
 
 /** Ziel „vorhanden“: Eingangsrechnung ohne Datei (p:<id>) oder Kassenbuch-Buchung (e:<id>) */
@@ -141,7 +158,7 @@ export async function attachTargets(t: Tenant, withEntries: boolean): Promise<At
   const purchases = await all<AttachTargets['purchases'][number]>(
     `SELECT p.id, p.number, p.issue_date, p.gross_total, p.is_credit, COALESCE(NULLIF(c.company, ''), c.name) supplier
      FROM purchase_invoices p LEFT JOIN contacts c ON c.id = p.contact_id
-     WHERE p.tenant_id = ? AND p.status <> 'draft' AND (p.file_path IS NULL OR p.file_path = '')
+     WHERE p.tenant_id = ? AND p.status NOT IN ('draft', 'archived') AND (p.file_path IS NULL OR p.file_path = '')
      ORDER BY COALESCE(p.issue_date, DATE(p.created_at)) DESC, p.id DESC LIMIT 100`, t.id,
   );
   const entries = withEntries
@@ -165,8 +182,7 @@ export async function assignInbox(t: Tenant, inboxId: number, target: string, us
   const m = /^([pe]):(\d+)$/.exec(target);
   if (!m) throw new UserError('Bitte die Buchung bzw. Eingangsrechnung auswählen.');
   const id = Number(m[2]);
-  const f = await getInbox(t.id, inboxId);
-  if (!f) throw new UserError('Der Beleg ist nicht mehr im Belegeingang (schon zugeordnet oder gelöscht?).');
+  const f = await openInbox(t.id, inboxId);
   const data = new Uint8Array(await readInbox(f));
   let result: { label: string; href: string };
   if (m[1] === 'p') {
@@ -183,10 +199,10 @@ export async function assignInbox(t: Tenant, inboxId: number, target: string, us
            WHERE id = ? AND (file_path IS NULL OR file_path = '')`,
           f.file_name, stored.path, f.file_mime, stored.size, stored.sha256, nowIso(), p.id,
         );
-        await dropInbox(f);
+        await markAssigned(f, `Eingangsrechnung ${p.number || `ID ${p.id}`}`);
       });
     } catch (err) {
-      await removeStoredFile('verbindlichkeiten', stored.path);
+      await discardUnreferenced('verbindlichkeiten', stored.path);
       throw err;
     }
     result = { label: `Eingangsrechnung ${p.number || `ID ${p.id}`}`, href: `/purchases/${p.id}` };
@@ -197,20 +213,22 @@ export async function assignInbox(t: Tenant, inboxId: number, target: string, us
     );
     if (!e) throw new UserError('Buchung nicht gefunden.');
     if (!['manual', 'transfer', 'count'].includes(e.source)) throw new UserError('Diese Buchung gehört zu einer Rechnung bzw. Spende – der Beleg ist dort hinterlegt.');
+    result = { label: `Buchung „${e.text}“ vom ${e.entry_date.split('-').reverse().join('.')}`, href: `/cashbook/entries/${e.id}/edit` };
     await tx(async () => {
       await attachData(t, e.id, { name: f.file_name, data, mime: f.file_mime }, userId);
-      await dropInbox(f);
+      await markAssigned(f, result.label);
     });
-    result = { label: `Buchung „${e.text}“ vom ${e.entry_date.split('-').reverse().join('.')}`, href: `/cashbook/entries/${e.id}/edit` };
   }
-  await removeInboxFile(f);
   return result;
 }
 
+/**
+ * Beleg aus dem Belegeingang an eine Kassenbuch-Buchung hängen (innerhalb einer Transaktion
+ * aufrufen). Die Datei wird in die Belegablage kopiert, das Original bleibt im Eingang.
+ */
 export async function assignToEntry(t: Tenant, inboxId: number, entryId: number, userId: number): Promise<InboxFile> {
-  const f = await getInbox(t.id, inboxId);
-  if (!f) throw new UserError('Der Beleg ist nicht mehr im Belegeingang (schon zugeordnet oder gelöscht?).');
+  const f = await openInbox(t.id, inboxId);
   await attachData(t, entryId, { name: f.file_name, data: new Uint8Array(await readInbox(f)), mime: f.file_mime }, userId);
-  await dropInbox(f);
+  await markAssigned(f, `Kassenbuch-Buchung ID ${entryId}`);
   return f;
 }

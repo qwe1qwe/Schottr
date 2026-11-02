@@ -1,5 +1,5 @@
 import { all, one, run, tx, nowIso } from '../../db/index.ts';
-import { attachFiles, deleteFile, fileCounts, filesFrom, filesOf, getFile, readEntryFile, type EntryFile } from './files.ts';
+import { attachFiles, fileCounts, filesFrom, filesOf, getFile, hasFiles, readEntryFile, setFileArchived, type EntryFile } from './files.ts';
 import { audit } from '../../lib/audit.ts';
 import { addDays, formatDate, isIsoDate, today } from '../../lib/dates.ts';
 import { checked, html, selected, type SafeHtml } from '../../lib/html.ts';
@@ -12,10 +12,10 @@ import { categoryOptions } from '../purchases/views.ts';
 import { balanceChart } from '../../views/chart.ts';
 import { csrfField, empty, page } from '../../views/layout.ts';
 import type { App, Ctx, Module, Tenant } from '../../types.ts';
-import { assignToEntry, getInbox, inboxOf, removeInboxFile, type InboxFile } from '../inbox/repo.ts';
+import { assignToEntry, getInbox, inboxOf, type InboxFile } from '../inbox/repo.ts';
 import {
   bookDue, getRecurring, nextDue, pendingDues, recurringOf, RHYTHMS, skipDue, type PendingDue, type Recurring, type Rhythm,
-  accountsOf, assertOpen, balanceAt, balances, bookLinked, cashbookEnabled, changeCountDate, createManual, linkEntryToPurchase, purchaseCandidates, recalcCounts, createTransfer, deleteCount, deleteEntry, DENOMINATIONS,
+  accountsOf, assertOpen, balanceAt, balances, bookLinked, cashbookEnabled, changeCountDate, createManual, linkEntryToPurchase, purchaseCandidates, recalcCounts, reversalOf, reverseEntry, createTransfer, DENOMINATIONS,
   entriesOf, entrySphere, getAccount, history, lastCount, saveCount, SOURCE_LABELS, unassigned, updateManual,
   type CashAccount, type CashCount, type CashEntry, type EntryInput, type EntryRow, type LinkSource,
 } from './repo.ts';
@@ -161,15 +161,16 @@ async function takeInbox(t: Tenant, form: Form, entryId: number, userId: number)
   return id ? assignToEntry(t, id, entryId, userId) : null;
 }
 
-/** Angehängte Belege mit Vorschau (Bilder) bzw. Link (PDF) */
-function filesList(c: Ctx, files: EntryFile[], canDelete: boolean): SafeHtml {
+/** Angehängte Belege mit Vorschau (Bilder) bzw. Link (PDF); archivieren statt löschen */
+function filesList(c: Ctx, files: EntryFile[], canArchive: boolean): SafeHtml {
   if (!files.length) return html``;
-  return html`<ul class="plain entry-file-list">${files.map((f) => html`<li>
+  return html`<ul class="plain entry-file-list">${files.map((f) => html`<li class="${f.archived_at ? 'archived' : ''}">
     <a href="/cashbook/files/${f.id}?inline=1" target="_blank" rel="noopener" class="entry-file">
       ${f.file_mime.startsWith('image/') ? html`<img src="/cashbook/files/${f.id}?inline=1" alt="Beleg ${f.file_name}" loading="lazy">` : html`<span class="pdf-badge">PDF</span>`}
-      <span>${f.file_name}<span class="muted small"> · ${Math.max(1, Math.round(f.file_size / 1024))} KB</span></span>
+      <span>${f.file_name}<span class="muted small"> · ${Math.max(1, Math.round(f.file_size / 1024))} KB${f.archived_at ? ' · archiviert' : ''}</span></span>
     </a>
-    ${canDelete ? postButton(c, `/cashbook/files/${f.id}/delete`, 'Entfernen', 'link danger', `Beleg „${f.file_name}“ entfernen?`) : ''}
+    ${canArchive ? postButton(c, `/cashbook/files/${f.id}/archive`, f.archived_at ? 'Wiederherstellen' : 'Archivieren', f.archived_at ? 'link' : 'link danger',
+      f.archived_at ? undefined : `Beleg „${f.file_name}“ archivieren? Er bleibt unverändert aufbewahrt (Aufbewahrungspflicht), zählt aber nicht mehr als Beleg dieser Buchung.`) : ''}
   </li>`)}</ul>`;
 }
 
@@ -667,7 +668,6 @@ function register(app: App) {
       await attachFiles(t, newId, files, userOf(c).id);
       return takeInbox(t, form, newId, userOf(c).id);
     });
-    if (taken) await removeInboxFile(taken);
     const n = files.length + (taken ? 1 : 0);
     return redirectWith(c, `/cashbook?account=${e.account_id}&year=${e.entry_date.slice(0, 4)}`, 'ok',
       n ? `Buchung mit ${n} Beleg(en) gespeichert.` : 'Buchung gespeichert. Belege lassen sich beim Bearbeiten nachreichen.');
@@ -681,15 +681,20 @@ function register(app: App) {
     const files = await filesOf(e.id);
     const inbox = locked ? [] : await inboxOf(t.id);
     const linked = e.source === 'invoice' || e.source === 'purchase' || e.source === 'donation';
+    const reversed = await reversalOf(e.id);
+    const sides = e.source === 'transfer' && e.transfer_group
+      ? (await all<{ id: number }>('SELECT id FROM cash_entries WHERE transfer_group = ?', e.transfer_group)).map((x) => x.id) : [e.id];
+    const withFiles = await hasFiles(sides);
     return page(c, {
-      title: e.source === 'transfer' ? 'Umbuchung' : 'Buchung bearbeiten',
+      title: e.reversal_of ? 'Stornobuchung' : e.source === 'transfer' ? 'Umbuchung' : 'Buchung bearbeiten',
       back: { href: `/cashbook?account=${e.account_id}&year=${e.entry_date.slice(0, 4)}`, label: 'Kassenbuch' },
       body: html`
       ${locked ? html`<div class="notice">Abgeschlossen – diese Buchung lässt sich nicht mehr ändern.</div>` : ''}
-      ${e.source === 'manual' && !locked
+      ${e.source === 'manual' && !locked && !reversed && !e.reversal_of
         ? entryForm(c, t, accounts, `/cashbook/entries/${e.id}`, e, inbox)
         : html`<section class="card"><dl class="dl">
             <dt>Datum</dt><dd>${formatDate(e.entry_date)}</dd><dt>Text</dt><dd>${e.text}</dd><dt>Betrag</dt><dd>${money(e.amount)}</dd>
+            ${e.reversal_of ? html`<dt>Storno zu</dt><dd><a href="/cashbook/entries/${e.reversal_of}/edit">Buchung ansehen</a></dd>` : ''}
             ${e.sphere ? html`<dt>Bereich</dt><dd>${sphereLabel(e.sphere)}</dd>` : ''}</dl></section>`}
       ${files.length || !linked
         ? html`<section class="card"><h2>Belege <span class="count">${files.length}</span></h2>
@@ -701,9 +706,18 @@ function register(app: App) {
               : ''}
           </section>`
         : ''}
-      ${e.source === 'manual' && !locked ? await linkPurchaseCard(c, t, e) : ''}
-      ${!locked && (e.source === 'manual' || e.source === 'transfer')
-        ? html`<div class="danger-zone">${postButton(c, `/cashbook/entries/${e.id}/delete`, e.source === 'transfer' ? 'Umbuchung löschen' : 'Buchung löschen', 'btn danger', 'Wirklich löschen?')}</div>`
+      ${e.source === 'manual' && !locked && !e.reversal_of && !reversed ? await linkPurchaseCard(c, t, e) : ''}
+      ${reversed ? html`<div class="notice soft">Storniert am ${formatDate(reversed.entry_date)} – <a href="/cashbook/entries/${reversed.id}/edit">Stornobuchung ansehen</a>.</div>` : ''}
+      ${(e.source === 'manual' || e.source === 'transfer') && !reversed && !e.reversal_of
+        ? html`<div class="danger-zone">
+            <form method="post" action="/cashbook/entries/${e.id}/reverse" class="inline-form"
+              data-confirm="Buchung stornieren? Es entsteht eine Gegenbuchung; Original und Belege bleiben unverändert stehen.">
+              ${csrfField(c)}
+              <label>Storno zum <input type="date" name="date" value="${today()}" min="${e.entry_date}" max="${today()}" required></label>
+              <button class="btn danger">${e.source === 'transfer' ? 'Umbuchung stornieren' : 'Buchung stornieren'}</button>
+            </form>
+            <p class="muted small">Buchungen lassen sich nicht löschen (GoBD) – ein Storno hebt sie nachvollziehbar auf${withFiles ? '; Original und Belege bleiben unverändert stehen' : ''}.${locked ? ' Der Zeitraum ist abgeschlossen – das Storno muss in einem offenen Zeitraum liegen.' : ''}</p>
+          </div>`
         : ''}`,
     });
   });
@@ -719,7 +733,6 @@ function register(app: App) {
       await attachFiles(t, e.id, files, userOf(c).id);
       return takeInbox(t, form, e.id, userOf(c).id);
     });
-    if (taken) await removeInboxFile(taken);
     await audit(c, 'cashbook.entry.update', `${formatDate(e.entry_date)} ${formatMoney(e.amount)} → ${formatDate(input.entry_date)} ${formatMoney(input.amount)}: ${input.text}`);
     return redirectWith(c, `/cashbook?account=${input.account_id}&year=${input.entry_date.slice(0, 4)}`, 'ok', 'Buchung gespeichert.');
   });
@@ -746,7 +759,6 @@ function register(app: App) {
       const k = await attachFiles(t, e.id, files, userOf(c).id);
       return { k, f: await takeInbox(t, form, e.id, userOf(c).id) };
     });
-    if (taken.f) await removeInboxFile(taken.f);
     const n = taken.k + (taken.f ? 1 : 0);
     await audit(c, 'cashbook.file.add', `${formatDate(e.entry_date)} ${e.text}: ${n} Beleg(e)`);
     return redirectWith(c, `/cashbook/entries/${e.id}/edit`, 'ok', `${n} Beleg(e) angehängt.`);
@@ -763,22 +775,24 @@ function register(app: App) {
     });
   });
 
-  app.post('/cashbook/files/:id/delete', async (c) => {
+  /** Beleg archivieren bzw. wiederherstellen – gelöscht wird nie (Aufbewahrungspflicht) */
+  app.post('/cashbook/files/:id/archive', async (c) => {
     const t = cbTenant(c);
     const f = await getFile(t.id, idParam(c)) ?? notFound();
     const e = (await one<CashEntry>('SELECT * FROM cash_entries WHERE id = ?', f.entry_id))!;
-    assertOpen(t, e.entry_date);
-    await deleteFile(f);
-    await audit(c, 'cashbook.file.delete', `${formatDate(e.entry_date)} ${e.text}: ${f.file_name}`);
-    return redirectWith(c, `/cashbook/entries/${e.id}/edit`, 'ok', 'Beleg entfernt.');
+    await setFileArchived(f, !f.archived_at);
+    await audit(c, f.archived_at ? 'cashbook.file.restore' : 'cashbook.file.archive', `${formatDate(e.entry_date)} ${e.text}: ${f.file_name}`);
+    return redirectWith(c, `/cashbook/entries/${e.id}/edit`, 'ok', f.archived_at ? 'Beleg wiederhergestellt.' : 'Beleg archiviert – er bleibt unverändert aufbewahrt.');
   });
 
-  app.post('/cashbook/entries/:id/delete', async (c) => {
+  /** Storno: Gegenbuchung, Original und Belege bleiben */
+  app.post('/cashbook/entries/:id/reverse', async (c) => {
     const t = cbTenant(c);
     const e = await one<CashEntry>('SELECT * FROM cash_entries WHERE tenant_id = ? AND id = ?', t.id, idParam(c)) ?? notFound();
-    await deleteEntry(t, e);
-    await audit(c, 'cashbook.entry.delete', `${formatDate(e.entry_date)} ${formatMoney(e.amount)}: ${e.text}`);
-    return redirectWith(c, `/cashbook?account=${e.account_id}&year=${e.entry_date.slice(0, 4)}`, 'ok', 'Buchung gelöscht.');
+    const date = str(await readForm(c), 'date') || today();
+    const [id] = await reverseEntry(t, e, date, userOf(c).id);
+    await audit(c, 'cashbook.entry.reverse', `${formatDate(e.entry_date)} ${formatMoney(e.amount)}: ${e.text} – Storno am ${formatDate(date)}`);
+    return redirectWith(c, `/cashbook/entries/${id}/edit`, 'ok', 'Buchung storniert – die Gegenbuchung ist angelegt, Original und Belege bleiben erhalten.');
   });
 
   /* ---------------- Zuordnen ---------------- */
@@ -933,8 +947,7 @@ function register(app: App) {
                       data-confirm="Datum der Zählung ändern? Buchbestand und Differenz dieser und späterer Zählungen werden neu berechnet.">${csrfField(c)}
                       <input type="date" name="count_date" value="${k.count_date}" min="${minOf(i)}" max="${maxOf(i)}" required aria-label="Neues Datum der Zählung">
                       <button class="link">Datum ändern</button></form>
-                    ${postButton(c, `/cashbook/counts/${k.id}/delete`, 'Löschen', 'link danger',
-                      i > 0 ? 'Zählung samt Differenzbuchung löschen? Die späteren Zählungen werden neu berechnet.' : 'Zählung samt Differenzbuchung löschen?')}` : ''}</td>
+                    ` : ''}</td>
               </tr>`;
             })}</tbody></table></div>`
         : empty('Noch keine Zählungen.'),
@@ -966,14 +979,6 @@ function register(app: App) {
     return c.json(out);
   });
 
-  app.post('/cashbook/counts/:id/delete', async (c) => {
-    const t = cbTenant(c);
-    const k = await one<CashCount & { tenant_id: number }>('SELECT * FROM cash_counts WHERE tenant_id = ? AND id = ?', t.id, idParam(c)) ?? notFound();
-    const a = (await getAccount(t.id, k.account_id))!;
-    await deleteCount(t, a, k);
-    await audit(c, 'cashbook.count.delete', `${a.name} ${formatDate(k.count_date)}`);
-    return redirectWith(c, `/cashbook/counts?account=${a.id}`, 'ok', 'Zählung gelöscht.');
-  });
 }
 
 export const cashbookModule: Module = {

@@ -3,7 +3,7 @@ import { audit } from '../lib/audit.ts';
 import { html, raw, type SafeHtml } from '../lib/html.ts';
 import { attachment, idParam, notFound, readForm, redirectWith, str, tenantOf, userOf } from '../lib/http.ts';
 import { inspectPdf } from '../lib/pdfmerge.ts';
-import { readStoredFile, removeStoredFile, saveFile, sha256 } from '../lib/files.ts';
+import { discardUnreferenced, readStoredFile, saveFile, sha256 } from '../lib/files.ts';
 import { csrfField, empty, page } from '../views/layout.ts';
 import { fromDbTime } from '../db/index.ts';
 import type { App, Ctx, Module } from '../types.ts';
@@ -151,7 +151,7 @@ function register(app: App) {
             <td class="right num">${p.used}×</td>
             <td class="right nowrap">
               <form method="post" action="/proofs/${p.id}/archive" class="inline">${csrfField(c)}<button class="link">${p.archived ? 'Wiederherstellen' : 'Archivieren'}</button></form>
-              ${p.used ? '' : html` · <form method="post" action="/proofs/${p.id}/delete" class="inline" data-confirm="Nachweis „${p.name}“ löschen?">${csrfField(c)}<button class="link danger">Löschen</button></form>`}
+              
             </td></tr>`)}
           </tbody></table></div>`
         : empty(showArchived ? 'Keine archivierten Nachweise.' : 'Noch keine Nachweise hochgeladen.')}`,
@@ -183,7 +183,7 @@ function register(app: App) {
         t.id, name, filename, stored.path, stored.sha256, data.length, info.pages, info.fontsEmbedded ? 1 : 0, userOf(c).id, now, now,
       );
     } catch (err) {
-      await removeStoredFile('nachweise', stored.path);
+      await discardUnreferenced('nachweise', stored.path);
       throw err;
     }
     await audit(c, 'proof.upload', `${name} (${filename})`);
@@ -219,17 +219,6 @@ function register(app: App) {
     return redirectWith(c, `/proofs${p.archived ? '?archived=1' : ''}`, 'ok', p.archived ? 'Nachweis wiederhergestellt.' : 'Nachweis archiviert.');
   });
 
-  app.post('/proofs/:id/delete', async (c) => {
-    const t = tenantOf(c);
-    const p = (await one('SELECT id, name, path FROM proof_documents WHERE id = ? AND tenant_id = ?', idParam(c), t.id)) ?? notFound();
-    if (await one('SELECT 1 FROM document_proofs WHERE proof_id = ? LIMIT 1', p.id)) {
-      return redirectWith(c, '/proofs', 'error', 'Dieser Nachweis ist an Belegen angehängt und kann nur archiviert werden.');
-    }
-    await run('DELETE FROM proof_documents WHERE id = ?', p.id);
-    if (p.path) await removeStoredFile('nachweise', p.path);
-    await audit(c, 'proof.delete', p.name);
-    return redirectWith(c, '/proofs', 'ok', 'Nachweis gelöscht.');
-  });
 }
 
 export const proofsModule: Module = {

@@ -25,6 +25,8 @@ export interface Donation {
   goods_documents: number;
   note: string;
   receipt_id: number | null;
+  /** wann zuerst eine Bestätigung erstellt wurde – bleibt auch nach deren Storno (dann nicht mehr löschbar) */
+  receipted_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -114,7 +116,9 @@ export async function updateDonation(existing: Donation, d: DonationInput) {
 }
 
 export async function deleteDonation(existing: Donation) {
-  if (existing.receipt_id) throw new UserError('Bestätigte Zuwendungen können nicht gelöscht werden. Erst die Bestätigung stornieren.');
+  if (existing.receipt_id || existing.receipted_at) {
+    throw new UserError('Für diese Zuwendung wurde eine Zuwendungsbestätigung erstellt – sie bleibt deshalb dauerhaft gespeichert und lässt sich nicht löschen (auch nicht nach dem Storno der Bestätigung).');
+  }
   await run('DELETE FROM donations WHERE id = ?', existing.id);
 }
 
@@ -161,7 +165,7 @@ async function issue(t: Tenant, contactId: number, kind: ReceiptKind, donations:
     );
     const receiptId = Number(res.insertId);
     for (const d of donations) {
-      const r = await run('UPDATE donations SET receipt_id = ?, updated_at = ? WHERE id = ? AND receipt_id IS NULL', receiptId, nowIso(), d.id);
+      const r = await run('UPDATE donations SET receipt_id = ?, receipted_at = COALESCE(receipted_at, ?), updated_at = ? WHERE id = ? AND receipt_id IS NULL', receiptId, nowIso(), nowIso(), d.id);
       if (!r.affectedRows) throw new UserError('Eine der Zuwendungen wurde inzwischen schon bestätigt.');
     }
     return receiptId;

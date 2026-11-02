@@ -88,7 +88,7 @@ async function purchasesIn(t: Tenant, from: string, to: string): Promise<Purchas
             COALESCE(NULLIF(c.company, ''), c.name, '') AS supplier_name, COALESCE(c.customer_number, '') AS supplier_number,
             COALESCE(c.vat_id, '') AS supplier_vat
      FROM purchase_invoices p LEFT JOIN contacts c ON c.id = p.contact_id
-     WHERE p.tenant_id = ? AND p.status <> 'draft' AND p.issue_date BETWEEN ? AND ?
+     WHERE p.tenant_id = ? AND p.status NOT IN ('draft', 'archived') AND p.issue_date BETWEEN ? AND ?
      ORDER BY p.issue_date, p.id`,
     t.id, from, to,
   );
@@ -336,7 +336,7 @@ function register(app: App) {
     const entryFiles = await all<{ id: number; entry_id: number; file_name: string; file_path: string; entry_date: string; account_name: string }>(
       `SELECT f.id, f.entry_id, f.file_name, f.file_path, e.entry_date, a.name account_name
        FROM cash_entry_files f JOIN cash_entries e ON e.id = f.entry_id JOIN cash_accounts a ON a.id = e.account_id
-       WHERE f.tenant_id = ? AND e.entry_date BETWEEN ? AND ? ORDER BY e.entry_date, f.id`,
+       WHERE f.tenant_id = ? AND f.archived_at IS NULL AND e.entry_date BETWEEN ? AND ? ORDER BY e.entry_date, f.id`,
       t.id, from, to,
     );
     const fileNames = new Map<number, string[]>();
