@@ -215,11 +215,12 @@ function register(app: App) {
 
   app.get('/purchases/new', async (c) => {
     const t = tenantOf(c);
-    const contact = c.req.query('contact') ? await getContact(t.id, Number(c.req.query('contact'))) : undefined;
-    const input = emptyInput(contact);
-    // aus einer freien Buchung anlegen: Datum, Betrag, Text, Kostenart, Bereich und Zahlung übernehmen
+    // aus einer freien Buchung anlegen: Datum, Betrag, Text, Kostenart, Bereich, Adresse und Zahlung übernehmen
     const entryId = cashbookEnabled(t) ? Number(c.req.query('entry') ?? 0) : 0;
     const entry = entryId ? await entryForPurchase(t, entryId) : null;
+    const contactId = Number(c.req.query('contact') ?? 0) || entry?.contact_id || 0;
+    const contact = contactId ? await getContact(t.id, contactId) : undefined;
+    const input = emptyInput(contact);
     if (entry) {
       const gross = Math.abs(entry.amount);
       const rate = t.small_business ? 0 : entry.vat_rate;

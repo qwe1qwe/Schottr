@@ -2,7 +2,8 @@ import { all, one, run, nowIso } from '../db/index.ts';
 import { html, selected, type SafeHtml } from '../lib/html.ts';
 import { readForm, str, redirectWith, tenantOf, idParam, notFound, type Form } from '../lib/http.ts';
 import { nextNumber } from '../lib/numbering.ts';
-import { today } from '../lib/dates.ts';
+import { formatDate, today } from '../lib/dates.ts';
+import { formatMoney } from '../lib/money.ts';
 import { isCountryCode, isValidEmail, isValidVatId, normalizeVatId } from '../lib/validate.ts';
 import { csrfField, page, empty } from '../views/layout.ts';
 import { documentTable } from './documents/views.ts';
@@ -105,12 +106,13 @@ function parseContact(form: Form) {
 
 /** Wie oft eine Adresse als Kunde bzw. als Lieferant verwendet wird */
 async function usage(contactId: number) {
-  const r = await one<{ docs: number; purchases: number; donations: number }>(
+  const r = await one<{ docs: number; purchases: number; donations: number; entries: number }>(
     `SELECT (SELECT COUNT(*) FROM documents WHERE contact_id = ?) AS docs, (SELECT COUNT(*) FROM purchase_invoices WHERE contact_id = ?) AS purchases,
-       (SELECT COUNT(*) FROM donations WHERE contact_id = ?) + (SELECT COUNT(*) FROM donation_receipts WHERE contact_id = ?) AS donations`,
-    contactId, contactId, contactId, contactId,
+       (SELECT COUNT(*) FROM donations WHERE contact_id = ?) + (SELECT COUNT(*) FROM donation_receipts WHERE contact_id = ?) AS donations,
+       (SELECT COUNT(*) FROM cash_entries WHERE contact_id = ?) + (SELECT COUNT(*) FROM cash_recurring WHERE contact_id = ?) AS entries`,
+    contactId, contactId, contactId, contactId, contactId, contactId,
   );
-  return { docs: Number(r?.docs ?? 0), purchases: Number(r?.purchases ?? 0), donations: Number(r?.donations ?? 0) };
+  return { docs: Number(r?.docs ?? 0), purchases: Number(r?.purchases ?? 0), donations: Number(r?.donations ?? 0), entries: Number(r?.entries ?? 0) };
 }
 
 function kindSelect(current: ContactKind): SafeHtml {
@@ -238,6 +240,13 @@ function register(app: App) {
           `SELECT d.*, r.number receipt_number FROM donations d LEFT JOIN donation_receipts r ON r.id = d.receipt_id
            WHERE d.tenant_id = ? AND d.contact_id = ? ORDER BY d.donation_date DESC, d.id DESC`, t.id, ct.id)
       : [];
+    // Freie Kassenbuch-Buchungen mit dieser Adresse (z. B. Kassenbons ohne Eingangsrechnung)
+    const entries = await all<{ id: number; entry_date: string; text: string; amount: number; account: string; reversed: number; reversal_of: number | null }>(
+      `SELECT e.id, e.entry_date, e.text, e.amount, a.name account, e.reversal_of,
+         EXISTS (SELECT 1 FROM cash_entries r WHERE r.reversal_of = e.id) reversed
+       FROM cash_entries e JOIN cash_accounts a ON a.id = e.account_id
+       WHERE e.tenant_id = ? AND e.contact_id = ? ORDER BY e.entry_date DESC, e.id DESC LIMIT 200`, t.id, ct.id,
+    );
     const quotes = docs.filter((d) => d.kind === 'quote');
     const invoices = docs.filter((d) => d.kind === 'invoice');
     const address = [ct.company, ct.name, ct.street, ct.address_extra, [ct.zip, ct.city].filter(Boolean).join(' '), ct.country !== 'DE' ? ct.country : '']
@@ -252,6 +261,7 @@ function register(app: App) {
           <a class="btn" href="/invoices/new?contact=${ct.id}">Neue Rechnung</a>` : ''}
         ${isSupplier(ct) ? html`<a class="btn" href="/purchases/new?contact=${ct.id}">Eingangsrechnung erfassen</a>` : ''}
         ${t.nonprofit ? html`<a class="btn" href="/donations/new?contact=${ct.id}">Zuwendung erfassen</a>` : ''}
+        ${t.org_type === 'association' ? html`<a class="btn" href="/cashbook/new?contact=${ct.id}">Buchung erfassen</a>` : ''}
         <a class="btn ghost" href="/contacts/${ct.id}/edit">Bearbeiten</a>`,
       body: html`
       ${ct.archived ? html`<div class="notice">Diese Adresse ist archiviert.</div>` : ''}
@@ -294,6 +304,19 @@ function register(app: App) {
               : ''}
           </section>`
         : ''}
+      ${entries.length
+        ? html`<section>
+            <h2 class="section-title">Buchungen ohne Rechnung <span class="count">${entries.length}</span></h2>
+            <div class="card flush"><table class="table stack-mobile">
+              <thead><tr><th>Datum</th><th>Buchung</th><th>Konto</th><th class="num">Betrag</th></tr></thead>
+              <tbody>${entries.map((e) => html`<tr class="rowlink${e.reversed || e.reversal_of ? ' muted' : ''}" data-href="/cashbook/entries/${e.id}/edit">
+                <td data-label="Datum">${formatDate(e.entry_date)}</td>
+                <td data-label="Buchung"><a href="/cashbook/entries/${e.id}/edit">${e.text}</a>${e.reversed ? html` <span class="tag">storniert</span>` : ''}</td>
+                <td data-label="Konto">${e.account}</td>
+                <td data-label="Betrag" class="num">${formatMoney(Number(e.amount))}</td>
+              </tr>`)}</tbody></table></div>
+          </section>`
+        : ''}
       ${donations.length
         ? html`<section>
             <h2 class="section-title">Zuwendungen <span class="count">${donations.length}</span></h2>
@@ -315,7 +338,7 @@ function register(app: App) {
       <div class="danger-zone">
         <form method="post" action="/contacts/${ct.id}/archive">${csrfField(c)}
           <button class="btn ghost">${ct.archived ? 'Aus Archiv holen' : 'Archivieren'}</button></form>
-        ${used.docs || used.purchases || used.donations ? '' : html`<form method="post" action="/contacts/${ct.id}/delete" data-confirm="Adresse endgültig löschen?">${csrfField(c)}
+        ${used.docs || used.purchases || used.donations || used.entries ? '' : html`<form method="post" action="/contacts/${ct.id}/delete" data-confirm="Adresse endgültig löschen?">${csrfField(c)}
           <button class="btn danger">Löschen</button></form>`}
       </div>`,
     });
@@ -347,8 +370,8 @@ function register(app: App) {
     const t = tenantOf(c);
     const ct = await getContact(t.id, idParam(c)) ?? notFound();
     const used = await usage(ct.id);
-    if (used.docs || used.purchases || used.donations) {
-      return redirectWith(c, `/contacts/${ct.id}`, 'error', 'Adressen mit Belegen können nur archiviert werden.');
+    if (used.docs || used.purchases || used.donations || used.entries) {
+      return redirectWith(c, `/contacts/${ct.id}`, 'error', 'Adressen mit Belegen oder Buchungen können nur archiviert werden.');
     }
     await run('DELETE FROM contacts WHERE id = ? AND tenant_id = ?', ct.id, t.id);
     return redirectWith(c, '/contacts', 'ok', 'Adresse gelöscht.');

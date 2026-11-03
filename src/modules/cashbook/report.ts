@@ -52,16 +52,16 @@ export async function accountReports(t: Tenant, from: string, to: string): Promi
 }
 
 export function cashbookCsv(t: Tenant, rep: AccountReport, files = new Map<number, string[]>()): string {
-  const head = ['Datum', 'Konto', 'Art', 'Buchungstext', 'Beleg', 'Kostenart', 'Bereich', 'USt-Satz', 'darin USt', 'Einnahme', 'Ausgabe', 'Saldo', 'Belegdateien'];
-  const lines: (string | number)[][] = [['', rep.account.name, '', 'Anfangsbestand', '', '', '', '', '', '', '', num(rep.opening), '']];
+  const head = ['Datum', 'Konto', 'Art', 'Buchungstext', 'Adresse', 'Beleg', 'Kostenart', 'Bereich', 'USt-Satz', 'darin USt', 'Einnahme', 'Ausgabe', 'Saldo', 'Belegdateien'];
+  const lines: (string | number)[][] = [['', rep.account.name, '', 'Anfangsbestand', '', '', '', '', '', '', '', '', num(rep.opening), '']];
   for (const r of rep.rows) {
     lines.push([
-      formatDate(r.entry_date), rep.account.name, r.recurring_id ? 'Dauerauftrag' : SOURCE_LABELS[r.source], entryLabel(r) + (r.ref_label && r.text ? ` – ${r.text}` : ''), r.receipt_ref,
+      formatDate(r.entry_date), rep.account.name, r.recurring_id ? 'Dauerauftrag' : SOURCE_LABELS[r.source], entryLabel(r) + (r.ref_label && r.text ? ` – ${r.text}` : ''), r.contact_label ?? '', r.receipt_ref,
       r.category || r.ref_category ? categoryLabel(r.category || r.ref_category!) : '', sphereText(t, r), r.vat_rate ? `${r.vat_rate / 100} %` : '', r.vat_rate ? num(vatOf(Math.abs(r.amount), r.vat_rate)) : '',
       r.amount > 0 ? num(r.amount) : '', r.amount < 0 ? num(-r.amount) : '', num(r.balance), (files.get(r.id) ?? []).join(', '),
     ]);
   }
-  lines.push(['', rep.account.name, '', 'Endbestand', '', '', '', '', '', num(rep.income), num(rep.expense), num(rep.closing), '']);
+  lines.push(['', rep.account.name, '', 'Endbestand', '', '', '', '', '', '', num(rep.income), num(rep.expense), num(rep.closing), '']);
   return csv(head, lines);
 }
 

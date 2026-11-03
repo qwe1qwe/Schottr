@@ -296,23 +296,35 @@ async function supplierCard(c: Ctx, t: Tenant, period: string, years: string[], 
      GROUP BY c.id, label ORDER BY s DESC`,
     t.id, ...params,
   );
-  type Part = { label: string; s: number; href?: string; cash?: boolean };
+  type Part = { label: string; s: number; href?: string };
   const parts: Part[] = rows.map((r) => ({ label: r.label, s: Number(r.s), href: `/contacts/${r.id}` }));
+  const byContact = new Map(rows.map((r, i) => [Number(r.id), parts[i]]));
   if (withCash) {
-    // gleiche Buchungstexte (z. B. „Kontoführungsgebühr“) zusammen; eine einzelne Buchung verlinkt direkt
-    const cashRows = await all<{ text: string; n: number | string; first_id: number; s: number | string }>(
-      `SELECT TRIM(e.text) text, COUNT(*) n, MIN(e.id) first_id, -SUM(${gross ? 'e.amount' : `e.amount - IF(e.vat_rate > 0, ROUND(e.amount * e.vat_rate / (10000 + e.vat_rate)), 0)`}) s
-       FROM cash_entries e WHERE e.tenant_id = ? AND ${CASH_OUT_LIVE} ${entryWhere}
-       GROUP BY TRIM(e.text)`,
+    // Buchungen mit Adresse zählen beim Lieferanten mit (REWE-Bons zu REWE); ohne Adresse werden
+    // gleiche Buchungstexte (z. B. „Kontoführungsgebühr“) zusammengefasst
+    const cashRows = await all<{ contact_id: number | null; clabel: string | null; grp: string; n: number | string; first_id: number; s: number | string }>(
+      `SELECT e.contact_id, MAX(COALESCE(NULLIF(k.company, ''), k.name)) clabel, IF(e.contact_id IS NULL, TRIM(e.text), '') grp,
+         COUNT(*) n, MIN(e.id) first_id, -SUM(${gross ? 'e.amount' : `e.amount - IF(e.vat_rate > 0, ROUND(e.amount * e.vat_rate / (10000 + e.vat_rate)), 0)`}) s
+       FROM cash_entries e LEFT JOIN contacts k ON k.id = e.contact_id
+       WHERE e.tenant_id = ? AND ${CASH_OUT_LIVE} ${entryWhere}
+       GROUP BY e.contact_id, grp`,
       t.id, ...params,
     );
     for (const r of cashRows) {
-      parts.push({
-        label: `${r.text || 'Buchung ohne Text'} (ohne Rechnung)`,
-        s: Number(r.s),
-        href: Number(r.n) === 1 ? `/cashbook/entries/${r.first_id}/edit` : `/cashbook${all_ ? '' : `?year=${period}`}`,
-        cash: true,
-      });
+      const known = r.contact_id ? byContact.get(Number(r.contact_id)) : undefined;
+      if (known) {
+        known.s += Number(r.s);
+        continue;
+      }
+      const part: Part = r.contact_id
+        ? { label: r.clabel ?? 'Adresse', s: Number(r.s), href: `/contacts/${r.contact_id}` }
+        : {
+            label: `${r.grp || 'Buchung ohne Text'} (ohne Rechnung)`,
+            s: Number(r.s),
+            href: Number(r.n) === 1 ? `/cashbook/entries/${r.first_id}/edit` : `/cashbook${all_ ? '' : `?year=${period}`}`,
+          };
+      if (r.contact_id) byContact.set(Number(r.contact_id), part);
+      parts.push(part);
     }
   }
   const positive = parts.filter((r) => r.s > 0).sort((a, b) => b.s - a.s);
@@ -340,9 +352,9 @@ async function supplierCard(c: Ctx, t: Tenant, period: string, years: string[], 
     t.id, ...params,
   );
   const bigEntries = withCash
-    ? await all<{ id: number; entry_date: string; text: string; amount: number; receipt_ref: string; account: string }>(
-        `SELECT e.id, e.entry_date, e.text, e.amount, e.receipt_ref, a.name account
-         FROM cash_entries e JOIN cash_accounts a ON a.id = e.account_id
+    ? await all<{ id: number; entry_date: string; text: string; amount: number; receipt_ref: string; account: string; clabel: string | null }>(
+        `SELECT e.id, e.entry_date, e.text, e.amount, e.receipt_ref, a.name account, COALESCE(NULLIF(k.company, ''), k.name) clabel
+         FROM cash_entries e JOIN cash_accounts a ON a.id = e.account_id LEFT JOIN contacts k ON k.id = e.contact_id
          WHERE e.tenant_id = ? AND ${CASH_OUT_LIVE} ${entryWhere}
          ORDER BY e.amount ASC, e.entry_date DESC LIMIT ${LIMIT}`,
         t.id, ...params,
@@ -365,7 +377,7 @@ async function supplierCard(c: Ctx, t: Tenant, period: string, years: string[], 
     ...bigEntries.map((e): Item => ({
       amount: -Number(e.amount), date: e.entry_date,
       html: html`<li>
-        <a href="/cashbook/entries/${e.id}/edit" class="liability-name">${e.text || 'Buchung ohne Text'}<span class="muted small"> · ${e.account} · bezahlt ${formatDate(e.entry_date)}${e.receipt_ref ? ` · ${e.receipt_ref}` : ''}</span></a>
+        <a href="/cashbook/entries/${e.id}/edit" class="liability-name">${e.clabel ?? (e.text || 'Buchung ohne Text')}<span class="muted small">${e.clabel && e.text ? ` · ${e.text}` : ''} · ${e.account} · bezahlt ${formatDate(e.entry_date)}${e.receipt_ref ? ` · ${e.receipt_ref}` : ''}</span></a>
         <span class="liability-due small"><span class="tag">ohne Rechnung</span></span>
         <strong class="num">${formatMoney(-e.amount)}</strong>
       </li>`,

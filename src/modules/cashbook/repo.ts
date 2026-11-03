@@ -36,6 +36,8 @@ export interface CashEntry {
   document_id: number | null;
   purchase_id: number | null;
   donation_id: number | null;
+  /** Adresse (Kunde/Lieferant) einer freien Buchung, optional */
+  contact_id: number | null;
   count_id: number | null;
   transfer_group: string | null;
   text: string;
@@ -160,6 +162,23 @@ export interface EntryInput {
   sphere?: string;
   vat_rate?: number;
   category?: string;
+  contact_id?: number | null;
+}
+
+/** Adresse einer Buchung prüfen: nur Adressen desselben Mandanten, sonst keine */
+export async function checkContact(t: Tenant, contactId: number | null | undefined): Promise<number | null> {
+  if (!contactId) return null;
+  if (!await one('SELECT 1 FROM contacts WHERE tenant_id = ? AND id = ?', t.id, contactId)) throw new UserError('Die gewählte Adresse gibt es nicht.');
+  return contactId;
+}
+
+/** Adressen zur Auswahl an Buchungen: alle aktiven (Kunden und Lieferanten) plus ggf. die gewählte */
+export async function entryContactOptions(tenantId: number, includeId?: number | null) {
+  return all<{ id: number; label: string; kind: string; city: string }>(
+    `SELECT id, COALESCE(NULLIF(company, ''), name) label, kind, city FROM contacts
+     WHERE tenant_id = ? AND (archived = 0 OR id = ?) ORDER BY label`,
+    tenantId, includeId ?? 0,
+  );
 }
 
 async function checkAccount(t: Tenant, accountId: number, date: string): Promise<CashAccount> {
@@ -239,12 +258,13 @@ export async function unlink(t: Tenant, source: LinkSource, refId: number, userI
 
 export async function createManual(t: Tenant, e: EntryInput, userId: number): Promise<number> {
   await checkAccount(t, e.account_id, e.entry_date);
+  const contactId = await checkContact(t, e.contact_id);
   const now = nowIso();
   return tx(async () => {
     const res = await run(
-      `INSERT INTO cash_entries (tenant_id, account_id, entry_date, amount, source, text, receipt_ref, sphere, vat_rate, category, created_by, created_at, updated_at)
-       VALUES (?, ?, ?, ?, 'manual', ?, ?, ?, ?, ?, ?, ?, ?)`,
-      t.id, e.account_id, e.entry_date, e.amount, e.text, e.receipt_ref ?? '', e.sphere ?? '', e.vat_rate ?? 0, e.category ?? '', userId, now, now,
+      `INSERT INTO cash_entries (tenant_id, account_id, entry_date, amount, source, contact_id, text, receipt_ref, sphere, vat_rate, category, created_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 'manual', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      t.id, e.account_id, e.entry_date, e.amount, contactId, e.text, e.receipt_ref ?? '', e.sphere ?? '', e.vat_rate ?? 0, e.category ?? '', userId, now, now,
     );
     await recalcAfter(t, [e.account_id, e.entry_date]);
     return Number(res.insertId);
@@ -256,10 +276,11 @@ export async function updateManual(t: Tenant, entry: CashEntry, e: EntryInput): 
   if (entry.reversal_of || await reversalOf(entry.id)) throw new UserError('Stornierte Buchungen und Stornobuchungen lassen sich nicht ändern.');
   assertOpen(t, entry.entry_date);
   await checkAccount(t, e.account_id, e.entry_date);
+  const contactId = await checkContact(t, e.contact_id);
   await tx(async () => {
     await run(
-      'UPDATE cash_entries SET account_id = ?, entry_date = ?, amount = ?, text = ?, receipt_ref = ?, sphere = ?, vat_rate = ?, category = ?, updated_at = ? WHERE id = ?',
-      e.account_id, e.entry_date, e.amount, e.text, e.receipt_ref ?? '', e.sphere ?? '', e.vat_rate ?? 0, e.category ?? '', nowIso(), entry.id,
+      'UPDATE cash_entries SET account_id = ?, entry_date = ?, amount = ?, contact_id = ?, text = ?, receipt_ref = ?, sphere = ?, vat_rate = ?, category = ?, updated_at = ? WHERE id = ?',
+      e.account_id, e.entry_date, e.amount, contactId, e.text, e.receipt_ref ?? '', e.sphere ?? '', e.vat_rate ?? 0, e.category ?? '', nowIso(), entry.id,
     );
     await recalcAfter(t, [entry.account_id, entry.entry_date], [e.account_id, e.entry_date]);
   });
@@ -391,9 +412,9 @@ export async function reverseEntry(t: Tenant, entry: CashEntry, date: string, us
     const ids: number[] = [];
     for (const x of sides) {
       const res = await run(
-        `INSERT INTO cash_entries (tenant_id, account_id, entry_date, amount, source, transfer_group, text, receipt_ref, sphere, vat_rate, category, reversal_of, created_by, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        t.id, x.account_id, date, -x.amount, x.source, group, `Storno: ${x.text}`.slice(0, 300), x.receipt_ref, x.sphere, x.vat_rate, x.category ?? '', x.id, userId, now, now,
+        `INSERT INTO cash_entries (tenant_id, account_id, entry_date, amount, source, transfer_group, contact_id, text, receipt_ref, sphere, vat_rate, category, reversal_of, created_by, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        t.id, x.account_id, date, -x.amount, x.source, group, x.contact_id ?? null, `Storno: ${x.text}`.slice(0, 300), x.receipt_ref, x.sphere, x.vat_rate, x.category ?? '', x.id, userId, now, now,
       );
       ids.push(Number(res.insertId));
     }
@@ -648,6 +669,8 @@ export interface EntryRow extends CashEntry {
   ref_label: string | null;
   ref_sphere: string | null;
   ref_category: string | null;
+  /** Adresse einer freien Buchung */
+  contact_label: string | null;
 }
 
 /**
@@ -672,7 +695,8 @@ export async function entriesOf(accounts: CashAccount[], from: string, to: strin
          WHEN 'purchase' THEN (SELECT NULLIF(p.sphere, '') FROM purchase_invoices p WHERE p.id = e.purchase_id)
          WHEN 'donation' THEN 'ideell'
          ELSE NULL END ref_sphere,
-       IF(e.source = 'purchase', (SELECT p.category FROM purchase_invoices p WHERE p.id = e.purchase_id), NULL) ref_category
+       IF(e.source = 'purchase', (SELECT p.category FROM purchase_invoices p WHERE p.id = e.purchase_id), NULL) ref_category,
+       (SELECT COALESCE(NULLIF(k.company, ''), k.name) FROM contacts k WHERE k.id = e.contact_id) contact_label
      FROM cash_entries e JOIN cash_accounts a ON a.id = e.account_id
      WHERE e.account_id IN (${ids.map(() => '?').join(',')}) AND e.entry_date BETWEEN ? AND ? ORDER BY e.entry_date, e.id`,
     ...ids, from, to,
@@ -709,6 +733,7 @@ export interface Recurring {
   account_id: number;
   amount: number;
   rhythm: Rhythm;
+  contact_id: number | null;
   start_date: string;
   end_date: string | null;
   text: string;
@@ -805,9 +830,9 @@ export async function bookDue(t: Tenant, r: Recurring, due: string, userId: numb
   const month = `${['Januar', 'Februar', 'März', 'April', 'Mai', 'Juni', 'Juli', 'August', 'September', 'Oktober', 'November', 'Dezember'][Number(due.slice(5, 7)) - 1]} ${due.slice(0, 4)}`;
   return tx(async () => {
     const res = await run(
-      `INSERT INTO cash_entries (tenant_id, account_id, entry_date, amount, source, recurring_id, recurring_due, text, receipt_ref, sphere, vat_rate, category, created_by, created_at, updated_at)
-       VALUES (?, ?, ?, ?, 'manual', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      t.id, r.account_id, due, r.amount, r.id, due, `${r.text} ${r.rhythm === 'yearly' ? due.slice(0, 4) : month}`,
+      `INSERT INTO cash_entries (tenant_id, account_id, entry_date, amount, source, recurring_id, recurring_due, contact_id, text, receipt_ref, sphere, vat_rate, category, created_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 'manual', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      t.id, r.account_id, due, r.amount, r.id, due, r.contact_id ?? null, `${r.text} ${r.rhythm === 'yearly' ? due.slice(0, 4) : month}`,
       r.receipt_ref, r.sphere, r.vat_rate, r.category, userId, now, now,
     );
     await recalcAfter(t, [r.account_id, due]);

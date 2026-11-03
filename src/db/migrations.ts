@@ -869,4 +869,18 @@ export const migrations: { version: number; statements: string[] }[] = [
         ADD COLUMN cropped_at DATETIME(3) NULL`,
     ],
   },
+  {
+    version: 18,
+    statements: [
+      // Adresse (Kunde/Lieferant) an freien Buchungen und Daueraufträgen – optional, z. B. REWE für
+      // einen Kassenbon oder der Vermieter beim Dauerauftrag „Miete“
+      `ALTER TABLE cash_entries
+        ADD COLUMN contact_id INT NULL AFTER donation_id,
+        ADD KEY cash_entries_contact (contact_id),
+        ADD CONSTRAINT cash_entries_contact FOREIGN KEY (contact_id) REFERENCES contacts(id)`,
+      `ALTER TABLE cash_recurring
+        ADD COLUMN contact_id INT NULL AFTER account_id,
+        ADD CONSTRAINT cash_recurring_contact FOREIGN KEY (contact_id) REFERENCES contacts(id)`,
+    ],
+  },
 ];

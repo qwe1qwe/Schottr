@@ -18,7 +18,7 @@ import { assignToEntry, getInbox, inboxOf, type InboxFile } from '../inbox/repo.
 import {
   bookDue, getRecurring, nextDue, pendingDues, recurringOf, RHYTHMS, skipDue, type PendingDue, type Recurring, type Rhythm,
   accountsOf, assertOpen, balanceAt, balances, bookLinked, cashbookEnabled, changeCountDate, createManual, linkEntryToPurchase, purchaseCandidates, recalcCounts, reversalOf, reverseEntry, createTransfer, DENOMINATIONS,
-  entriesOf, entrySphere, getAccount, history, lastCount, saveCount, SOURCE_LABELS, unassigned, updateManual,
+  entriesOf, entrySphere, getAccount, history, lastCount, saveCount, SOURCE_LABELS, unassigned, updateManual, checkContact, entryContactOptions,
   type CashAccount, type CashCount, type CashEntry, type EntryInput, type EntryRow, type LinkSource,
 } from './repo.ts';
 
@@ -73,7 +73,7 @@ function entryTable(t: Tenant, rows: EntryRow[], opening: number, showAccount: b
           <td>${formatDate(r.entry_date)}</td>
           ${showAccount ? html`<td>${r.account_name}</td>` : ''}
           <td><a href="${href}">${r.ref_label ?? r.text}</a>
-            <div class="muted small">${r.recurring_id ? 'Dauerauftrag' : SOURCE_LABELS[r.source]}${r.category ? ` · ${categoryLabel(r.category)}` : ''}${r.ref_label && r.text && r.text !== r.ref_label ? ` · ${r.text}` : ''}${r.receipt_ref ? ` · Beleg ${r.receipt_ref}` : ''}${r.vat_rate ? ` · inkl. ${r.vat_rate / 100} % USt.` : ''}${files.get(r.id) ? html` · <span class="has-file">${files.get(r.id)} ${files.get(r.id) === 1 ? 'Beleg' : 'Belege'}</span>` : ''}</div></td>
+            <div class="muted small">${r.contact_label ? `${r.contact_label} · ` : ''}${r.recurring_id ? 'Dauerauftrag' : SOURCE_LABELS[r.source]}${r.category ? ` · ${categoryLabel(r.category)}` : ''}${r.ref_label && r.text && r.text !== r.ref_label ? ` · ${r.text}` : ''}${r.receipt_ref ? ` · Beleg ${r.receipt_ref}` : ''}${r.vat_rate ? ` · inkl. ${r.vat_rate / 100} % USt.` : ''}${files.get(r.id) ? html` · <span class="has-file">${files.get(r.id)} ${files.get(r.id) === 1 ? 'Beleg' : 'Belege'}</span>` : ''}</div></td>
           ${t.nonprofit ? html`<td class="small">${sphere ? SPHERES.find((s) => s.value === sphere)?.short ?? '' : '–'}</td>` : ''}
           <td class="right num">${r.amount > 0 ? formatMoney(r.amount) : ''}</td>
           <td class="right num">${r.amount < 0 ? formatMoney(-r.amount) : ''}</td>
@@ -99,7 +99,27 @@ function parseEntry(form: Form, t: Tenant): EntryInput {
     sphere: t.nonprofit && isSphere(sphere) ? sphere : '',
     vat_rate: t.small_business ? 0 : [0, 700, 1900].includes(vat) ? vat : 0,
     category: str(form, 'direction') === 'out' && isExpenseCategory(str(form, 'category')) ? str(form, 'category') : '',
+    contact_id: Number(str(form, 'contact_id')) || null,
   };
+}
+
+type ContactOpt = { id: number; label: string; kind: string; city: string };
+
+/**
+ * Adresse (optional) – Lieferanten zuerst, dann Kunden. Neue Adressen über „Adressen“ anlegen;
+ * der Link öffnet sich in einem neuen Tab, damit die Eingaben hier nicht verloren gehen.
+ */
+function contactField(contacts: ContactOpt[], value: number | null | undefined): SafeHtml {
+  const opt = (k: ContactOpt) => html`<option value="${k.id}"${selected(k.id, value ?? '')}>${k.label}${k.city ? ` · ${k.city}` : ''}</option>`;
+  const suppliers = contacts.filter((k) => k.kind !== 'customer');
+  const customers = contacts.filter((k) => k.kind === 'customer');
+  return html`<label>Adresse (optional)
+    <select name="contact_id">
+      <option value="">– keine –</option>
+      ${suppliers.length ? html`<optgroup label="Lieferanten">${suppliers.map(opt)}</optgroup>` : ''}
+      ${customers.length ? html`<optgroup label="Kunden">${customers.map(opt)}</optgroup>` : ''}
+    </select>
+    <small class="muted">z. B. REWE oder Getränkemarkt · <a href="/contacts/new?kind=supplier" target="_blank" rel="noopener">neue Adresse</a></small></label>`;
 }
 
 /** Kostenart – nur bei Ausgaben (wird bei Einnahmen ausgeblendet und nicht gespeichert) */
@@ -210,7 +230,7 @@ async function linkPurchaseCard(c: Ctx, t: Tenant, e: CashEntry): Promise<SafeHt
   </section>`;
 }
 
-function entryForm(c: Ctx, t: Tenant, accounts: CashAccount[], action: string, e: Partial<CashEntry>, inbox: InboxFile[] = [], inboxId?: number): SafeHtml {
+function entryForm(c: Ctx, t: Tenant, accounts: CashAccount[], action: string, e: Partial<CashEntry>, contacts: ContactOpt[], inbox: InboxFile[] = [], inboxId?: number): SafeHtml {
   // Beleg aus dem Belegeingang (Quittung, Kassenbon) ist meist eine Ausgabe
   const out = (e.amount ?? 0) < 0 || (!e.id && !!inboxId);
   return html`<form method="post" action="${action}" class="card stack" enctype="multipart/form-data"
@@ -225,6 +245,7 @@ function entryForm(c: Ctx, t: Tenant, accounts: CashAccount[], action: string, e
       <label>Datum <input type="date" name="entry_date" value="${e.entry_date ?? today()}" required></label>
       <label>Betrag (€) <input name="amount" class="num" inputmode="decimal" required value="${e.amount ? formatAmount(Math.abs(e.amount)).replace(/\./g, '') : ''}" placeholder="0,00"></label>
       <label>Beleg-Nr. (optional) <input name="receipt_ref" maxlength="100" value="${e.receipt_ref ?? ''}" placeholder="z. B. Quittung 12"></label>
+      ${contactField(contacts, e.contact_id)}
       <label class="span-2">Buchungstext <input name="text" maxlength="300" required value="${e.text ?? ''}" placeholder="z. B. Getränkeverkauf Sommerfest, Porto, Kontoführungsgebühr"></label>
       ${categoryField(c, e.category ?? '')}
       ${sphereField(t, e.sphere ?? '')}
@@ -265,7 +286,7 @@ export function pendingCard(c: Ctx, list: PendingDue[], back: string): SafeHtml 
   </section>`;
 }
 
-function recurringForm(c: Ctx, t: Tenant, accounts: CashAccount[], action: string, r: Partial<Recurring>): SafeHtml {
+function recurringForm(c: Ctx, t: Tenant, accounts: CashAccount[], action: string, r: Partial<Recurring>, contacts: ContactOpt[]): SafeHtml {
   const out = (r.amount ?? -1) < 0;
   return html`<form method="post" action="${action}" class="stack">
     ${csrfField(c)}
@@ -277,6 +298,7 @@ function recurringForm(c: Ctx, t: Tenant, accounts: CashAccount[], action: strin
       <label class="span-2">Text <input name="text" maxlength="300" required value="${r.text ?? ''}" placeholder="z. B. Miete Vereinsheim"></label>
       <label>Konto ${accountSelect(accounts, r.account_id)}</label>
       <label>Betrag (€) <input name="amount" class="num" inputmode="decimal" required value="${r.amount ? formatAmount(Math.abs(r.amount)).replace(/\./g, '') : ''}" placeholder="0,00"></label>
+      ${contactField(contacts, r.contact_id)}
       <label>Rhythmus <select name="rhythm">${(Object.keys(RHYTHMS) as Rhythm[]).map((k) => html`<option value="${k}"${selected(k, r.rhythm ?? 'monthly')}>${RHYTHMS[k].label}</option>`)}</select></label>
       <label>Erster Termin <input type="date" name="start_date" required value="${r.start_date ?? `${today().slice(0, 8)}01`}">
         <small class="muted">bestimmt auch den Tag im Monat, z. B. 3. = immer am 3.</small></label>
@@ -315,6 +337,7 @@ function parseRecurring(form: Form, t: Tenant, isNew: boolean) {
     sphere: t.nonprofit && isSphere(sphere) ? sphere : '',
     vat_rate: t.small_business ? 0 : [0, 700, 1900].includes(vat) ? vat : 0,
     active: isNew || str(form, 'active') === '1' ? 1 : 0,
+    contact_id: Number(str(form, 'contact_id')) || null,
   };
 }
 
@@ -573,7 +596,7 @@ function register(app: App) {
             })}</tbody></table></div>`
         : html`<div class="notice soft">Daueraufträge sind wiederkehrende Zahlungen ohne eigene Rechnung – z. B. Miete laut Mietvertrag, Kontoführungsgebühren oder Versicherungsbeiträge. Zum Termin erscheinen sie in der Übersicht und lassen sich mit einem Klick buchen.</div>`}
       <section class="card"><h2>Neuer Dauerauftrag</h2>
-        ${recurringForm(c, t, accounts, '/cashbook/recurring', { account_id: accounts.find((a) => a.kind === 'bank')?.id })}</section>`,
+        ${recurringForm(c, t, accounts, '/cashbook/recurring', { account_id: accounts.find((a) => a.kind === 'bank')?.id }, await entryContactOptions(t.id))}</section>`,
     });
   });
 
@@ -581,11 +604,12 @@ function register(app: App) {
     const t = cbTenant(c);
     const v = parseRecurring(await readForm(c), t, true);
     if (!await getAccount(t.id, v.account_id)) throw new UserError('Bitte ein Konto auswählen.');
+    const contactId = await checkContact(t, v.contact_id);
     const now = nowIso();
     const res = await run(
-      `INSERT INTO cash_recurring (tenant_id, account_id, amount, rhythm, start_date, end_date, text, receipt_ref, category, sphere, vat_rate, active, created_by, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      t.id, v.account_id, v.amount, v.rhythm, v.start_date, v.end_date, v.text, v.receipt_ref, v.category, v.sphere, v.vat_rate, v.active, userOf(c).id, now, now,
+      `INSERT INTO cash_recurring (tenant_id, account_id, contact_id, amount, rhythm, start_date, end_date, text, receipt_ref, category, sphere, vat_rate, active, created_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      t.id, v.account_id, contactId, v.amount, v.rhythm, v.start_date, v.end_date, v.text, v.receipt_ref, v.category, v.sphere, v.vat_rate, v.active, userOf(c).id, now, now,
     );
     await audit(c, 'cashbook.recurring.create', `${v.text}: ${formatMoney(v.amount)} ${RHYTHMS[v.rhythm].label}`);
     return redirectWith(c, `/cashbook/recurring/${res.insertId}`, 'ok', 'Dauerauftrag angelegt.');
@@ -607,7 +631,7 @@ function register(app: App) {
     return page(c, {
       title: r.text,
       back: { href: '/cashbook/recurring', label: 'Daueraufträge' },
-      body: html`<section class="card">${recurringForm(c, t, accounts, `/cashbook/recurring/${r.id}`, r)}</section>
+      body: html`<section class="card">${recurringForm(c, t, accounts, `/cashbook/recurring/${r.id}`, r, await entryContactOptions(t.id, r.contact_id))}</section>
       ${booked.length
         ? html`<h2 class="section-title">Gebuchte Termine</h2>
           <div class="card flush"><table class="table"><thead><tr><th>Termin</th><th>Buchung</th><th class="right">Betrag</th></tr></thead>
@@ -624,10 +648,11 @@ function register(app: App) {
     const r = await getRecurring(t.id, idParam(c)) ?? notFound();
     const v = parseRecurring(await readForm(c), t, false);
     if (!await getAccount(t.id, v.account_id)) throw new UserError('Bitte ein Konto auswählen.');
+    const contactId = await checkContact(t, v.contact_id);
     await run(
-      `UPDATE cash_recurring SET account_id = ?, amount = ?, rhythm = ?, start_date = ?, end_date = ?, text = ?, receipt_ref = ?, category = ?, sphere = ?,
+      `UPDATE cash_recurring SET account_id = ?, contact_id = ?, amount = ?, rhythm = ?, start_date = ?, end_date = ?, text = ?, receipt_ref = ?, category = ?, sphere = ?,
          vat_rate = ?, active = ?, updated_at = ? WHERE id = ?`,
-      v.account_id, v.amount, v.rhythm, v.start_date, v.end_date, v.text, v.receipt_ref, v.category, v.sphere, v.vat_rate, v.active, nowIso(), r.id,
+      v.account_id, contactId, v.amount, v.rhythm, v.start_date, v.end_date, v.text, v.receipt_ref, v.category, v.sphere, v.vat_rate, v.active, nowIso(), r.id,
     );
     await audit(c, 'cashbook.recurring.update', `${v.text}: ${formatMoney(v.amount)} ${RHYTHMS[v.rhythm].label}`);
     return redirectWith(c, '/cashbook/recurring', 'ok', 'Dauerauftrag gespeichert. Bereits gebuchte Termine bleiben unverändert.');
@@ -664,7 +689,11 @@ function register(app: App) {
     const accounts = await needAccounts(c, t);
     const inbox = await inboxOf(t.id);
     const chosen = c.req.query('inbox') ? await getInbox(t.id, Number(c.req.query('inbox'))) : undefined;
-    const form = entryForm(c, t, accounts, '/cashbook/entries', { account_id: Number(c.req.query('account') ?? 0) || accounts[0].id, text: chosen?.note || undefined }, inbox, chosen?.id);
+    // ?contact= (z. B. von der Adresse aus) wählt die Adresse vor
+    const contactId = Number(c.req.query('contact') ?? 0) || null;
+    const form = entryForm(c, t, accounts, '/cashbook/entries', {
+      account_id: Number(c.req.query('account') ?? 0) || accounts[0].id, text: chosen?.note || undefined, contact_id: contactId,
+    }, await entryContactOptions(t.id, contactId), inbox, chosen?.id);
     return page(c, {
       title: 'Buchung erfassen',
       back: chosen ? { href: '/inbox', label: 'Belegeingang' } : { href: '/cashbook', label: 'Kassenbuch' },
@@ -705,9 +734,10 @@ function register(app: App) {
       body: html`
       ${locked ? html`<div class="notice">Abgeschlossen – diese Buchung lässt sich nicht mehr ändern.</div>` : ''}
       ${e.source === 'manual' && !locked && !reversed && !e.reversal_of
-        ? entryForm(c, t, accounts, `/cashbook/entries/${e.id}`, e, inbox)
+        ? entryForm(c, t, accounts, `/cashbook/entries/${e.id}`, e, await entryContactOptions(t.id, e.contact_id), inbox)
         : html`<section class="card"><dl class="dl">
             <dt>Datum</dt><dd>${formatDate(e.entry_date)}</dd><dt>Text</dt><dd>${e.text}</dd><dt>Betrag</dt><dd>${money(e.amount)}</dd>
+            ${e.contact_id ? html`<dt>Adresse</dt><dd><a href="/contacts/${e.contact_id}">${(await one<{ l: string }>("SELECT COALESCE(NULLIF(company, ''), name) l FROM contacts WHERE id = ?", e.contact_id))?.l ?? 'Adresse'}</a></dd>` : ''}
             ${e.reversal_of ? html`<dt>Storno zu</dt><dd><a href="/cashbook/entries/${e.reversal_of}/edit">Buchung ansehen</a></dd>` : ''}
             ${e.sphere ? html`<dt>Bereich</dt><dd>${sphereLabel(e.sphere)}</dd>` : ''}</dl></section>`}
       ${files.length || !linked
