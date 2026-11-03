@@ -6,6 +6,7 @@ import { EXPENSE_CATEGORIES, categoriesFor, categoryLabel } from '../../lib/expe
 import { tenantOf } from '../../lib/http.ts';
 import { unitShort } from '../../lib/units.ts';
 import { csrfField } from '../../views/layout.ts';
+import { cropControls } from '../../views/crop.ts';
 import type { Ctx } from '../../types.ts';
 import type { Contact } from '../contacts.ts';
 import { dueOf, payable, type EInvoiceInfo, type Purchase, type PurchaseInput, type PurchaseTax } from './repo.ts';
@@ -192,7 +193,7 @@ export function purchaseForm(
 /* ---------------- Anzeige ---------------- */
 
 /** Vorschau des Belegs: PDF/Bild eingebettet, XML als aufbereitete Übersicht auf der Detailseite */
-export function previewFrame(p: Purchase): SafeHtml {
+export function previewFrame(p: Purchase, c?: Ctx): SafeHtml {
   if (!p.file_path) return html``;
   const src = `/purchases/${p.id}/file?inline=1`;
   if (p.file_mime === 'application/pdf') {
@@ -203,7 +204,8 @@ export function previewFrame(p: Purchase): SafeHtml {
   }
   if (p.file_mime.startsWith('image/')) {
     return html`<div class="card flush preview-card">
-      <a href="${src}" target="_blank" rel="noopener"><img src="${src}" alt="Beleg ${p.file_name}" class="preview-img"></a>
+      <a href="${src}" target="_blank" rel="noopener"><img src="${src}${p.cropped_at ? `&v=${encodeURIComponent(p.cropped_at)}` : ''}" alt="Beleg ${p.file_name}" class="preview-img"></a>
+      ${c && p.status !== 'archived' ? html`<p class="preview-foot small">${p.crop_path ? html`<span class="muted">zugeschnitten · </span>` : ''}${cropControls(c, p, `/purchases/${p.id}/crop`, `/purchases/${p.id}/file`, { small: true })}</p>` : ''}
     </div>`;
   }
   return html`<div class="card preview-card"><p class="muted small">XML-Datei: <a href="/purchases/${p.id}/file">${p.file_name}</a> – die Inhalte stehen in der Übersicht.</p></div>`;

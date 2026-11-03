@@ -302,7 +302,7 @@ export async function linkEntryToPurchase(t: Tenant, entryId: number, purchaseId
 /** Freie Buchung, aus der eine Eingangsrechnung angelegt werden kann (sonst Fehler) */
 export async function entryForPurchase(t: Tenant, entryId: number): Promise<CashEntry & { file_count: number }> {
   const e = await one<CashEntry & { file_count: number }>(
-    `SELECT e.*, (SELECT COUNT(*) FROM cash_entry_files f WHERE f.entry_id = e.id) file_count
+    `SELECT e.*, (SELECT COUNT(*) FROM cash_entry_files f WHERE f.entry_id = e.id AND f.archived_at IS NULL) file_count
      FROM cash_entries e WHERE e.tenant_id = ? AND e.id = ?`, t.id, entryId,
   );
   if (!e) throw new UserError('Buchung nicht gefunden.');
@@ -318,13 +318,17 @@ export async function entryForPurchase(t: Tenant, entryId: number): Promise<Cash
  * auf dieselbe, unveränderte Datei – am Beleg der Buchung ändert sich nichts.
  */
 export async function shareEntryFileWithPurchase(entryId: number, purchaseId: number): Promise<boolean> {
-  const f = await one<{ id: number; file_name: string; file_path: string; file_mime: string; file_size: number; file_sha256: string }>(
+  const f = await one<{ id: number; file_name: string; file_path: string; file_mime: string; file_size: number; file_sha256: string;
+    crop_path: string | null; crop_mime: string | null; crop_size: number | null; crop_sha256: string | null; cropped_at: string | null }>(
     'SELECT * FROM cash_entry_files WHERE entry_id = ? AND archived_at IS NULL ORDER BY id LIMIT 1', entryId,
   );
   if (!f) return false;
+  // Ein Zuschnitt gilt mit: dieselbe (unveränderte) Ausschnitt-Datei wird mitverwendet
   await run(
-    "UPDATE purchase_invoices SET file_name = ?, file_path = ?, file_mime = ?, file_size = ?, file_sha256 = ?, updated_at = ? WHERE id = ? AND file_path = ''",
-    f.file_name, f.file_path, f.file_mime, f.file_size, f.file_sha256, nowIso(), purchaseId,
+    `UPDATE purchase_invoices SET file_name = ?, file_path = ?, file_mime = ?, file_size = ?, file_sha256 = ?,
+       crop_path = ?, crop_mime = ?, crop_size = ?, crop_sha256 = ?, cropped_at = ?, updated_at = ? WHERE id = ? AND file_path = ''`,
+    f.file_name, f.file_path, f.file_mime, f.file_size, f.file_sha256,
+    f.crop_path, f.crop_mime, f.crop_size, f.crop_sha256, f.cropped_at, nowIso(), purchaseId,
   );
   return true;
 }

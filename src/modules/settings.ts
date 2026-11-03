@@ -177,7 +177,7 @@ function register(app: App) {
             ? html`<div class="stack">
                 <form method="post" action="/settings/logo" enctype="multipart/form-data" class="logo-form">
                   ${csrfField(c)}
-                  <input type="file" name="logo" accept="image/png,image/jpeg" required aria-label="Logo-Datei">
+                  <input type="file" name="logo" accept="image/png,image/jpeg" required aria-label="Logo-Datei" data-crop-pick>
                   <button class="btn">${logo ? 'Ersetzen' : 'Hochladen'}</button>
                 </form>
                 <small class="muted">PNG (auch transparent) oder JPEG, max. 1 MB. Erscheint oben rechts auf Angeboten, Rechnungen und Mahnungen (max. 60 × 22 mm).</small>

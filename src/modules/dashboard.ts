@@ -255,13 +255,39 @@ async function resultChart(t: Tenant, year: string, todayIso: string, basis: Bas
 }
 
 /**
+ * Schalter „Buchungen ohne Eingangsrechnung“ in der Lieferanten-Kachel: ?scash=1|0 setzt ihn
+ * (je Mandant als Cookie gemerkt), sonst das Cookie. Nur mit Kassenbuch, Vorgabe aus.
+ */
+function dashSupplierCash(c: Ctx, t: Tenant): boolean {
+  if (!cashbookEnabled(t)) return false;
+  const name = `schottr_scash_${t.id}`;
+  const q = c.req.query('scash');
+  if (q === '1' || q === '0') {
+    setCookie(c, name, q, { path: '/', maxAge: 60 * 60 * 24 * 365, sameSite: 'Lax', httpOnly: true });
+    return q === '1';
+  }
+  return getCookie(c, name) === '1';
+}
+
+/**
+ * Freie Ausgabe-Buchungen (ohne Eingangsrechnung) für die Lieferanten-Kachel – ohne stornierte
+ * Buchungen und ohne Stornobuchungen, damit ein Storno nicht als Ausgabe stehen bleibt.
+ */
+const CASH_OUT_LIVE = `e.source = 'manual' AND e.amount < 0 AND e.reversal_of IS NULL
+  AND NOT EXISTS (SELECT 1 FROM cash_entries r WHERE r.reversal_of = e.id)`;
+
+/**
  * Kachel mit Umschalter: Top-Lieferanten nach Kosten bzw. größte Verbindlichkeiten (alle
  * Eingangsrechnungen, offene wie bezahlte) – jeweils für ein wählbares Jahr oder den ganzen Bestand.
+ * Mit dem Schalter „inkl. Buchungen ohne Rechnung“ (nur mit Kassenbuch) kommen freie
+ * Ausgabe-Buchungen dazu: im Diagramm je Buchungstext zusammengefasst, in der Liste einzeln.
  */
-async function supplierCard(t: Tenant, period: string, years: string[], dashYear: string, basis: Basis) {
+async function supplierCard(c: Ctx, t: Tenant, period: string, years: string[], dashYear: string, basis: Basis, withCash: boolean) {
   const all_ = period === 'all';
+  const gross = t.small_business || basis === 'gross';
   // Wie Ausgaben und Ergebnis nach Zahlungsdatum: nur bezahlte Eingangsrechnungen im gewählten Jahr
   const paidWhere = all_ ? '' : 'AND substr(p.paid_at, 1, 4) = ?';
+  const entryWhere = all_ ? '' : 'AND substr(e.entry_date, 1, 4) = ?';
   const params = all_ ? [] : [period];
   const rows = await all<{ id: number; label: string; s: number | string }>(
     `SELECT c.id, COALESCE(NULLIF(c.company, ''), c.name) label, ${COST(t, basis)} s
@@ -270,39 +296,98 @@ async function supplierCard(t: Tenant, period: string, years: string[], dashYear
      GROUP BY c.id, label ORDER BY s DESC`,
     t.id, ...params,
   );
-  const positive = rows.map((r) => ({ ...r, s: Number(r.s) })).filter((r) => r.s > 0);
-  const slices: PieSlice[] = positive.slice(0, 5).map((r) => ({ label: r.label, value: r.s, href: `/contacts/${r.id}` }));
+  type Part = { label: string; s: number; href?: string; cash?: boolean };
+  const parts: Part[] = rows.map((r) => ({ label: r.label, s: Number(r.s), href: `/contacts/${r.id}` }));
+  if (withCash) {
+    // gleiche Buchungstexte (z. B. „Kontoführungsgebühr“) zusammen; eine einzelne Buchung verlinkt direkt
+    const cashRows = await all<{ text: string; n: number | string; first_id: number; s: number | string }>(
+      `SELECT TRIM(e.text) text, COUNT(*) n, MIN(e.id) first_id, -SUM(${gross ? 'e.amount' : `e.amount - IF(e.vat_rate > 0, ROUND(e.amount * e.vat_rate / (10000 + e.vat_rate)), 0)`}) s
+       FROM cash_entries e WHERE e.tenant_id = ? AND ${CASH_OUT_LIVE} ${entryWhere}
+       GROUP BY TRIM(e.text)`,
+      t.id, ...params,
+    );
+    for (const r of cashRows) {
+      parts.push({
+        label: `${r.text || 'Buchung ohne Text'} (ohne Rechnung)`,
+        s: Number(r.s),
+        href: Number(r.n) === 1 ? `/cashbook/entries/${r.first_id}/edit` : `/cashbook${all_ ? '' : `?year=${period}`}`,
+        cash: true,
+      });
+    }
+  }
+  const positive = parts.filter((r) => r.s > 0).sort((a, b) => b.s - a.s);
+  const slices: PieSlice[] = positive.slice(0, 5).map((r) => ({ label: r.label, value: r.s, href: r.href }));
   const rest = positive.slice(5).reduce((a, r) => a + r.s, 0);
   if (rest > 0) slices.push({ label: `Sonstige (${positive.length - 5})`, value: rest, rest: true });
   const label = all_ ? 'gesamt' : period;
+  const what = withCash ? 'Ausgaben' : 'Eingangsrechnungen';
   const pie = pieChart(slices, {
     caption: 'Top-Lieferanten',
-    sub: `${t.small_business || basis === 'gross' ? 'Kosten brutto' : 'Kosten netto'}, ${all_ ? 'bezahlt in allen Jahren' : `bezahlt im Jahr ${period}`}`,
-    emptyText: all_ ? 'Es wurden noch keine Eingangsrechnungen bezahlt.' : `${period} wurden keine Eingangsrechnungen bezahlt.`,
+    sub: `${gross ? 'Kosten brutto' : 'Kosten netto'}, ${all_ ? 'bezahlt in allen Jahren' : `bezahlt im Jahr ${period}`}${withCash ? ', inkl. Buchungen ohne Rechnung' : ''}`,
+    emptyText: all_ ? `Es wurden noch keine ${what} bezahlt.` : `${period} wurden keine ${what} bezahlt.`,
     centerLabel: label,
     bare: true,
   });
 
   // Bezahlte nach Zahlungsjahr; noch offene gehören zum laufenden Jahr (bzw. zu „Alle Jahre“)
   const withOpen = all_ || period === today().slice(0, 4);
+  const LIMIT = 6;
   const biggest = await all<Purchase & { contact_label: string | null }>(
     `SELECT p.*, COALESCE(NULLIF(c.company, ''), c.name) AS contact_label FROM purchase_invoices p LEFT JOIN contacts c ON c.id = p.contact_id
      WHERE p.tenant_id = ? AND p.is_credit = 0
        AND ((p.status = 'paid' AND p.paid_at IS NOT NULL ${paidWhere})${withOpen ? " OR p.status = 'open'" : ''})
-     ORDER BY p.gross_total DESC, COALESCE(p.paid_at, p.issue_date) DESC LIMIT 6`,
+     ORDER BY p.gross_total DESC, COALESCE(p.paid_at, p.issue_date) DESC LIMIT ${LIMIT}`,
     t.id, ...params,
   );
-  const liabilities = biggest.length
-    ? html`<ul class="plain liability-list">${biggest.map((p) => {
-        const st = purchaseStatus(p);
-        return html`<li>
+  const bigEntries = withCash
+    ? await all<{ id: number; entry_date: string; text: string; amount: number; receipt_ref: string; account: string }>(
+        `SELECT e.id, e.entry_date, e.text, e.amount, e.receipt_ref, a.name account
+         FROM cash_entries e JOIN cash_accounts a ON a.id = e.account_id
+         WHERE e.tenant_id = ? AND ${CASH_OUT_LIVE} ${entryWhere}
+         ORDER BY e.amount ASC, e.entry_date DESC LIMIT ${LIMIT}`,
+        t.id, ...params,
+      )
+    : [];
+  // beide Quellen nach Bruttobetrag gemischt, die größten zuerst
+  type Item = { amount: number; date: string; html: SafeHtml };
+  const items: Item[] = [
+    ...biggest.map((p): Item => {
+      const st = purchaseStatus(p);
+      return {
+        amount: Number(p.gross_total), date: p.paid_at ?? p.issue_date ?? '',
+        html: html`<li>
           <a href="/purchases/${p.id}" class="liability-name">${p.contact_label ?? 'ohne Lieferant'}<span class="muted small"> · ${p.number || 'ohne Nr.'} · ${p.status === 'paid' && p.paid_at ? `bezahlt ${formatDate(p.paid_at)}` : formatDate(p.issue_date)}</span>${p.description ? html`<span class="muted small liability-desc">${p.description}</span>` : ''}</a>
           <span class="liability-due small">${st === 'open' ? html`<span class="muted">fällig ${formatDate(dueOf(p))}</span>` : purchaseBadge(st)}</span>
           <strong class="num">${formatMoney(p.gross_total)}</strong>
-        </li>`;
-      })}</ul>
-      <p class="small"><a href="/purchases">Alle Eingangsrechnungen</a></p>`
-    : html`<p class="muted small pie-empty">${all_ ? 'Keine Eingangsrechnungen.' : `${period} wurden keine Eingangsrechnungen bezahlt${withOpen ? ', offen ist auch keine' : ''}.`}</p>`;
+        </li>`,
+      };
+    }),
+    ...bigEntries.map((e): Item => ({
+      amount: -Number(e.amount), date: e.entry_date,
+      html: html`<li>
+        <a href="/cashbook/entries/${e.id}/edit" class="liability-name">${e.text || 'Buchung ohne Text'}<span class="muted small"> · ${e.account} · bezahlt ${formatDate(e.entry_date)}${e.receipt_ref ? ` · ${e.receipt_ref}` : ''}</span></a>
+        <span class="liability-due small"><span class="tag">ohne Rechnung</span></span>
+        <strong class="num">${formatMoney(-e.amount)}</strong>
+      </li>`,
+    })),
+  ].sort((a, b) => b.amount - a.amount || b.date.localeCompare(a.date)).slice(0, LIMIT);
+  const liabilities = items.length
+    ? html`<ul class="plain liability-list">${items.map((i) => i.html)}</ul>
+      <p class="small"><a href="/purchases">Alle Eingangsrechnungen</a>${withCash ? html` · <a href="/cashbook">Kassenbuch</a>` : ''}</p>`
+    : html`<p class="muted small pie-empty">${all_ ? `Keine ${what}.` : `${period} wurden keine ${what} bezahlt${withOpen ? ', offen ist auch keine' : ''}.`}</p>`;
+
+  const cashSwitch = cashbookEnabled(t)
+    ? html`<form method="get" action="/" class="dual-switch">
+        <input type="hidden" name="year" value="${dashYear}"><input type="hidden" name="sp" value="${period}">
+        <label class="switch small" title="Freie Ausgabe-Buchungen aus dem Kassenbuch (z. B. Porto, Kontogebühren, Barausgaben) mit anzeigen">
+          <input type="checkbox" name="scash" value="1" role="switch" data-autosubmit${withCash ? raw(' checked') : ''}>
+          <span class="switch-track" aria-hidden="true"></span>
+          <span>inkl. Buchungen ohne Rechnung</span>
+        </label>
+        <input type="hidden" name="scash" value="0">
+        <noscript><button class="btn small">OK</button></noscript>
+      </form>`
+    : '';
 
   return html`<section class="card dual" data-tabs>
     <div class="dual-head">
@@ -319,6 +404,7 @@ async function supplierCard(t: Tenant, period: string, years: string[], dashYear
         <button type="button" role="tab" data-tab="suppliers" aria-selected="true">Top-Lieferanten</button>
         <button type="button" role="tab" data-tab="liabilities" aria-selected="false">Größte Verbindlichkeiten</button>
       </div>
+      ${cashSwitch}
     </div>
     <div data-panel="suppliers" role="tabpanel"><h3 class="panel-title">Top-Lieferanten</h3>${pie}</div>
     <div data-panel="liabilities" role="tabpanel"><h3 class="panel-title">Größte Verbindlichkeiten</h3>${liabilities}</div>
@@ -653,7 +739,7 @@ export const dashboardModule: Module = {
       const result = await resultChart(t, selYear, d, basis);
       const customers = await topCustomers(t.id, d, basis);
       const spParam = c.req.query('sp') ?? '';
-      const suppliers = await supplierCard(t, spParam === 'all' || years.includes(spParam) ? spParam : selYear, years, selYear, basis);
+      const suppliers = await supplierCard(c, t, spParam === 'all' || years.includes(spParam) ? spParam : selYear, years, selYear, basis, dashSupplierCash(c, t));
       const liab = await openLiabilities(t.id);
       const ku = t.small_business ? await smallBusinessLimits(t, Number(year)) : null;
       const npo = t.nonprofit ? await nonprofitLimitsCard(t, Number(year)) : null;

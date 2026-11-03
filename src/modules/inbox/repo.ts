@@ -1,5 +1,6 @@
 import { all, one, run, tx, nowIso } from '../../db/index.ts';
 import { discardUnreferenced, readStoredFile, saveFile } from '../../lib/files.ts';
+import { copyCrop, viewOf } from '../../lib/crop.ts';
 import { UserError } from '../../lib/http.ts';
 import { appendPdfs, imagesToPdf } from '../../lib/pdfmerge.ts';
 import { attachData, MAX_ENTRY_FILE, mimeOf } from '../cashbook/files.ts';
@@ -26,6 +27,9 @@ export interface InboxFile {
   created_by: number | null;
   created_at: string;
   archived_at: string | null;
+  crop_path: string | null;
+  crop_mime: string | null;
+  cropped_at: string | null;
   assigned_at: string | null;
   assigned_to: string;
 }
@@ -122,6 +126,13 @@ export const getInbox = (tenantId: number, id: number) =>
 
 export const readInbox = (f: Pick<InboxFile, 'file_path'>) => readStoredFile(AREA, f.file_path);
 
+/** Anzeige: zugeschnittener Ausschnitt, falls vorhanden – sonst das Original */
+export const viewInbox = (f: InboxFile, original = false) => viewOf(AREA, f, original);
+
+/** Zuschnitt aus dem Belegeingang an die Eingangsrechnung bzw. den Buchungsbeleg weitergeben */
+export const carryCrop = (f: InboxFile, table: 'purchase_invoices' | 'cash_entry_files', tenantId: number, id: number) =>
+  copyCrop(AREA, f, table, 'verbindlichkeiten', tenantId, id);
+
 /** Noch offener Beleg (zum Zuordnen) – sonst Fehler */
 export async function openInbox(tenantId: number, id: number): Promise<InboxFile> {
   const f = await getInbox(tenantId, id);
@@ -164,7 +175,7 @@ export async function attachTargets(t: Tenant, withEntries: boolean): Promise<At
   const entries = withEntries
     ? await all<AttachTargets['entries'][number]>(
       `SELECT e.id, e.entry_date, e.text, e.amount, a.name account,
-              (SELECT COUNT(*) FROM cash_entry_files f WHERE f.entry_id = e.id) files
+              (SELECT COUNT(*) FROM cash_entry_files f WHERE f.entry_id = e.id AND f.archived_at IS NULL) files
        FROM cash_entries e JOIN cash_accounts a ON a.id = e.account_id
        WHERE e.tenant_id = ? AND e.source IN ('manual', 'transfer', 'count')
        ORDER BY e.entry_date DESC, e.id DESC LIMIT 150`, t.id,
@@ -200,6 +211,7 @@ export async function assignInbox(t: Tenant, inboxId: number, target: string, us
           f.file_name, stored.path, f.file_mime, stored.size, stored.sha256, nowIso(), p.id,
         );
         await markAssigned(f, `Eingangsrechnung ${p.number || `ID ${p.id}`}`);
+        await carryCrop(f, 'purchase_invoices', t.id, p.id);
       });
     } catch (err) {
       await discardUnreferenced('verbindlichkeiten', stored.path);
@@ -215,7 +227,8 @@ export async function assignInbox(t: Tenant, inboxId: number, target: string, us
     if (!['manual', 'transfer', 'count'].includes(e.source)) throw new UserError('Diese Buchung gehört zu einer Rechnung bzw. Spende – der Beleg ist dort hinterlegt.');
     result = { label: `Buchung „${e.text}“ vom ${e.entry_date.split('-').reverse().join('.')}`, href: `/cashbook/entries/${e.id}/edit` };
     await tx(async () => {
-      await attachData(t, e.id, { name: f.file_name, data, mime: f.file_mime }, userId);
+      const fileId = await attachData(t, e.id, { name: f.file_name, data, mime: f.file_mime }, userId);
+      await carryCrop(f, 'cash_entry_files', t.id, fileId);
       await markAssigned(f, result.label);
     });
   }
@@ -228,7 +241,8 @@ export async function assignInbox(t: Tenant, inboxId: number, target: string, us
  */
 export async function assignToEntry(t: Tenant, inboxId: number, entryId: number, userId: number): Promise<InboxFile> {
   const f = await openInbox(t.id, inboxId);
-  await attachData(t, entryId, { name: f.file_name, data: new Uint8Array(await readInbox(f)), mime: f.file_mime }, userId);
+  const fileId = await attachData(t, entryId, { name: f.file_name, data: new Uint8Array(await readInbox(f)), mime: f.file_mime }, userId);
+  await carryCrop(f, 'cash_entry_files', t.id, fileId);
   await markAssigned(f, `Kassenbuch-Buchung ID ${entryId}`);
   return f;
 }

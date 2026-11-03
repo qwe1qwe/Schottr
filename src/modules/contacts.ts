@@ -224,11 +224,15 @@ function register(app: App) {
     const t = tenantOf(c);
     const ct = await getContact(t.id, idParam(c)) ?? notFound();
     const docs = await all('SELECT * FROM documents WHERE tenant_id = ? AND contact_id = ? ORDER BY issue_date DESC, id DESC', t.id, ct.id);
-    const purchases = await all(
+    // Archivierte Eingangsrechnungen nur auf Wunsch (?archived=1)
+    const showArchived = c.req.query('archived') === '1';
+    const allPurchases = await all(
       `SELECT p.*, COALESCE(NULLIF(c.company, ''), c.name) AS contact_label FROM purchase_invoices p LEFT JOIN contacts c ON c.id = p.contact_id
        WHERE p.tenant_id = ? AND p.contact_id = ? ORDER BY p.issue_date DESC, p.id DESC`,
       t.id, ct.id,
     );
+    const archivedPurchases = allPurchases.filter((p) => p.status === 'archived').length;
+    const purchases = showArchived ? allPurchases : allPurchases.filter((p) => p.status !== 'archived');
     const donations = t.nonprofit || (await one('SELECT 1 FROM donations WHERE contact_id = ? LIMIT 1', ct.id))
       ? await all<Donation & { receipt_number: string | null }>(
           `SELECT d.*, r.number receipt_number FROM donations d LEFT JOIN donation_receipts r ON r.id = d.receipt_id
@@ -239,7 +243,7 @@ function register(app: App) {
     const address = [ct.company, ct.name, ct.street, ct.address_extra, [ct.zip, ct.city].filter(Boolean).join(' '), ct.country !== 'DE' ? ct.country : '']
       .filter(Boolean);
     const customer = isCustomer(ct) || docs.length > 0;
-    const supplier = isSupplier(ct) || purchases.length > 0;
+    const supplier = isSupplier(ct) || allPurchases.length > 0;
     return page(c, {
       title: contactLabel(ct),
       back: { href: `/contacts?kind=${ct.kind === 'supplier' ? 'supplier' : 'customer'}`, label: 'Adressen' },
@@ -282,7 +286,12 @@ function register(app: App) {
       ${supplier
         ? html`<section>
             <h2 class="section-title">Eingangsrechnungen <span class="count">${purchases.length}</span></h2>
-            ${purchases.length ? purchaseTable(purchases, false) : html`<p class="muted">Noch keine Eingangsrechnungen.</p>`}
+            ${purchases.length ? purchaseTable(purchases, false) : html`<p class="muted">${archivedPurchases && !showArchived ? 'Keine aktiven Eingangsrechnungen.' : 'Noch keine Eingangsrechnungen.'}</p>`}
+            ${archivedPurchases
+              ? html`<p class="muted small">${showArchived
+                  ? html`<a href="/contacts/${ct.id}">Archivierte ausblenden</a>`
+                  : html`<a href="/contacts/${ct.id}?archived=1">${archivedPurchases} archivierte anzeigen</a>`}</p>`
+              : ''}
           </section>`
         : ''}
       ${donations.length

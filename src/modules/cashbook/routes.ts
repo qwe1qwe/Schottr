@@ -1,5 +1,7 @@
 import { all, one, run, tx, nowIso } from '../../db/index.ts';
-import { attachFiles, fileCounts, filesFrom, filesOf, getFile, hasFiles, readEntryFile, setFileArchived, type EntryFile } from './files.ts';
+import { attachFiles, fileCounts, filesFrom, filesOf, getFile, hasFiles, setFileArchived, viewEntryFile, type EntryFile } from './files.ts';
+import { handleCrop } from '../../lib/crop.ts';
+import { cropControls } from '../../views/crop.ts';
 import { audit } from '../../lib/audit.ts';
 import { addDays, formatDate, isIsoDate, today } from '../../lib/dates.ts';
 import { checked, html, selected, type SafeHtml } from '../../lib/html.ts';
@@ -161,17 +163,29 @@ async function takeInbox(t: Tenant, form: Form, entryId: number, userId: number)
   return id ? assignToEntry(t, id, entryId, userId) : null;
 }
 
-/** Angehängte Belege mit Vorschau (Bilder) bzw. Link (PDF); archivieren statt löschen */
+/**
+ * Angehängte Belege mit Vorschau (Bilder) bzw. Link (PDF); archivieren statt löschen.
+ * Archivierte Belege stehen nur eingeklappt darunter – standardmäßig sieht man sie nicht.
+ */
 function filesList(c: Ctx, files: EntryFile[], canArchive: boolean): SafeHtml {
-  if (!files.length) return html``;
-  return html`<ul class="plain entry-file-list">${files.map((f) => html`<li class="${f.archived_at ? 'archived' : ''}">
+  const item = (f: EntryFile) => html`<li class="${f.archived_at ? 'archived' : ''}">
     <a href="/cashbook/files/${f.id}?inline=1" target="_blank" rel="noopener" class="entry-file">
-      ${f.file_mime.startsWith('image/') ? html`<img src="/cashbook/files/${f.id}?inline=1" alt="Beleg ${f.file_name}" loading="lazy">` : html`<span class="pdf-badge">PDF</span>`}
-      <span>${f.file_name}<span class="muted small"> · ${Math.max(1, Math.round(f.file_size / 1024))} KB${f.archived_at ? ' · archiviert' : ''}</span></span>
+      ${f.file_mime.startsWith('image/') ? html`<img src="/cashbook/files/${f.id}?inline=1${f.cropped_at ? `&v=${encodeURIComponent(f.cropped_at)}` : ''}" alt="Beleg ${f.file_name}" loading="lazy">` : html`<span class="pdf-badge">PDF</span>`}
+      <span>${f.file_name}<span class="muted small"> · ${Math.max(1, Math.round(f.file_size / 1024))} KB${f.crop_path ? ' · zugeschnitten' : ''}${f.archived_at ? ' · archiviert' : ''}</span></span>
     </a>
-    ${canArchive ? postButton(c, `/cashbook/files/${f.id}/archive`, f.archived_at ? 'Wiederherstellen' : 'Archivieren', f.archived_at ? 'link' : 'link danger',
-      f.archived_at ? undefined : `Beleg „${f.file_name}“ archivieren? Er bleibt unverändert aufbewahrt (Aufbewahrungspflicht), zählt aber nicht mehr als Beleg dieser Buchung.`) : ''}
-  </li>`)}</ul>`;
+    <span class="entry-file-actions">
+      ${f.archived_at ? '' : cropControls(c, f, `/cashbook/files/${f.id}/crop`, `/cashbook/files/${f.id}`, { small: true })}
+      ${canArchive ? postButton(c, `/cashbook/files/${f.id}/archive`, f.archived_at ? 'Wiederherstellen' : 'Archivieren', f.archived_at ? 'link' : 'link danger',
+        f.archived_at ? undefined : `Beleg „${f.file_name}“ archivieren? Er bleibt unverändert aufbewahrt (Aufbewahrungspflicht), zählt aber nicht mehr als Beleg dieser Buchung und wird nicht mehr exportiert.`) : ''}
+    </span>
+  </li>`;
+  const active = files.filter((f) => !f.archived_at);
+  const archived = files.filter((f) => f.archived_at);
+  return html`${active.length ? html`<ul class="plain entry-file-list">${active.map(item)}</ul>` : html`<p class="muted small">Kein aktiver Beleg angehängt.</p>`}
+    ${archived.length
+      ? html`<details class="archived-files"><summary class="muted small">${archived.length} archivierte(r) Beleg(e) anzeigen</summary>
+          <ul class="plain entry-file-list">${archived.map(item)}</ul></details>`
+      : ''}`;
 }
 
 /** Auf der Buchungsseite: freie Ausgabe mit einer später eingegangenen Eingangsrechnung verbinden */
@@ -697,7 +711,7 @@ function register(app: App) {
             ${e.reversal_of ? html`<dt>Storno zu</dt><dd><a href="/cashbook/entries/${e.reversal_of}/edit">Buchung ansehen</a></dd>` : ''}
             ${e.sphere ? html`<dt>Bereich</dt><dd>${sphereLabel(e.sphere)}</dd>` : ''}</dl></section>`}
       ${files.length || !linked
-        ? html`<section class="card"><h2>Belege <span class="count">${files.length}</span></h2>
+        ? html`<section class="card"><h2>Belege <span class="count">${files.filter((f) => !f.archived_at).length}</span></h2>
             ${files.length ? filesList(c, files, !locked) : html`<p class="muted small">Noch kein Beleg angehängt.</p>`}
             ${!linked && (locked || e.source !== 'manual')
               ? html`<form method="post" action="/cashbook/entries/${e.id}/files" enctype="multipart/form-data" class="stack">
@@ -767,12 +781,24 @@ function register(app: App) {
   app.get('/cashbook/files/:id', async (c) => {
     const t = cbTenant(c);
     const f = await getFile(t.id, idParam(c)) ?? notFound();
-    return c.body(new Uint8Array(await readEntryFile(f)), 200, {
-      'Content-Type': f.file_mime,
-      'Content-Disposition': attachment(f.file_name, c.req.query('inline') === '1'),
+    const v = await viewEntryFile(f, c.req.query('original') === '1');
+    return c.body(new Uint8Array(v.data), 200, {
+      'Content-Type': v.mime,
+      'Content-Disposition': attachment(v.name, c.req.query('inline') === '1'),
       'Cache-Control': 'private, no-store',
       'X-Content-Type-Options': 'nosniff',
     });
+  });
+
+  /** Foto-Beleg zuschneiden – das Original bleibt unverändert erhalten */
+  app.post('/cashbook/files/:id/crop', async (c) => {
+    const t = cbTenant(c);
+    const f = await getFile(t.id, idParam(c)) ?? notFound();
+    if (f.archived_at) throw new UserError('Der Beleg ist archiviert – zum Zuschneiden zuerst wiederherstellen.');
+    const e = (await one<CashEntry>('SELECT * FROM cash_entries WHERE id = ?', f.entry_id))!;
+    const r = await handleCrop(c, 'cash_entry_files', 'verbindlichkeiten', t.id, f.id, f);
+    await audit(c, r === 'saved' ? 'cashbook.file.crop' : 'cashbook.file.uncrop', `${formatDate(e.entry_date)} ${e.text}: ${f.file_name}`);
+    return redirectWith(c, `/cashbook/entries/${e.id}/edit`, 'ok', r === 'saved' ? 'Beleg zugeschnitten – das Original bleibt unverändert erhalten.' : 'Zuschnitt verworfen – es gilt wieder das Original.');
   });
 
   /** Beleg archivieren bzw. wiederherstellen – gelöscht wird nie (Aufbewahrungspflicht) */

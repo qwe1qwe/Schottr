@@ -242,6 +242,282 @@
       return file; // z. B. HEIC in Browsern ohne Unterstützung – der Server meldet sich dann
     }
   };
+
+  /* ---------- Bilder zuschneiden (Dialog) ----------
+   * cropImage(quelle, { skip }) öffnet den Dialog für eine Datei/Blob oder eine Adresse.
+   * Ergebnis: { action: 'apply', file } | { action: 'skip' } | { action: 'cancel' }.
+   * Drehen in 90°-Schritten, Rahmen aufziehen, verschieben, an Ecken und Kanten ziehen –
+   * mit Maus und Finger (Pointer Events). Ausgabe: PNG bleibt PNG, sonst JPEG.
+   */
+  const cropImage = (() => {
+    let dlg = null;
+    const els = {};
+    const st = { bmp: null, rot: 0, scale: 1, w: 0, h: 0, box: null, type: 'image/jpeg', name: 'bild', resolve: null };
+    const HANDLES = ['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w'];
+    const MIN = 24;
+
+    const build = () => {
+      dlg = document.createElement('dialog');
+      dlg.className = 'cropper';
+      dlg.innerHTML = `
+        <div class="cropper-head"><strong>Zuschneiden</strong>
+          <span class="muted small">Rahmen aufziehen, verschieben oder an den Ecken ziehen</span></div>
+        <div class="cropper-stage" data-stage><canvas></canvas>
+          <div class="cropper-box" data-box>${HANDLES.map((h) => `<span class="cropper-h ${h}" data-h="${h}"></span>`).join('')}</div></div>
+        <div class="cropper-tools">
+          <button type="button" class="btn small ghost" data-rot="-1" title="Nach links drehen">⟲ Drehen</button>
+          <button type="button" class="btn small ghost" data-rot="1" title="Nach rechts drehen">⟳ Drehen</button>
+          <button type="button" class="btn small ghost" data-full>Ganzes Bild</button>
+        </div>
+        <div class="cropper-actions">
+          <button type="button" class="btn ghost" data-cancel>Abbrechen</button>
+          <button type="button" class="btn" data-skip>Ohne Zuschneiden</button>
+          <button type="button" class="btn primary" data-apply>Übernehmen</button>
+        </div>`;
+      document.body.append(dlg);
+      els.stage = dlg.querySelector('[data-stage]');
+      els.canvas = dlg.querySelector('canvas');
+      els.box = dlg.querySelector('[data-box]');
+      els.skip = dlg.querySelector('[data-skip]');
+      dlg.addEventListener('cancel', (e) => {
+        e.preventDefault();
+        finish({ action: 'cancel' });
+      });
+      dlg.querySelector('[data-cancel]').addEventListener('click', () => finish({ action: 'cancel' }));
+      els.skip.addEventListener('click', () => finish({ action: 'skip' }));
+      dlg.querySelector('[data-apply]').addEventListener('click', apply);
+      dlg.querySelector('[data-full]').addEventListener('click', () => {
+        st.box = { x: 0, y: 0, w: st.w, h: st.h };
+        st.prev = { ...st.box };
+        placeBox();
+      });
+      dlg.querySelectorAll('[data-rot]').forEach((b) => b.addEventListener('click', () => {
+        st.rot = (st.rot + Number(b.dataset.rot) + 4) % 4;
+        layout();
+      }));
+      bindPointer();
+      window.addEventListener('resize', () => dlg.open && layout());
+    };
+
+    // Abmessungen des gedrehten Bildes in voller Auflösung
+    const rotSize = () => (st.rot % 2 ? [st.bmp.height, st.bmp.width] : [st.bmp.width, st.bmp.height]);
+    // Transformation „gedrehtes Bild“ → Zeichenfläche (nach evtl. Skalierung/Verschiebung)
+    const rotate = (ctx) => {
+      const { width: bw, height: bh } = st.bmp;
+      if (st.rot === 1) { ctx.translate(bh, 0); ctx.rotate(Math.PI / 2); }
+      if (st.rot === 2) { ctx.translate(bw, bh); ctx.rotate(Math.PI); }
+      if (st.rot === 3) { ctx.translate(0, bw); ctx.rotate(-Math.PI / 2); }
+      ctx.drawImage(st.bmp, 0, 0);
+    };
+
+    const layout = () => {
+      const [rw, rh] = rotSize();
+      const maxW = Math.min(window.innerWidth - 48, 960);
+      const maxH = Math.max(200, window.innerHeight - 230);
+      st.scale = Math.min(maxW / rw, maxH / rh, 1);
+      st.w = Math.round(rw * st.scale);
+      st.h = Math.round(rh * st.scale);
+      const dpr = window.devicePixelRatio || 1;
+      els.canvas.width = Math.round(st.w * dpr);
+      els.canvas.height = Math.round(st.h * dpr);
+      els.canvas.style.width = `${st.w}px`;
+      els.canvas.style.height = `${st.h}px`;
+      els.stage.style.width = `${st.w}px`;
+      els.stage.style.height = `${st.h}px`;
+      const ctx = els.canvas.getContext('2d');
+      ctx.setTransform(st.scale * dpr, 0, 0, st.scale * dpr, 0, 0);
+      rotate(ctx);
+      // Startrahmen mit etwas Abstand – so sieht man sofort, dass er sich ziehen lässt
+      const m = Math.round(Math.min(st.w, st.h) * 0.04);
+      st.box = { x: m, y: m, w: st.w - 2 * m, h: st.h - 2 * m };
+      st.prev = { ...st.box };
+      placeBox();
+    };
+
+    const placeBox = () => {
+      const b = st.box;
+      Object.assign(els.box.style, { left: `${b.x}px`, top: `${b.y}px`, width: `${b.w}px`, height: `${b.h}px` });
+    };
+
+    const bindPointer = () => {
+      let drag = null;
+      const pt = (e) => {
+        const r = els.stage.getBoundingClientRect();
+        return { x: Math.max(0, Math.min(st.w, e.clientX - r.left)), y: Math.max(0, Math.min(st.h, e.clientY - r.top)) };
+      };
+      els.stage.addEventListener('pointerdown', (e) => {
+        if (e.button > 0) return;
+        e.preventDefault();
+        const p = pt(e);
+        const h = e.target.closest('[data-h]')?.dataset.h;
+        const b = { ...st.box };
+        if (h) drag = { mode: h, p, b };
+        else if (e.target.closest('[data-box]')) drag = { mode: 'move', p, b };
+        else drag = { mode: 'new', p, b: { x: p.x, y: p.y, w: 0, h: 0 } };
+        els.stage.setPointerCapture(e.pointerId);
+      });
+      els.stage.addEventListener('pointermove', (e) => {
+        if (!drag) return;
+        const p = pt(e);
+        const dx = p.x - drag.p.x;
+        const dy = p.y - drag.p.y;
+        const o = drag.b;
+        let { x, y, w, h } = o;
+        if (drag.mode === 'move') {
+          x = Math.max(0, Math.min(st.w - w, o.x + dx));
+          y = Math.max(0, Math.min(st.h - h, o.y + dy));
+        } else if (drag.mode === 'new') {
+          x = Math.min(drag.p.x, p.x);
+          y = Math.min(drag.p.y, p.y);
+          w = Math.abs(dx);
+          h = Math.abs(dy);
+        } else {
+          const m = drag.mode;
+          if (m.includes('w')) { x = Math.min(o.x + o.w - MIN, Math.max(0, o.x + dx)); w = o.x + o.w - x; }
+          if (m.includes('e')) w = Math.max(MIN, Math.min(st.w - o.x, o.w + dx));
+          if (m.includes('n')) { y = Math.min(o.y + o.h - MIN, Math.max(0, o.y + dy)); h = o.y + o.h - y; }
+          if (m.includes('s')) h = Math.max(MIN, Math.min(st.h - o.y, o.h + dy));
+        }
+        st.box = { x, y, w, h };
+        placeBox();
+      });
+      const end = () => {
+        if (!drag) return;
+        // versehentlicher Klick ohne Ziehen: alten Rahmen behalten
+        if (st.box.w < MIN || st.box.h < MIN) st.box = drag.mode === 'new' ? { ...st.prev } : drag.b;
+        st.prev = { ...st.box };
+        drag = null;
+        placeBox();
+      };
+      els.stage.addEventListener('pointerup', end);
+      els.stage.addEventListener('pointercancel', end);
+    };
+
+    async function apply() {
+      const b = st.box;
+      const sx = b.x / st.scale;
+      const sy = b.y / st.scale;
+      const out = document.createElement('canvas');
+      out.width = Math.max(1, Math.round(b.w / st.scale));
+      out.height = Math.max(1, Math.round(b.h / st.scale));
+      const ctx = out.getContext('2d');
+      if (st.type !== 'image/png') {
+        ctx.fillStyle = '#fff';
+        ctx.fillRect(0, 0, out.width, out.height);
+      }
+      ctx.translate(-sx, -sy);
+      rotate(ctx);
+      let blob = await new Promise((r) => out.toBlob(r, st.type, 0.9));
+      // sehr große PNGs (z. B. Fotos als PNG) lieber als JPEG
+      if (blob && st.type === 'image/png' && blob.size > 8 * 1024 * 1024) blob = await new Promise((r) => out.toBlob(r, 'image/jpeg', 0.9));
+      if (!blob) return finish({ action: 'cancel' });
+      const ext = blob.type === 'image/png' ? '.png' : '.jpg';
+      finish({ action: 'apply', file: new File([blob], st.name.replace(/\.[^.]+$/, '') + ext, { type: blob.type, lastModified: Date.now() }) });
+    }
+
+    const finish = (result) => {
+      if (dlg?.open) dlg.close();
+      st.bmp?.close?.();
+      st.bmp = null;
+      const r = st.resolve;
+      st.resolve = null;
+      r?.(result);
+    };
+
+    return async (source, opts = {}) => {
+      if (typeof createImageBitmap !== 'function' || typeof HTMLDialogElement !== 'function') return { action: 'skip' };
+      if (!dlg) build();
+      let blob = source;
+      if (typeof source === 'string') {
+        const res = await fetch(source, { credentials: 'same-origin' });
+        if (!res.ok) {
+          window.alert('Das Bild konnte nicht geladen werden.');
+          return { action: 'cancel' };
+        }
+        blob = await res.blob();
+      }
+      if (!/^image\/(jpeg|png|webp)$/.test(blob.type)) return { action: 'skip' };
+      try {
+        st.bmp = await createImageBitmap(blob, { imageOrientation: 'from-image' }).catch(() => createImageBitmap(blob));
+      } catch {
+        return { action: 'skip' };
+      }
+      st.rot = 0;
+      st.type = blob.type === 'image/png' ? 'image/png' : 'image/jpeg';
+      st.name = opts.name || blob.name || 'beleg.jpg';
+      els.skip.hidden = !opts.skip;
+      dlg.showModal();
+      layout();
+      return new Promise((resolve) => { st.resolve = resolve; });
+    };
+  })();
+
+  /** Datei an Position i eines Dateifelds ersetzen */
+  const replaceFile = (input, i, file) => {
+    const dt = new DataTransfer();
+    [...input.files].forEach((f, k) => dt.items.add(k === i ? file : f));
+    input.files = dt.files;
+  };
+  const isImg = (f) => /^image\/(jpeg|png|webp)$/.test(f.type);
+
+  /* Nachträglich zuschneiden (Belege): Knopf mit data-crop-action / data-crop-reset */
+  const postForm = (action, csrf, fill) => {
+    const form = document.createElement('form');
+    form.method = 'post';
+    form.action = action;
+    form.enctype = 'multipart/form-data';
+    form.hidden = true;
+    const token = document.createElement('input');
+    token.type = 'hidden';
+    token.name = '_csrf';
+    token.value = csrf;
+    form.append(token);
+    fill(form);
+    document.body.append(form);
+    form.submit();
+  };
+  document.addEventListener('click', async (e) => {
+    const btn = e.target instanceof Element ? e.target.closest('[data-crop-action], [data-crop-reset]') : null;
+    if (!btn) return;
+    e.preventDefault();
+    if (btn.dataset.cropReset) {
+      if (btn.dataset.confirmText && !window.confirm(btn.dataset.confirmText)) return;
+      return postForm(btn.dataset.cropReset, btn.dataset.csrf, (form) => {
+        const r = document.createElement('input');
+        r.type = 'hidden';
+        r.name = 'reset';
+        r.value = '1';
+        form.append(r);
+      });
+    }
+    btn.disabled = true;
+    try {
+      const res = await cropImage(btn.dataset.cropSrc);
+      if (res.action !== 'apply') return;
+      postForm(btn.dataset.cropAction, btn.dataset.csrf, (form) => {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.name = 'image';
+        const dt = new DataTransfer();
+        dt.items.add(res.file);
+        input.files = dt.files;
+        form.append(input);
+      });
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  /* Einzelnes Bild beim Auswählen zuschneiden (z. B. Logo): input[data-crop-pick] */
+  document.querySelectorAll('input[type="file"][data-crop-pick]').forEach((input) => {
+    input.addEventListener('change', async () => {
+      const f = input.files[0];
+      if (!f || !isImg(f)) return;
+      const res = await cropImage(f, { skip: true });
+      if (res.action === 'apply') replaceFile(input, 0, res.file);
+      else if (res.action === 'cancel') input.value = '';
+    });
+  });
   document.querySelectorAll('[data-entry-files]').forEach((box) => {
     const list = box.querySelector('[data-file-list]');
     const holder = document.createElement('div');
@@ -250,9 +526,23 @@
     const refresh = () => {
       list.replaceChildren();
       holder.querySelectorAll('input[type="file"]').forEach((input) => {
-        [...input.files].forEach((f) => {
+        [...input.files].forEach((f, i) => {
           const li = document.createElement('li');
           li.textContent = `${f.name} (${Math.max(1, Math.round(f.size / 1024))} KB) `;
+          if (isImg(f)) {
+            const crop = document.createElement('button');
+            crop.type = 'button';
+            crop.className = 'link';
+            crop.textContent = 'zuschneiden';
+            crop.addEventListener('click', async () => {
+              const res = await cropImage(f);
+              if (res.action === 'apply') {
+                replaceFile(input, i, res.file);
+                refresh();
+              }
+            });
+            li.append(crop, ' · ');
+          }
           const rm = document.createElement('button');
           rm.type = 'button';
           rm.className = 'link danger';
@@ -278,6 +568,12 @@
       const dt = new DataTransfer();
       for (const f of input.files) dt.items.add(await shrink(f));
       input.files = dt.files;
+      // frisch fotografiert: gleich zuschneiden anbieten
+      if (input.hasAttribute('capture') && input.files.length === 1 && isImg(input.files[0])) {
+        const res = await cropImage(input.files[0], { skip: true });
+        if (res.action === 'apply') replaceFile(input, 0, res.file);
+        else if (res.action === 'cancel') input.remove();
+      }
       refresh();
     };
     const bind = (input) => input.addEventListener('change', () => onPick(input));
@@ -289,10 +585,18 @@
     const input = form.querySelector('input[type="file"]');
     input.addEventListener('change', async () => {
       if (!input.files.length) return;
-      form.classList.add('busy');
       const dt = new DataTransfer();
       for (const f of input.files) dt.items.add(await shrink(f));
       input.files = dt.files;
+      if (input.files.length === 1 && isImg(input.files[0])) {
+        const res = await cropImage(input.files[0], { skip: true });
+        if (res.action === 'cancel') {
+          input.value = '';
+          return;
+        }
+        if (res.action === 'apply') replaceFile(input, 0, res.file);
+      }
+      form.classList.add('busy');
       form.submit();
     });
   });
@@ -413,10 +717,35 @@
     const input = form.querySelector('[data-upload-input]');
     const list = form.querySelector('[data-upload-files]');
     const zone = form.querySelector('.drop-zone');
+    // Fotos in der Auswahl lassen sich vor dem Hochladen zuschneiden (Liste unter dem Ablagefeld)
+    const picks = document.createElement('ul');
+    picks.className = 'plain file-picks small';
+    zone.after(picks);
     const show = () => {
-      const names = [...(input.files || [])].map((f) => f.name);
-      list.hidden = !names.length;
-      list.textContent = names.length ? `${names.length} Datei(en): ${names.join(', ')}` : '';
+      const files = [...(input.files || [])];
+      list.hidden = !files.length;
+      list.textContent = files.length ? `${files.length} Datei(en) ausgewählt` : '';
+      picks.replaceChildren();
+      files.forEach((f, i) => {
+        const li = document.createElement('li');
+        li.textContent = `${f.name} (${Math.max(1, Math.round(f.size / 1024))} KB) `;
+        if (isImg(f)) {
+          const crop = document.createElement('button');
+          crop.type = 'button';
+          crop.className = 'link';
+          crop.textContent = 'zuschneiden';
+          crop.addEventListener('click', async () => {
+            const res = await cropImage(f);
+            if (res.action === 'apply') {
+              replaceFile(input, i, res.file);
+              show();
+            }
+          });
+          li.append(crop);
+        }
+        picks.append(li);
+      });
+      picks.hidden = !files.length;
     };
     input.addEventListener('change', show);
     ['dragenter', 'dragover'].forEach((t) => zone.addEventListener(t, (e) => {

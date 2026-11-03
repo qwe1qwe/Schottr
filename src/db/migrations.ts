@@ -842,4 +842,31 @@ export const migrations: { version: number; statements: string[] }[] = [
        IF OLD.receipted_at IS NOT NULL AND NOT (NEW.receipted_at <=> OLD.receipted_at) THEN ${forbid('Zuwendungen mit Zuwendungsbestaetigung koennen nicht geloescht werden')}; END IF`,
     ],
   },
+  {
+    version: 17,
+    statements: [
+      // Zuschnitt von Foto-Belegen: Das Original bleibt unverändert (und durch die Trigger aus
+      // Version 15 gesperrt); der zugeschnittene Ausschnitt wird als eigene, zusätzliche Datei
+      // daneben abgelegt und zur Anzeige und im Export verwendet. Verwerfen stellt das Original
+      // wieder als Ansicht her – gelöscht wird dabei nichts.
+      `ALTER TABLE cash_entry_files
+        ADD COLUMN crop_path VARCHAR(300) NULL,
+        ADD COLUMN crop_mime VARCHAR(60) NULL,
+        ADD COLUMN crop_size INT NULL,
+        ADD COLUMN crop_sha256 CHAR(64) NULL,
+        ADD COLUMN cropped_at DATETIME(3) NULL`,
+      `ALTER TABLE purchase_invoices
+        ADD COLUMN crop_path VARCHAR(300) NULL,
+        ADD COLUMN crop_mime VARCHAR(60) NULL,
+        ADD COLUMN crop_size INT NULL,
+        ADD COLUMN crop_sha256 CHAR(64) NULL,
+        ADD COLUMN cropped_at DATETIME(3) NULL`,
+      `ALTER TABLE inbox_files
+        ADD COLUMN crop_path VARCHAR(300) NULL,
+        ADD COLUMN crop_mime VARCHAR(60) NULL,
+        ADD COLUMN crop_size INT NULL,
+        ADD COLUMN crop_sha256 CHAR(64) NULL,
+        ADD COLUMN cropped_at DATETIME(3) NULL`,
+    ],
+  },
 ];

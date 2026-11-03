@@ -9,7 +9,9 @@ import { cashbookEnabled } from '../cashbook/repo.ts';
 import { filesFrom } from '../cashbook/files.ts';
 import { fileUploader } from '../cashbook/routes.ts';
 import { importPurchaseFile, importRedirect } from '../purchases/routes.ts';
-import { addInbox, archivedInbox, assignInbox, attachTargets, combine, getInbox, inboxOf, markAssigned, openInbox, readInbox, setInboxArchived, type AttachTargets, type InboxFile } from './repo.ts';
+import { addInbox, archivedInbox, assignInbox, attachTargets, carryCrop, combine, getInbox, inboxOf, markAssigned, openInbox, readInbox, setInboxArchived, viewInbox, type AttachTargets, type InboxFile } from './repo.ts';
+import { handleCrop } from '../../lib/crop.ts';
+import { cropControls } from '../../views/crop.ts';
 import type { App, Ctx, Module, Tenant } from '../../types.ts';
 
 /**
@@ -46,7 +48,7 @@ const kb = (n: number) => `${Math.max(1, Math.round(n / 1024))} KB`;
 function thumb(f: InboxFile): SafeHtml {
   const src = `/inbox/${f.id}/file?inline=1`;
   return html`<a href="${src}" target="_blank" rel="noopener" class="inbox-thumb" title="${f.file_name} öffnen">
-    ${f.file_mime.startsWith('image/') ? html`<img src="${src}" alt="Beleg ${f.file_name}" loading="lazy">` : html`<span class="pdf-badge">PDF</span>`}
+    ${f.file_mime.startsWith('image/') ? html`<img src="${src}${f.cropped_at ? `&v=${encodeURIComponent(f.cropped_at)}` : ''}" alt="Beleg ${f.file_name}" loading="lazy">` : html`<span class="pdf-badge">PDF</span>`}
   </a>`;
 }
 
@@ -55,7 +57,8 @@ function inboxCard(c: Ctx, t: Tenant, f: InboxFile, targets: AttachTargets): Saf
     ${thumb(f)}
     <div class="inbox-meta">
       <strong class="truncate">${f.file_name}</strong>
-      <span class="muted small">${formatDate(f.created_at.slice(0, 10))} · ${kb(f.file_size)}${f.note ? html` · ${f.note}` : ''}</span>
+      <span class="muted small">${formatDate(f.created_at.slice(0, 10))} · ${kb(f.file_size)}${f.crop_path ? ' · zugeschnitten' : ''}${f.note ? html` · ${f.note}` : ''}</span>
+      <div class="small">${cropControls(c, f, `/inbox/${f.id}/crop`, `/inbox/${f.id}/file`, { small: true })}</div>
       <div class="inline-form">
         ${postButton(c, `/inbox/${f.id}/purchase`, 'Als Eingangsrechnung', 'btn small primary')}
         ${cashbookEnabled(t) ? html`<a class="btn small" href="/cashbook/new?inbox=${f.id}">Als Buchung</a>` : ''}
@@ -202,13 +205,16 @@ function register(app: App) {
 
     const q = (c.req.query('q') ?? '').trim().slice(0, 100);
     const like = `%${q}%`;
-    const archivedItems = await archivedInbox(t.id);
+    // Archivierte Belege nur auf ausdrücklichen Wunsch (Häkchen „Archivierte zeigen“)
+    const showArchived = c.req.query('archived') === '1';
+    const archivedItems = showArchived ? await archivedInbox(t.id) : [];
     type Row = { kind: 'purchase' | 'cash' | 'inbox'; date: string; title: string; sub: string; amount: number | null; href: string; file: string; name: string };
     const purchases = await all<{ id: number; issue_date: string | null; created_at: string; number: string; description: string; file_name: string; gross_total: number; is_credit: number; status: string; label: string | null }>(
       `SELECT p.id, p.issue_date, p.created_at, p.number, p.description, p.file_name, p.gross_total, p.is_credit, p.status,
               COALESCE(NULLIF(c.company, ''), c.name) label
        FROM purchase_invoices p LEFT JOIN contacts c ON c.id = p.contact_id
        WHERE p.tenant_id = ? AND p.file_path IS NOT NULL AND p.file_path <> ''
+         ${showArchived ? '' : "AND p.status <> 'archived'"}
          ${q ? 'AND (p.number LIKE ? OR p.description LIKE ? OR p.file_name LIKE ? OR c.company LIKE ? OR c.name LIKE ?)' : ''}
        ORDER BY COALESCE(p.issue_date, DATE(p.created_at)) DESC, p.id DESC LIMIT 500`,
       t.id, ...(q ? Array(5).fill(like) : []),
@@ -217,7 +223,7 @@ function register(app: App) {
       ? await all<{ id: number; entry_id: number; file_name: string; entry_date: string; text: string; amount: number; account: string; archived_at: string | null }>(
         `SELECT f.id, f.entry_id, f.file_name, f.archived_at, e.entry_date, e.text, e.amount, a.name account
          FROM cash_entry_files f JOIN cash_entries e ON e.id = f.entry_id JOIN cash_accounts a ON a.id = e.account_id
-         WHERE f.tenant_id = ?
+         WHERE f.tenant_id = ? ${showArchived ? '' : 'AND f.archived_at IS NULL'}
            -- dieselbe Datei auch als Rechnungsdatei verwendet: nur einmal (bei der Eingangsrechnung) zeigen
            AND NOT EXISTS (SELECT 1 FROM purchase_invoices p WHERE p.tenant_id = f.tenant_id AND p.file_path = f.file_path)
            ${q ? 'AND (f.file_name LIKE ? OR e.text LIKE ? OR e.receipt_ref LIKE ?)' : ''}
@@ -246,7 +252,8 @@ function register(app: App) {
       actions: html`<a class="btn primary" href="/capture">Beleg erfassen</a>`,
       body: html`${tabs}
       <form class="toolbar" method="get"><input type="hidden" name="tab" value="all">
-        <input type="search" name="q" value="${q}" placeholder="Suchen …" aria-label="Suchen"></form>
+        <input type="search" name="q" value="${q}" placeholder="Suchen …" aria-label="Suchen">
+        <label class="check small"><input type="checkbox" name="archived" value="1" data-autosubmit${checked(showArchived)}> Archivierte zeigen</label></form>
       ${rows.length
         ? html`<div class="card flush"><table class="table stack-mobile">
             <thead><tr><th>Datum</th><th>Art</th><th>Beleg</th><th>Datei</th><th class="num">Betrag</th></tr></thead>
@@ -265,9 +272,10 @@ function register(app: App) {
   app.get('/inbox/:id/file', async (c) => {
     const t = tenantOf(c);
     const f = await getInbox(t.id, idParam(c)) ?? notFound();
-    return c.body(new Uint8Array(await readInbox(f)), 200, {
-      'Content-Type': f.file_mime,
-      'Content-Disposition': attachment(f.file_name, c.req.query('inline') === '1'),
+    const v = await viewInbox(f, c.req.query('original') === '1');
+    return c.body(new Uint8Array(v.data), 200, {
+      'Content-Type': v.mime,
+      'Content-Disposition': attachment(v.name, c.req.query('inline') === '1'),
       'Cache-Control': 'private, no-store',
       'X-Content-Type-Options': 'nosniff',
     });
@@ -284,7 +292,17 @@ function register(app: App) {
         : redirectWith(c, '/inbox', 'error', `„${f.file_name}“: ${r.message}.`);
     }
     await markAssigned(f, `Eingangsrechnung ID ${r.id}`);
+    if (r.id) await carryCrop(f, 'purchase_invoices', t.id, r.id);
     return importRedirect(c, r);
+  });
+
+  /** Foto im Belegeingang zuschneiden – das Original bleibt unverändert erhalten */
+  app.post('/inbox/:id/crop', async (c) => {
+    const t = tenantOf(c);
+    const f = await openInbox(t.id, idParam(c));
+    const r = await handleCrop(c, 'inbox_files', 'other', t.id, f.id, f);
+    await audit(c, r === 'saved' ? 'inbox.crop' : 'inbox.uncrop', f.file_name);
+    return redirectWith(c, '/inbox', 'ok', r === 'saved' ? 'Beleg zugeschnitten – das Original bleibt unverändert erhalten.' : 'Zuschnitt verworfen – es gilt wieder das Original.');
   });
 
   /** Vorhandener Eingangsrechnung (ohne Datei) oder Buchung zuordnen */

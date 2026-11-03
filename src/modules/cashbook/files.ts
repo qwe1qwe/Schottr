@@ -1,6 +1,7 @@
 import { all, one, run, nowIso } from '../../db/index.ts';
 import { readStoredFile, saveFile } from '../../lib/files.ts';
 import { UserError } from '../../lib/http.ts';
+import { viewOf } from '../../lib/crop.ts';
 import type { Tenant } from '../../types.ts';
 
 /**
@@ -23,6 +24,9 @@ export interface EntryFile {
   file_size: number;
   created_at: string;
   archived_at: string | null;
+  crop_path: string | null;
+  crop_mime: string | null;
+  cropped_at: string | null;
 }
 
 /** Dateityp anhand des Inhalts – nur PDF, JPEG und PNG */
@@ -57,13 +61,14 @@ export async function attachFiles(t: Tenant, entryId: number, files: File[], use
 }
 
 /** Eine bereits geprüfte Datei (z. B. aus dem Belegeingang) an eine Buchung hängen */
-export async function attachData(t: Tenant, entryId: number, p: { name: string; data: Uint8Array; mime: string }, userId: number) {
+export async function attachData(t: Tenant, entryId: number, p: { name: string; data: Uint8Array; mime: string }, userId: number): Promise<number> {
   const stored = await saveFile(AREA, t.id, `kasse_${p.name}`, p.data);
-  await run(
+  const r = await run(
     `INSERT INTO cash_entry_files (tenant_id, entry_id, file_name, file_path, file_mime, file_size, file_sha256, created_by, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     t.id, entryId, p.name, stored.path, p.mime, stored.size, stored.sha256, userId, nowIso(),
   );
+  return Number(r.insertId);
 }
 
 export async function filesOf(entryId: number): Promise<EntryFile[]> {
@@ -85,6 +90,9 @@ export async function getFile(tenantId: number, id: number) {
 }
 
 export const readEntryFile = (f: Pick<EntryFile, 'file_path'>) => readStoredFile(AREA, f.file_path);
+
+/** Anzeige/Export: zugeschnittener Ausschnitt, falls vorhanden – sonst das Original */
+export const viewEntryFile = (f: EntryFile, original = false) => viewOf(AREA, f, original);
 
 /** Beleg archivieren bzw. wiederherstellen – die Datei bleibt unverändert gespeichert */
 export async function setFileArchived(f: EntryFile, archived: boolean) {

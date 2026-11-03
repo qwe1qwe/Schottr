@@ -1,11 +1,11 @@
 import { all, one } from '../db/index.ts';
 import { cashbookEnabled, unassigned } from './cashbook/repo.ts';
-import { readEntryFile } from './cashbook/files.ts';
+import { viewEntryFile, type EntryFile } from './cashbook/files.ts';
+import { viewName, viewOf } from '../lib/crop.ts';
 import { accountReports, cashbookCsv, cashbookPdf, countsCsv, donationsCsv, sphereCsv, sphereSummary, summaryPdf } from './cashbook/report.ts';
 import { audit } from '../lib/audit.ts';
 import { buildDatevCsv, creditorAccount, revenueAccounts, type DatevInvoice, type DatevPurchase } from '../lib/datev.ts';
 import { categoryLabel, expenseAccounts } from '../lib/expenses.ts';
-import { readStoredFile } from '../lib/files.ts';
 import { html as h } from '../lib/html.ts';
 import { formatDate, isIsoDate, today } from '../lib/dates.ts';
 import { html } from '../lib/html.ts';
@@ -75,6 +75,9 @@ interface PurchaseRow {
   einvoice_format: string;
   file_name: string;
   file_path: string;
+  file_mime: string;
+  crop_path: string | null;
+  crop_mime: string | null;
   supplier_name: string;
   supplier_number: string;
   supplier_vat: string;
@@ -84,7 +87,7 @@ interface PurchaseRow {
 async function purchasesIn(t: Tenant, from: string, to: string): Promise<PurchaseRow[]> {
   const rows = await all<Omit<PurchaseRow, 'taxes'>>(
     `SELECT p.id, p.number, p.issue_date, p.due_date, p.status, p.paid_at, p.is_credit, p.category, p.currency, p.description,
-            p.net_total, p.tax_total, p.gross_total, p.prepaid_total, p.einvoice_format, p.file_name, p.file_path,
+            p.net_total, p.tax_total, p.gross_total, p.prepaid_total, p.einvoice_format, p.file_name, p.file_path, p.file_mime, p.crop_path, p.crop_mime,
             COALESCE(NULLIF(c.company, ''), c.name, '') AS supplier_name, COALESCE(c.customer_number, '') AS supplier_number,
             COALESCE(c.vat_id, '') AS supplier_vat
      FROM purchase_invoices p LEFT JOIN contacts c ON c.id = p.contact_id
@@ -162,8 +165,9 @@ function purchaseJournalCsv(t: Tenant, rows: PurchaseRow[]): string {
 }
 
 /** Dateiname im ZIP: Datum_Lieferant_Nummer.ext */
-function zipPurchaseName(r: Pick<PurchaseRow, 'issue_date' | 'supplier_name' | 'number' | 'id' | 'file_name'>): string {
-  const ext = (/\.(pdf|xml|png|jpe?g)$/i.exec(r.file_name)?.[0] ?? '').toLowerCase();
+function zipPurchaseName(r: Pick<PurchaseRow, 'issue_date' | 'supplier_name' | 'number' | 'id' | 'file_name' | 'file_path' | 'file_mime' | 'crop_path' | 'crop_mime'>): string {
+  // zugeschnittene Fotos werden als Ausschnitt exportiert (Endung des Ausschnitts)
+  const ext = (/\.(pdf|xml|png|jpe?g)$/i.exec(viewName(r))?.[0] ?? '').toLowerCase();
   return `Eingangsrechnungen/${safeName(`${r.issue_date}_${r.supplier_name}_${r.number || `ER${r.id}`}`).slice(0, 120)}${ext}`;
 }
 
@@ -333,17 +337,18 @@ function register(app: App) {
     // Kassenbuch je Konto
     const reports = await accountReports(t, from, to);
     // Belege zu den Buchungen (Fotos, PDFs) unter 01_Kassenbuch/Belege/<Konto>/
-    const entryFiles = await all<{ id: number; entry_id: number; file_name: string; file_path: string; entry_date: string; account_name: string }>(
-      `SELECT f.id, f.entry_id, f.file_name, f.file_path, e.entry_date, a.name account_name
+    const entryFiles = await all<EntryFile & { entry_date: string; account_name: string }>(
+      `SELECT f.*, e.entry_date, a.name account_name
        FROM cash_entry_files f JOIN cash_entries e ON e.id = f.entry_id JOIN cash_accounts a ON a.id = e.account_id
        WHERE f.tenant_id = ? AND f.archived_at IS NULL AND e.entry_date BETWEEN ? AND ? ORDER BY e.entry_date, f.id`,
       t.id, from, to,
     );
     const fileNames = new Map<number, string[]>();
     for (const f of entryFiles) {
-      const name = `01_Kassenbuch/Belege/${safeName(f.account_name)}/${f.entry_date}_B${f.entry_id}_${safeName(f.file_name)}`;
+      const v = await viewEntryFile(f);
+      const name = `01_Kassenbuch/Belege/${safeName(f.account_name)}/${f.entry_date}_B${f.entry_id}_${safeName(v.name)}`;
       fileNames.set(f.entry_id, [...(fileNames.get(f.entry_id) ?? []), name.split('/').pop()!]);
-      files.push({ name, data: await readEntryFile(f) });
+      files.push({ name, data: v.data });
     }
     for (const rep of reports) {
       const base = `01_Kassenbuch/${safeName(rep.account.name)}_${year}`;
@@ -371,7 +376,7 @@ function register(app: App) {
       let name = zipPurchaseName(p).replace(/^Eingangsrechnungen\//, '04_Eingangsrechnungen/');
       if (used.has(name)) name = name.replace(/(\.\w+)?$/, `_${p.id}$1`);
       used.add(name);
-      files.push({ name, data: await readStoredFile('verbindlichkeiten', p.file_path) });
+      files.push({ name, data: (await viewOf('verbindlichkeiten', p)).data });
     }
 
     // Spenden
@@ -435,7 +440,7 @@ function register(app: App) {
       let name = zipPurchaseName(p);
       if (used.has(name)) name = name.replace(/(\.\w+)?$/, `_${p.id}$1`);
       used.add(name);
-      files.push({ name, data: await readStoredFile('verbindlichkeiten', p.file_path) });
+      files.push({ name, data: (await viewOf('verbindlichkeiten', p)).data });
     }
     await audit(c, 'export.zip', `${from} – ${to}, ${rows.length} Ausgangs-, ${purchases.length} Eingangsrechnungen`);
     return c.body(new Uint8Array(createZip(files)), 200, {

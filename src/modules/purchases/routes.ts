@@ -4,7 +4,7 @@ import { accountSelect } from '../cashbook/routes.ts';
 import { all, one, tx } from '../../db/index.ts';
 import { audit } from '../../lib/audit.ts';
 import { formatDate, isIsoDate, monthEnd, monthLabel, paidPeriod, today } from '../../lib/dates.ts';
-import { readStoredFile } from '../../lib/files.ts';
+import { handleCrop, viewOf } from '../../lib/crop.ts';
 import { categoryLabel, isExpenseCategory } from '../../lib/expenses.ts';
 import { html, type SafeHtml } from '../../lib/html.ts';
 import { attachment, idParam, notFound, readForm, redirectWith, str, tenantOf, userOf, UserError, type Form } from '../../lib/http.ts';
@@ -349,7 +349,7 @@ function register(app: App) {
           </section>` : ''}
           ${info ? einvoiceDetails(info) : ''}
         </div>
-        ${p.file_path && p.file_mime !== 'application/xml' ? html`<aside>${previewFrame(p)}</aside>` : ''}
+        ${p.file_path && p.file_mime !== 'application/xml' ? html`<aside>${previewFrame(p, c)}</aside>` : ''}
       </div>
       ${archived ? '' : archiveForm(c, p)}`,
     });
@@ -367,7 +367,7 @@ function register(app: App) {
       back: draft ? { href: '/purchases', label: 'Eingangsrechnungen' } : { href: `/purchases/${p.id}`, label: purchaseTitle(p) },
       body: html`
       ${purchaseForm(c, `/purchases/${p.id}`, purchaseToInput(p, taxes), await supplierOptions(t.id, p.contact_id), {
-        locked, taxes, preview: p.file_path && p.file_mime !== 'application/xml' ? previewFrame(p) : undefined, smallBusiness: !!t.small_business,
+        locked, taxes, preview: p.file_path && p.file_mime !== 'application/xml' ? previewFrame(p, c) : undefined, smallBusiness: !!t.small_business,
         defaultSphere: t.nonprofit ? t.default_sphere : null,
         accounts: cashbookEnabled(t) ? await accountsOf(t.id) : [], paidAccountId: (await linkedEntry('purchase', p.id))?.account_id ?? null,
       })}
@@ -458,14 +458,27 @@ function register(app: App) {
     return redirectWith(c, p.archived_from === 'draft' ? `/purchases/${p.id}/edit` : `/purchases/${p.id}`, 'ok', 'Wiederhergestellt.');
   });
 
+  /** Foto-Beleg zuschneiden – das Original bleibt unverändert erhalten */
+  app.post('/purchases/:id/crop', async (c) => {
+    const t = tenantOf(c);
+    const p = (await getPurchase(t.id, idParam(c))) ?? notFound();
+    if (p.status === 'archived') throw new UserError('Der Beleg ist archiviert – zum Zuschneiden zuerst wiederherstellen.');
+    const r = await handleCrop(c, 'purchase_invoices', 'verbindlichkeiten', t.id, p.id, p);
+    await audit(c, r === 'saved' ? 'purchase.crop' : 'purchase.uncrop', `${purchaseTitle(p)} (ID ${p.id}): ${p.file_name}`);
+    return redirectWith(c, p.status === 'draft' ? `/purchases/${p.id}/edit` : `/purchases/${p.id}`, 'ok',
+      r === 'saved' ? 'Beleg zugeschnitten – das Original bleibt unverändert erhalten.' : 'Zuschnitt verworfen – es gilt wieder das Original.');
+  });
+
   app.get('/purchases/:id/file', async (c) => {
     const t = tenantOf(c);
     const p = (await getPurchase(t.id, idParam(c))) ?? notFound();
     if (!p.file_path) notFound();
     const inline = c.req.query('inline') === '1' && p.file_mime !== 'application/xml';
-    return c.body(new Uint8Array(await readStoredFile('verbindlichkeiten', p.file_path)), 200, {
-      'Content-Type': p.file_mime || 'application/octet-stream',
-      'Content-Disposition': attachment(p.file_name || `beleg-${p.id}`, inline),
+    // Zugeschnittene Fotos: Ausschnitt anzeigen; ?original=1 liefert das unveränderte Original
+    const v = await viewOf('verbindlichkeiten', p, c.req.query('original') === '1');
+    return c.body(new Uint8Array(v.data), 200, {
+      'Content-Type': v.mime || 'application/octet-stream',
+      'Content-Disposition': attachment(v.name || `beleg-${p.id}`, inline),
       'Cache-Control': 'private, no-store',
       'X-Content-Type-Options': 'nosniff',
     });

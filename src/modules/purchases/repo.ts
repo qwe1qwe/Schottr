@@ -50,6 +50,9 @@ export interface Purchase {
   file_mime: string;
   file_size: number;
   file_sha256: string;
+  crop_path: string | null;
+  crop_mime: string | null;
+  cropped_at: string | null;
   created_at: string;
   updated_at: string;
 }
