@@ -1,9 +1,11 @@
 import { all, one, run, nowIso } from '../db/index.ts';
-import { html, selected, type SafeHtml } from '../lib/html.ts';
+import { html, raw, selected, type SafeHtml } from '../lib/html.ts';
 import { readForm, str, redirectWith, tenantOf, idParam, notFound, type Form } from '../lib/http.ts';
 import { nextNumber } from '../lib/numbering.ts';
 import { formatDate, today } from '../lib/dates.ts';
 import { formatMoney } from '../lib/money.ts';
+import { honoraryAllowance } from '../lib/nonprofit.ts';
+import { meter } from '../views/chart.ts';
 import { isCountryCode, isValidEmail, isValidVatId, normalizeVatId } from '../lib/validate.ts';
 import { csrfField, page, empty } from '../views/layout.ts';
 import { documentTable } from './documents/views.ts';
@@ -39,7 +41,46 @@ export interface Contact {
   leitweg_id: string;
   notes: string;
   expense_category: string;
+  /** erhält die Ehrenamtspauschale (§ 3 Nr. 26a EStG) – nur bei Vereinen */
+  honorary_allowance: number;
   archived: number;
+}
+
+export interface HonoraryUsage { id: number; label: string; paid: number; n: number }
+
+/**
+ * Zahlungen eines Jahres an Adressen mit Ehrenamtspauschale (Zuflussprinzip): freie Ausgabe-Buchungen
+ * mit der Adresse (ohne stornierte und Stornobuchungen) plus bezahlte Eingangsrechnungen, brutto.
+ * Ohne contactId alle markierten Adressen, die im Jahr etwas bekommen haben.
+ */
+export async function honoraryUsage(tenantId: number, year: number, contactId?: number): Promise<HonoraryUsage[]> {
+  const y = String(year);
+  const rows = await all<{ id: number; label: string; paid: number | string; n: number | string }>(
+    `SELECT c.id, COALESCE(NULLIF(c.company, ''), c.name) label, SUM(x.s) paid, SUM(x.n) n FROM contacts c JOIN (
+       SELECT e.contact_id cid, -SUM(e.amount) s, COUNT(*) n FROM cash_entries e
+       WHERE e.tenant_id = ? AND e.source = 'manual' AND e.amount < 0 AND e.reversal_of IS NULL
+         AND NOT EXISTS (SELECT 1 FROM cash_entries r WHERE r.reversal_of = e.id)
+         AND substr(e.entry_date, 1, 4) = ? GROUP BY e.contact_id
+       UNION ALL
+       SELECT p.contact_id cid, SUM(CASE WHEN p.is_credit = 1 THEN -p.gross_total ELSE p.gross_total END) s, COUNT(*) n FROM purchase_invoices p
+       WHERE p.tenant_id = ? AND p.status = 'paid' AND p.paid_at IS NOT NULL AND substr(p.paid_at, 1, 4) = ? GROUP BY p.contact_id
+     ) x ON x.cid = c.id
+     WHERE c.tenant_id = ? AND c.honorary_allowance = 1 ${contactId ? 'AND c.id = ?' : ''}
+     GROUP BY c.id, label ORDER BY paid DESC`,
+    tenantId, y, tenantId, y, tenantId, ...(contactId ? [contactId] : []),
+  );
+  return rows.map((r) => ({ id: Number(r.id), label: r.label, paid: Number(r.paid), n: Number(r.n) }));
+}
+
+/** Balken „Ehrenamtspauschale“ einer Person – auch für die Übersicht */
+export function honoraryMeter(u: Pick<HonoraryUsage, 'id' | 'label' | 'paid' | 'n'>, year: number, opts: { link?: boolean } = {}): SafeHtml {
+  const max = honoraryAllowance(year);
+  const state = u.paid > max ? 'danger' : u.paid >= max * 0.8 ? 'warn' : 'ok';
+  const label = opts.link ? html`<a href="/contacts/${u.id}">${u.label}</a>` : html`Ehrenamtspauschale ${year}`;
+  return html`${meter(u.paid, max, { label, state })}
+    <p class="small ku-status ku-${state}">${state === 'danger'
+      ? html`<strong>${formatMoney(u.paid - max)} über der Pauschale:</strong> Der Teil über ${formatMoney(max)} ist bei der Person steuerpflichtig – mit dem Steuerbüro klären.`
+      : html`${u.n} Zahlung(en) · noch <strong>${formatMoney(max - u.paid)}</strong> steuerfrei${state === 'warn' ? ' – bald ausgeschöpft' : ''}.`}</p>`;
 }
 
 export const isCustomer = (c: Pick<Contact, 'kind'>) => c.kind !== 'supplier';
@@ -121,7 +162,7 @@ function kindSelect(current: ContactKind): SafeHtml {
     <small class="muted">Kunden erscheinen bei Angeboten und Rechnungen, Lieferanten bei Eingangsrechnungen.</small></label>`;
 }
 
-function contactForm(c: Ctx, action: string, ct: Partial<Contact>) {
+function contactForm(c: Ctx, action: string, ct: Partial<Contact>, assoc = false) {
   const f = (key: keyof Contact, label: string, extra = '') =>
     html`<label>${label} <input name="${key}" value="${ct[key] ?? ''}" maxlength="200" ${extra ? html`${extra}` : ''}></label>`;
   return html`
@@ -143,6 +184,9 @@ function contactForm(c: Ctx, action: string, ct: Partial<Contact>) {
       <label>Leitweg-ID <input name="leitweg_id" value="${ct.leitweg_id ?? ''}" maxlength="50">
         <small class="muted">nur für öffentliche Auftraggeber (XRechnung)</small></label>
       <label class="span-2">Notizen <textarea name="notes" rows="3">${ct.notes ?? ''}</textarea></label>
+      ${assoc ? html`<label class="check span-2"><input type="checkbox" name="honorary_allowance" value="1"${ct.honorary_allowance ? raw(' checked') : ''}>
+        <span>Erhält die Ehrenamtspauschale (§ 3 Nr. 26a EStG)<small class="muted"> – die Übersicht zeigt dann, wie viel vom Jahresbetrag (${formatMoney(honoraryAllowance(new Date().getFullYear()))}) schon ausgezahlt ist.
+          Zählt freie Ausgabe-Buchungen mit dieser Adresse und bezahlte Eingangsrechnungen.</small></span></label>` : ''}
     </div>
     <div class="form-actions"><button class="btn primary">Speichern</button></div>
   </form>`;
@@ -210,15 +254,17 @@ function register(app: App) {
     return page(c, {
       title: kind === 'supplier' ? 'Neuer Lieferant' : kind === 'customer' ? 'Neuer Kunde' : 'Neue Adresse',
       back: { href: `/contacts${c.req.query('kind') ? `?kind=${kind}` : ''}`, label: 'Adressen' },
-      body: contactForm(c, '/contacts', { country: 'DE', kind }),
+      body: contactForm(c, '/contacts', { country: 'DE', kind }, tenantOf(c).org_type === 'association'),
     });
   });
 
   app.post('/contacts', async (c) => {
     const t = tenantOf(c);
-    const { v, kind, errors } = parseContact(await readForm(c));
+    const form = await readForm(c);
+    const { v, kind, errors } = parseContact(form);
     if (errors.length) return redirectWith(c, `/contacts/new?kind=${kind}`, 'error', errors.join(' '));
     const id = await insertContact(t, kind, v);
+    if (t.org_type === 'association' && str(form, 'honorary_allowance') === '1') await run('UPDATE contacts SET honorary_allowance = 1 WHERE id = ?', id);
     return redirectWith(c, `/contacts/${id}`, 'ok', `${CONTACT_KINDS[kind]} angelegt.`);
   });
 
@@ -247,6 +293,7 @@ function register(app: App) {
        FROM cash_entries e JOIN cash_accounts a ON a.id = e.account_id
        WHERE e.tenant_id = ? AND e.contact_id = ? ORDER BY e.entry_date DESC, e.id DESC LIMIT 200`, t.id, ct.id,
     );
+    const thisYear = Number(today().slice(0, 4));
     const quotes = docs.filter((d) => d.kind === 'quote');
     const invoices = docs.filter((d) => d.kind === 'invoice');
     const address = [ct.company, ct.name, ct.street, ct.address_extra, [ct.zip, ct.city].filter(Boolean).join(' '), ct.country !== 'DE' ? ct.country : '']
@@ -273,7 +320,7 @@ function register(app: App) {
         <section class="card">
           <h2>Daten</h2>
           <dl class="dl">
-            <dt>Art</dt><dd>${kindTag(ct.kind)}</dd>
+            <dt>Art</dt><dd>${kindTag(ct.kind)}${ct.honorary_allowance ? html` <span class="tag info">Ehrenamtspauschale</span>` : ''}</dd>
             <dt>${ct.kind === 'supplier' ? 'Lieferantennummer' : 'Kundennummer'}</dt><dd class="mono">${ct.customer_number}</dd>
             ${ct.email ? html`<dt>E-Mail</dt><dd><a href="mailto:${ct.email}">${ct.email}</a></dd>` : ''}
             ${ct.phone ? html`<dt>Telefon</dt><dd>${ct.phone}</dd>` : ''}
@@ -283,6 +330,9 @@ function register(app: App) {
           ${ct.notes ? html`<p class="notes">${ct.notes}</p>` : ''}
         </section>
       </div>
+      ${ct.honorary_allowance
+        ? html`<section class="card ku">${honoraryMeter((await honoraryUsage(t.id, thisYear, ct.id))[0] ?? { id: ct.id, label: contactLabel(ct), paid: 0, n: 0 }, thisYear)}</section>`
+        : ''}
       ${customer
         ? html`<section>
             <h2 class="section-title">Angebote <span class="count">${quotes.length}</span></h2>
@@ -333,7 +383,7 @@ function register(app: App) {
     return page(c, {
       title: 'Adresse bearbeiten',
       back: { href: `/contacts/${ct.id}`, label: contactLabel(ct) },
-      body: html`${contactForm(c, `/contacts/${ct.id}`, ct)}
+      body: html`${contactForm(c, `/contacts/${ct.id}`, ct, t.org_type === 'association')}
       <p class="muted small">Änderungen wirken sich nicht auf bereits festgeschriebene Rechnungen aus.</p>
       <div class="danger-zone">
         <form method="post" action="/contacts/${ct.id}/archive">${csrfField(c)}
@@ -347,14 +397,15 @@ function register(app: App) {
   app.post('/contacts/:id', async (c) => {
     const t = tenantOf(c);
     const ct = await getContact(t.id, idParam(c)) ?? notFound();
-    const { v, kind, errors } = parseContact(await readForm(c));
+    const form = await readForm(c);
+    const { v, kind, errors } = parseContact(form);
     const used = await usage(ct.id);
     if (kind === 'supplier' && used.docs) errors.push('Die Adresse hat Angebote oder Rechnungen und bleibt daher Kunde – wähle „Kunde & Lieferant“.');
     if (kind === 'customer' && used.purchases) errors.push('Die Adresse hat Eingangsrechnungen und bleibt daher Lieferant – wähle „Kunde & Lieferant“.');
     if (errors.length) return redirectWith(c, `/contacts/${ct.id}/edit`, 'error', errors.join(' '));
     await run(
-      `UPDATE contacts SET kind = ?, ${FIELDS.map((k) => `${k} = ?`).join(', ')}, updated_at = ? WHERE id = ? AND tenant_id = ?`,
-      kind, ...FIELDS.map((k) => v[k]), nowIso(), ct.id, t.id,
+      `UPDATE contacts SET kind = ?, ${FIELDS.map((k) => `${k} = ?`).join(', ')}, honorary_allowance = ?, updated_at = ? WHERE id = ? AND tenant_id = ?`,
+      kind, ...FIELDS.map((k) => v[k]), t.org_type === 'association' && str(form, 'honorary_allowance') === '1' ? 1 : 0, nowIso(), ct.id, t.id,
     );
     return redirectWith(c, `/contacts/${ct.id}`, 'ok', 'Adresse gespeichert.');
   });

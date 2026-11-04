@@ -875,3 +875,12 @@ ul.tight { margin: .35rem 0 0; padding-left: 1.2rem; }
 .switch input:checked ~ span:last-child { color: var(--ink); }
 .switch input:focus-visible + .switch-track { outline: 2px solid var(--accent); outline-offset: 2px; }
 @media (prefers-reduced-motion: reduce) { .switch-track, .switch-track::after { transition: none; } }
+
+/* ---------- Belege hineinziehen ---------- */
+.entry-drop {
+  border: 1.5px dashed var(--line-strong); border-radius: 8px; padding: .7rem .9rem; text-align: center; color: var(--muted);
+  transition: border-color .15s, background .15s, color .15s;
+}
+.entry-files.dragging { outline: 2px dashed var(--accent); outline-offset: 4px; border-radius: 8px; }
+.entry-files.dragging .entry-drop { border-color: var(--accent); background: var(--accent-soft); color: var(--ink); }
+@media (pointer: coarse) { .entry-drop { display: none; } }

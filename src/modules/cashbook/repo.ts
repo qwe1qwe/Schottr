@@ -584,6 +584,48 @@ async function countNeighbours(accountId: number, k: CashCount) {
  * zwischen ihren Nachbarn; die Differenzbuchung wandert mit, und die Zählung sowie alle späteren
  * werden neu gerechnet.
  */
+/**
+ * Gezählten Bestand einer Zählung nachträglich korrigieren (z. B. Zahlendreher). Buchbestand und
+ * Differenzbuchung dieser und späterer Zählungen werden neu berechnet; Text, Bereich und USt. der
+ * Differenzbuchung bleiben. Nur in offenen Zeiträumen; der Vorgang wird protokolliert (Aufrufer).
+ */
+export async function changeCounted(t: Tenant, a: CashAccount, k: CashCount, input: { counted?: number; denominations: Record<string, number> }): Promise<number> {
+  assertOpen(t, k.count_date);
+  const fromDenominations = DENOMINATIONS.reduce((s, d) => s + d * (input.denominations[d] ?? 0), 0);
+  const counted = Object.keys(input.denominations).length ? fromDenominations : input.counted ?? 0;
+  if (counted < 0) throw new UserError('Der gezählte Bestand kann nicht negativ sein.');
+  await tx(async () => {
+    await run('UPDATE cash_counts SET counted = ?, denominations = ? WHERE id = ?', counted, JSON.stringify(input.denominations), k.id);
+    await recalcCounts(t, a.id, k.count_date);
+  });
+  return counted;
+}
+
+/** Warum sich eine Zählung nicht löschen lässt – oder null */
+export async function countDeleteBlocker(t: Tenant, k: CashCount): Promise<string | null> {
+  if (t.cashbook_locked_until && k.count_date <= t.cashbook_locked_until) return 'Der Zeitraum ist abgeschlossen – die Zählung lässt sich nicht mehr löschen.';
+  const files = await one(
+    'SELECT 1 FROM cash_entry_files f JOIN cash_entries e ON e.id = f.entry_id WHERE e.count_id = ? LIMIT 1', k.id,
+  );
+  if (files) return 'An der Differenzbuchung dieser Zählung hängen Belege – sie sind aufbewahrungspflichtig, deshalb lässt sich die Zählung nicht löschen. Stattdessen das Datum ändern oder eine neue Zählung erfassen.';
+  return null;
+}
+
+/**
+ * Versehentlich erfasste Kassenzählung löschen: Zählprotokoll und Differenzbuchung entfallen,
+ * spätere Zählungen derselben Kasse werden neu berechnet. Nur in offenen Zeiträumen und ohne
+ * angehängte Belege; der Vorgang wird mit allen Werten protokolliert (Aufrufer).
+ */
+export async function deleteCount(t: Tenant, a: CashAccount, k: CashCount): Promise<void> {
+  const blocker = await countDeleteBlocker(t, k);
+  if (blocker) throw new UserError(blocker);
+  await tx(async () => {
+    await run('DELETE FROM cash_entries WHERE count_id = ?', k.id);
+    await run('DELETE FROM cash_counts WHERE id = ?', k.id);
+    await recalcCounts(t, a.id, k.count_date);
+  });
+}
+
 export async function changeCountDate(t: Tenant, a: CashAccount, count: CashCount, date: string): Promise<{ changed: boolean }> {
   assertOpen(t, count.count_date);
   await checkAccount(t, a.id, date);

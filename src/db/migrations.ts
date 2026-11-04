@@ -883,4 +883,11 @@ export const migrations: { version: number; statements: string[] }[] = [
         ADD CONSTRAINT cash_recurring_contact FOREIGN KEY (contact_id) REFERENCES contacts(id)`,
     ],
   },
+  {
+    version: 19,
+    statements: [
+      // Adresse erhält die Ehrenamtspauschale (§ 3 Nr. 26a EStG) – für die Jahresübersicht der Zahlungen
+      `ALTER TABLE contacts ADD COLUMN honorary_allowance TINYINT(1) NOT NULL DEFAULT 0 AFTER expense_category`,
+    ],
+  },
 ];

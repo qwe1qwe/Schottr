@@ -1,10 +1,10 @@
-import crypto from 'node:crypto';
 import { all, one, run, tx, nowIso, fromDbTime } from '../../db/index.ts';
 import { audit } from '../../lib/audit.ts';
 import { html, type SafeHtml } from '../../lib/html.ts';
 import { attachment, idParam, notFound, readForm, redirectWith, str, tenantOf, userOf } from '../../lib/http.ts';
 import { formatMoney } from '../../lib/money.ts';
 import { csrfField, page } from '../../views/layout.ts';
+import { checkCode, codeBox, currentCode, issueCode } from '../../lib/confirmcode.ts';
 import type { App, Ctx, Module, Tenant } from '../../types.ts';
 
 /**
@@ -15,16 +15,6 @@ import type { App, Ctx, Module, Tenant } from '../../types.ts';
  * document_versions archiviert, ein Änderungsgrund ist Pflicht und alles wird protokolliert.
  * Die Rechnungsnummer bleibt erhalten; nach der Bearbeitung wird erneut festgeschrieben.
  */
-
-const ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // ohne 0/O, 1/I – gut abschreibbar
-const codes = new Map<string, { code: string; exp: number; tries: number }>();
-
-function issueCode(key: string): string {
-  const code = Array.from({ length: 6 }, () => ALPHABET[crypto.randomInt(ALPHABET.length)]).join('');
-  codes.set(key, { code, exp: Date.now() + 10 * 60_000, tries: 0 });
-  if (codes.size > 5000) for (const [k, v] of codes) if (v.exp < Date.now()) codes.delete(k);
-  return code;
-}
 
 interface ReopenableDoc {
   id: number;
@@ -71,11 +61,6 @@ export async function versionsSection(docId: number): Promise<SafeHtml> {
         <td class="right nowrap"><a href="/invoices/${docId}/versions/${v.version}/pdf" target="_blank">PDF</a> · <a href="/invoices/${docId}/versions/${v.version}/xml">XML</a></td>
       </tr>`)}</tbody></table></div>
   </section>`;
-}
-
-function codeBox(code: string): SafeHtml {
-  // Zeichen nur per CSS-Pseudoelement → nicht markier- oder kopierbar
-  return html`<div class="confirm-code" aria-hidden="true">${[...code].map((ch) => html`<span data-c="${ch}"></span>`)}</div>`;
 }
 
 async function loadDoc(t: Tenant, id: number) {
@@ -135,20 +120,10 @@ function register(app: App) {
 
     const form = await readForm(c);
     const reason = str(form, 'reason', 1000);
-    const typed = str(form, 'code', 20).toUpperCase().replace(/\s+/g, '');
     const key = `${c.get('session')!.id}:${doc.id}`;
-    const entry = codes.get(key);
-
-    if (!entry || entry.exp < Date.now()) {
-      return confirmPage(c, doc, issueCode(key), reason, 'Der Code ist abgelaufen. Bitte den neuen Code abschreiben.');
-    }
-    if (typed !== entry.code) {
-      entry.tries++;
-      const code = entry.tries >= 3 ? issueCode(key) : entry.code;
-      return confirmPage(c, doc, code, reason, entry.tries >= 3 ? 'Code dreimal falsch – hier ist ein neuer Code.' : 'Der Code stimmt nicht.');
-    }
-    if (reason.length < 10) return confirmPage(c, doc, entry.code, reason, 'Bitte den Grund der Änderung angeben (mind. 10 Zeichen).');
-    codes.delete(key);
+    if (reason.length < 10) return confirmPage(c, doc, currentCode(key), reason, 'Bitte den Grund der Änderung angeben (mind. 10 Zeichen).');
+    const check = checkCode(key, str(form, 'code', 20));
+    if (!check.ok) return confirmPage(c, doc, check.code, reason, check.error);
 
     const version = await tx(async () => {
       const cur = await one('SELECT * FROM documents WHERE id = ? FOR UPDATE', doc.id);

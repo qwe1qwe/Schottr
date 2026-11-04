@@ -8,6 +8,7 @@ import { getCookie, setCookie } from 'hono/cookie';
 import type { Ctx } from '../types.ts';
 import { page } from '../views/layout.ts';
 import { tenantProblems } from './settings.ts';
+import { honoraryMeter, honoraryUsage } from './contacts.ts';
 import { documentTable } from './documents/views.ts';
 import { invitationsBox, pendingInvitations } from './invitations.ts';
 import { userOf } from '../lib/http.ts';
@@ -556,6 +557,21 @@ async function nonprofitLimitsCard(t: Tenant, year: number) {
 }
 
 
+/**
+ * Ehrenamtspauschale: je Adresse mit Haken „Ehrenamtspauschale“ und Zahlungen im Jahr ein Balken,
+ * wie viel vom Jahresbetrag (§ 3 Nr. 26a EStG) schon ausgezahlt ist. Ohne Zahlungen keine Kachel.
+ */
+async function honoraryCard(t: Tenant, year: number) {
+  const list = await honoraryUsage(t.id, year);
+  if (!list.length) return null;
+  return html`<section class="card ku honorary">
+    <h2>Ehrenamtspauschale ${year} <span class="muted small">§ 3 Nr. 26a EStG, je Person</span></h2>
+    ${list.map((u) => honoraryMeter(u, year, { link: true }))}
+    <p class="muted small">Ausgezahlt im Jahr (Zuflussprinzip): freie Ausgabe-Buchungen mit der Adresse und bezahlte Eingangsrechnungen, ohne Stornos.
+      Bekommt jemand die Pauschale auch anderswo, zählt das mit – dafür die jährliche Erklärung einholen. Keine Steuerberatung.</p>
+  </section>`;
+}
+
 /* ---------- Aufstellung: alles, was in einer Säule bzw. einem Bereich steckt ---------- */
 
 interface MonthLine { date: string; title: string; sub: string; href: string; amount: number; files?: number }
@@ -755,6 +771,8 @@ export const dashboardModule: Module = {
       const liab = await openLiabilities(t.id);
       const ku = t.small_business ? await smallBusinessLimits(t, Number(year)) : null;
       const npo = t.nonprofit ? await nonprofitLimitsCard(t, Number(year)) : null;
+      const honorary = cashbookEnabled(t) ? await honoraryCard(t, Number(year)) : null;
+      const limitCards = [npo, honorary, ku].filter((x) => x !== null);
       const cash = await cashbookDash(t);
       const pending = cashbookEnabled(t) ? pendingCard(c, await pendingDues(t), '/') : '';
       const drafts = await all(
@@ -845,7 +863,7 @@ export const dashboardModule: Module = {
         ${pending}
         ${charts}
         <div class="dash-grid">${customers}${suppliers}</div>
-        ${ku || npo ? html`<div class="dash-grid ${ku && npo ? '' : 'single'}">${npo ?? ''}${ku ?? ''}</div>` : ''}
+        ${limitCards.length ? html`<div class="dash-grid ${limitCards.length === 1 ? 'single' : ''}">${limitCards}</div>` : ''}
         <h2 class="section-title">Offene Rechnungen</h2>
         ${openList.length ? documentTable(openList, 'invoice') : html`<p class="muted">Keine offenen Rechnungen. 🎉</p>`}
         ${drafts.length ? html`<h2 class="section-title">Rechnungsentwürfe</h2>${documentTable(drafts, 'invoice')}` : ''}`,

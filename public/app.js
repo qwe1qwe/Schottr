@@ -578,6 +578,48 @@
     };
     const bind = (input) => input.addEventListener('change', () => onPick(input));
     box.querySelectorAll('input[data-shrink]').forEach(bind);
+
+    // Dateien hineinziehen: Ablagefläche unter den Knöpfen; das ganze Feld nimmt Dateien an
+    const drop = document.createElement('div');
+    drop.className = 'entry-drop small';
+    drop.textContent = 'oder PDFs und Fotos hierher ziehen';
+    box.querySelector('.upload-buttons')?.after(drop);
+    const OK = /^(application\/pdf|image\/(jpeg|png|webp))$/;
+    const hasFiles = (e) => [...(e.dataTransfer?.types ?? [])].includes('Files');
+    let depth = 0;
+    box.addEventListener('dragenter', (e) => {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      depth++;
+      box.classList.add('dragging');
+    });
+    box.addEventListener('dragover', (e) => {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'copy';
+    });
+    box.addEventListener('dragleave', () => {
+      depth = Math.max(0, depth - 1);
+      if (!depth) box.classList.remove('dragging');
+    });
+    box.addEventListener('drop', async (e) => {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      depth = 0;
+      box.classList.remove('dragging');
+      const files = [...e.dataTransfer.files];
+      const ok = files.filter((f) => OK.test(f.type));
+      const skipped = files.length - ok.length;
+      if (skipped) window.alert(`${skipped} Datei(en) übersprungen – bitte nur PDF, JPEG oder PNG.`);
+      if (!ok.length) return;
+      // in das leere „Datei wählen“-Feld legen – danach wie eine Auswahl über den Knopf
+      const input = box.querySelector('.upload-buttons input[type="file"][multiple]') ?? box.querySelector('.upload-buttons input[type="file"]');
+      if (!input) return;
+      const dt = new DataTransfer();
+      (input.multiple ? ok : ok.slice(0, 1)).forEach((f) => dt.items.add(f));
+      input.files = dt.files;
+      await onPick(input);
+    });
   });
 
   /* ---------- Ein Foto aufnehmen und sofort hochladen (Eingangsrechnungen) ---------- */

@@ -89,6 +89,12 @@ export function nonprofitLimits(year: number) {
   };
 }
 
+/**
+ * Ehrenamtspauschale (§ 3 Nr. 26a EStG) je Person und Kalenderjahr, in Cent:
+ * 960 € seit 2026 (Steueränderungsgesetz 2025), 840 € 2021–2025, davor 720 €.
+ */
+export const honoraryAllowance = (year: number) => (year >= 2026 ? 960_00 : year >= 2021 ? 840_00 : 720_00);
+
 /** Freibetrag für Vereine und Stiftungen (§ 24 KStG, § 11 Abs. 1 GewStG), in Cent */
 export const NONPROFIT_ALLOWANCE = 5_000_00;
 

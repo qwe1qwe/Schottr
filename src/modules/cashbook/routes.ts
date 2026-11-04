@@ -2,6 +2,7 @@ import { all, one, run, tx, nowIso } from '../../db/index.ts';
 import { attachFiles, fileCounts, filesFrom, filesOf, getFile, hasFiles, setFileArchived, viewEntryFile, type EntryFile } from './files.ts';
 import { handleCrop } from '../../lib/crop.ts';
 import { cropControls } from '../../views/crop.ts';
+import { checkCode, codeBox, codeInput, currentCode, issueCode } from '../../lib/confirmcode.ts';
 import { audit } from '../../lib/audit.ts';
 import { addDays, formatDate, isIsoDate, today } from '../../lib/dates.ts';
 import { checked, html, selected, type SafeHtml } from '../../lib/html.ts';
@@ -18,7 +19,7 @@ import { assignToEntry, getInbox, inboxOf, type InboxFile } from '../inbox/repo.
 import {
   bookDue, getRecurring, nextDue, pendingDues, recurringOf, RHYTHMS, skipDue, type PendingDue, type Recurring, type Rhythm,
   accountsOf, assertOpen, balanceAt, balances, bookLinked, cashbookEnabled, changeCountDate, createManual, linkEntryToPurchase, purchaseCandidates, recalcCounts, reversalOf, reverseEntry, createTransfer, DENOMINATIONS,
-  entriesOf, entrySphere, getAccount, history, lastCount, saveCount, SOURCE_LABELS, unassigned, updateManual, checkContact, entryContactOptions,
+  entriesOf, entrySphere, getAccount, history, lastCount, saveCount, SOURCE_LABELS, unassigned, updateManual, checkContact, entryContactOptions, countDeleteBlocker, deleteCount, changeCounted,
   type CashAccount, type CashCount, type CashEntry, type EntryInput, type EntryRow, type LinkSource,
 } from './repo.ts';
 
@@ -1003,6 +1004,8 @@ function register(app: App) {
                       data-confirm="Datum der Zählung ändern? Buchbestand und Differenz dieser und späterer Zählungen werden neu berechnet.">${csrfField(c)}
                       <input type="date" name="count_date" value="${k.count_date}" min="${minOf(i)}" max="${maxOf(i)}" required aria-label="Neues Datum der Zählung">
                       <button class="link">Datum ändern</button></form>
+                    <a class="link small" href="/cashbook/counts/${k.id}/edit">Gezählt ändern</a>
+                    <a class="link danger small" href="/cashbook/counts/${k.id}/delete">Löschen</a>
                     ` : ''}</td>
               </tr>`;
             })}</tbody></table></div>`
@@ -1020,6 +1023,163 @@ function register(app: App) {
     if (!changed) return redirectWith(c, `/cashbook/counts?account=${a.id}`, 'ok', 'Das Datum ist unverändert.');
     await audit(c, 'cashbook.count.date', `${a.name}: ${formatDate(k.count_date)} → ${formatDate(date)}`);
     return redirectWith(c, `/cashbook/counts?account=${a.id}`, 'ok', `Datum der Zählung auf ${formatDate(date)} geändert.`);
+  });
+
+  /* ---------- Gezählten Bestand nachträglich ändern (mit Grund und Sicherheitscode) ---------- */
+
+  /** Gezählter Bestand aus dem Formular: Gesamtsumme oder Stückelung */
+  const parseCounted = (form: Form) => {
+    const denominations: Record<string, number> = {};
+    let counted: number | undefined;
+    if (str(form, 'count_mode') === 'denominations') {
+      for (const d of DENOMINATIONS) {
+        const n = Number(str(form, `d_${d}`) || 0);
+        if (!Number.isInteger(n) || n < 0 || n > 1e6) throw new UserError('Bitte bei der Stückelung nur ganze Zahlen eintragen.');
+        if (n) denominations[d] = n;
+      }
+      if (!Object.keys(denominations).length) throw new UserError('Bitte die Anzahl der Scheine und Münzen eintragen – oder „Gesamtsumme“ wählen.');
+    } else {
+      const v = parseDecimal(str(form, 'counted_total'), 2);
+      if (v === null || v < 0 || v > 1e12) throw new UserError('Bitte den gezählten Gesamtbestand in Euro angeben (0 ist erlaubt).');
+      counted = v;
+    }
+    return { denominations, counted };
+  };
+
+  const countEditPage = (c: Ctx, a: CashAccount, k: CashCount, code: string, form: Partial<Form> = {}, error?: string) => {
+    const den = JSON.parse(k.denominations) as Record<string, number>;
+    const byDen = form.count_mode ? form.count_mode === 'denominations' : Object.keys(den).length > 0;
+    const val = (key: string, fallback: string) => (typeof form[key] === 'string' ? form[key] as string : fallback);
+    return page(c, {
+      title: 'Gezählten Bestand ändern',
+      back: { href: `/cashbook/counts?account=${a.id}`, label: `Zählprotokolle ${a.name}` },
+      status: error ? 400 : 200,
+      body: html`
+      ${error ? html`<div class="flash flash-error" role="alert">${error}</div>` : ''}
+      <div class="notice danger-notice">
+        <strong>Nur für Erfassungsfehler</strong> wie einen Zahlendreher. Buchbestand und Differenzbuchung dieser und späterer Zählungen von „${a.name}“
+        werden neu berechnet; alter und neuer Betrag und der Grund stehen im Protokoll.
+      </div>
+      <form method="post" action="/cashbook/counts/${k.id}/edit" class="card stack" data-count-form autocomplete="off">
+        ${csrfField(c)}
+        <p class="small">Zählung vom <strong>${formatDate(k.count_date)}</strong> · bisher gezählt <strong>${formatMoney(k.counted)}</strong> · Buchbestand ${formatMoney(k.book_balance)} · Differenz ${money(k.difference)}</p>
+        <fieldset class="inline-radio">
+          <legend>Erfassen als</legend>
+          <label class="check"><input type="radio" name="count_mode" value="total"${checked(!byDen)}> Gesamtsumme</label>
+          <label class="check"><input type="radio" name="count_mode" value="denominations"${checked(byDen)}> nach Stückelung (Scheine und Münzen)</label>
+        </fieldset>
+        <label data-show-if="count_mode=total">Gezählter Bestand (€)
+          <input name="counted_total" class="num" inputmode="decimal" placeholder="0,00" value="${val('counted_total', formatAmount(k.counted).replace(/\./g, ''))}"></label>
+        <table class="table count-table" data-show-if="count_mode=denominations">
+          <thead><tr><th>Stückelung</th><th class="w-qty">Anzahl</th><th class="right">Summe</th></tr></thead>
+          <tbody>${DENOMINATIONS.map((d) => html`<tr>
+            <td>${d >= 500 ? `${d / 100} €-Schein` : d >= 100 ? `${d / 100} €-Münze` : `${d} Cent`}</td>
+            <td><input name="d_${d}" type="number" min="0" step="1" inputmode="numeric" class="num" data-denom="${d}" aria-label="Anzahl ${formatMoney(d)}" value="${val(`d_${d}`, den[d] ? String(den[d]) : '')}"></td>
+            <td class="right num" data-denom-sum>–</td></tr>`)}</tbody>
+          <tfoot><tr><th>Gezählt</th><th></th><th class="right num" data-count-total>0,00 €</th></tr></tfoot>
+        </table>
+        <label>Grund <span class="muted small">(Pflicht, steht im Protokoll)</span>
+          <textarea name="reason" rows="2" required minlength="10" maxlength="500" placeholder="z. B. Zahlendreher: 158,00 statt 185,00 € eingetragen">${val('reason', '')}</textarea></label>
+        <div><p class="small">Zur Bestätigung bitte diesen Code abschreiben:</p>${codeBox(code)}</div>
+        ${codeInput()}
+        <div class="form-actions"><button class="btn danger">Gezählten Bestand ändern</button>
+          <a class="btn ghost" href="/cashbook/counts?account=${a.id}">Abbrechen</a></div>
+      </form>`,
+    });
+  };
+
+  app.get('/cashbook/counts/:id/edit', async (c) => {
+    const t = cbTenant(c);
+    const { k, a } = await loadCount(c, t);
+    if (t.cashbook_locked_until && k.count_date <= t.cashbook_locked_until) {
+      return redirectWith(c, `/cashbook/counts?account=${a.id}`, 'error', 'Der Zeitraum ist abgeschlossen – die Zählung lässt sich nicht mehr ändern.');
+    }
+    return countEditPage(c, a, k, issueCode(`${c.get('session')!.id}:count-edit:${k.id}`));
+  });
+
+  app.post('/cashbook/counts/:id/edit', async (c) => {
+    const t = cbTenant(c);
+    const { k, a } = await loadCount(c, t);
+    const form = await readForm(c);
+    const key = `${c.get('session')!.id}:count-edit:${k.id}`;
+    const reason = str(form, 'reason', 500);
+    let input: ReturnType<typeof parseCounted>;
+    try {
+      input = parseCounted(form);
+    } catch (err) {
+      if (err instanceof UserError) return countEditPage(c, a, k, currentCode(key), form, err.message);
+      throw err;
+    }
+    if (reason.length < 10) return countEditPage(c, a, k, currentCode(key), form, 'Bitte einen Grund angeben (mind. 10 Zeichen).');
+    const check = checkCode(key, str(form, 'code', 20));
+    if (!check.ok) return countEditPage(c, a, k, check.code, form, check.error);
+    const counted = await changeCounted(t, a, k, input);
+    await audit(c, 'cashbook.count.change',
+      `${a.name} ${formatDate(k.count_date)}: gezählt ${formatMoney(k.counted)} → ${formatMoney(counted)} (Differenz vorher ${formatMoney(k.difference)}) – Grund: ${reason}`);
+    return redirectWith(c, `/cashbook/counts?account=${a.id}`, 'ok', `Gezählter Bestand vom ${formatDate(k.count_date)} auf ${formatMoney(counted)} geändert.`);
+  });
+
+  /* ---------- Versehentliche Zählung löschen (mit Grund und Sicherheitscode) ---------- */
+
+  const loadCount = async (c: Ctx, t: Tenant) => {
+    const k = await one<CashCount & { tenant_id: number }>('SELECT * FROM cash_counts WHERE tenant_id = ? AND id = ?', t.id, idParam(c)) ?? notFound();
+    return { k, a: (await getAccount(t.id, k.account_id))! };
+  };
+  const countDeletePage = (c: Ctx, a: CashAccount, k: CashCount, code: string, reason = '', error?: string) => page(c, {
+    title: 'Kassenzählung löschen',
+    back: { href: `/cashbook/counts?account=${a.id}`, label: `Zählprotokolle ${a.name}` },
+    status: error ? 400 : 200,
+    body: html`
+    ${error ? html`<div class="flash flash-error" role="alert">${error}</div>` : ''}
+    <div class="notice danger-notice">
+      <strong>Nur für versehentlich erfasste Zählungen.</strong>
+      <ul>
+        <li>Gelöscht werden das Zählprotokoll und seine Differenzbuchung (${money(k.difference)}). Spätere Zählungen von „${a.name}“ werden neu berechnet.</li>
+        <li>War die Zählung echt und stimmt nur etwas nicht, besser das Datum ändern bzw. die fehlende Buchung nachtragen.</li>
+        <li>Datum, Beträge, Stückelung und Grund werden im Protokoll festgehalten.</li>
+      </ul>
+    </div>
+    <section class="card"><dl class="dl">
+      <dt>Kasse</dt><dd>${a.name}</dd>
+      <dt>Datum</dt><dd>${formatDate(k.count_date)}</dd>
+      <dt>Gezählt</dt><dd>${formatMoney(k.counted)}</dd>
+      <dt>Buchbestand</dt><dd>${formatMoney(k.book_balance)}</dd>
+      <dt>Differenz</dt><dd>${money(k.difference)}</dd>
+      ${k.note ? html`<dt>Notiz</dt><dd>${k.note}</dd>` : ''}
+    </dl></section>
+    <form method="post" action="/cashbook/counts/${k.id}/delete" class="card stack narrow" autocomplete="off">
+      ${csrfField(c)}
+      <label>Grund <span class="muted small">(Pflicht, steht im Protokoll)</span>
+        <textarea name="reason" rows="2" required minlength="10" maxlength="500" placeholder="z. B. doppelt erfasst, versehentlich gespeichert">${reason}</textarea></label>
+      <div><p class="small">Zur Bestätigung bitte diesen Code abschreiben:</p>${codeBox(code)}</div>
+      ${codeInput()}
+      <div class="form-actions"><button class="btn danger">Zählung endgültig löschen</button>
+        <a class="btn ghost" href="/cashbook/counts?account=${a.id}">Abbrechen</a></div>
+    </form>`,
+  });
+
+  app.get('/cashbook/counts/:id/delete', async (c) => {
+    const t = cbTenant(c);
+    const { k, a } = await loadCount(c, t);
+    const blocker = await countDeleteBlocker(t, k);
+    if (blocker) return redirectWith(c, `/cashbook/counts?account=${a.id}`, 'error', blocker);
+    return countDeletePage(c, a, k, issueCode(`${c.get('session')!.id}:count:${k.id}`));
+  });
+
+  app.post('/cashbook/counts/:id/delete', async (c) => {
+    const t = cbTenant(c);
+    const { k, a } = await loadCount(c, t);
+    const form = await readForm(c);
+    const reason = str(form, 'reason', 500);
+    const key = `${c.get('session')!.id}:count:${k.id}`;
+    if (reason.length < 10) return countDeletePage(c, a, k, currentCode(key), reason, 'Bitte einen Grund angeben (mind. 10 Zeichen).');
+    const check = checkCode(key, str(form, 'code', 20));
+    if (!check.ok) return countDeletePage(c, a, k, check.code, reason, check.error);
+    await deleteCount(t, a, k);
+    const den = Object.entries(JSON.parse(k.denominations) as Record<string, number>).map(([d, n]) => `${n}×${formatMoney(Number(d))}`).join(', ');
+    await audit(c, 'cashbook.count.delete',
+      `${a.name} ${formatDate(k.count_date)}: gezählt ${formatMoney(k.counted)}, Buchbestand ${formatMoney(k.book_balance)}, Differenz ${formatMoney(k.difference)}${den ? ` (${den})` : ''} – Grund: ${reason}`);
+    return redirectWith(c, `/cashbook/counts?account=${a.id}`, 'ok', `Zählung vom ${formatDate(k.count_date)} gelöscht.`);
   });
 
   /** Zähltage je Bargeldkasse – für den Hinweis vor nachträglichen Buchungen (public/app.js) */
