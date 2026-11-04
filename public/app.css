@@ -884,3 +884,8 @@ ul.tight { margin: .35rem 0 0; padding-left: 1.2rem; }
 .entry-files.dragging { outline: 2px dashed var(--accent); outline-offset: 4px; border-radius: 8px; }
 .entry-files.dragging .entry-drop { border-color: var(--accent); background: var(--accent-soft); color: var(--ink); }
 @media (pointer: coarse) { .entry-drop { display: none; } }
+
+/* ---------- Stornierte Buchungen und Stornobuchungen: durchgestrichen ---------- */
+tr.voided td { color: var(--muted); }
+tr.voided td a, tr.voided td.num { text-decoration: line-through; text-decoration-color: color-mix(in srgb, var(--muted) 70%, transparent); }
+tr.voided .tag { text-decoration: none; }

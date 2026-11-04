@@ -359,9 +359,9 @@ function register(app: App) {
             <h2 class="section-title">Buchungen ohne Rechnung <span class="count">${entries.length}</span></h2>
             <div class="card flush"><table class="table stack-mobile">
               <thead><tr><th>Datum</th><th>Buchung</th><th>Konto</th><th class="num">Betrag</th></tr></thead>
-              <tbody>${entries.map((e) => html`<tr class="rowlink${e.reversed || e.reversal_of ? ' muted' : ''}" data-href="/cashbook/entries/${e.id}/edit">
+              <tbody>${entries.map((e) => html`<tr class="rowlink${e.reversed || e.reversal_of ? ' voided' : ''}" data-href="/cashbook/entries/${e.id}/edit">
                 <td data-label="Datum">${formatDate(e.entry_date)}</td>
-                <td data-label="Buchung"><a href="/cashbook/entries/${e.id}/edit">${e.text}</a>${e.reversed ? html` <span class="tag">storniert</span>` : ''}</td>
+                <td data-label="Buchung"><a href="/cashbook/entries/${e.id}/edit">${e.text}</a>${e.reversed ? html` <span class="tag">storniert</span>` : e.reversal_of ? html` <span class="tag">Storno</span>` : ''}</td>
                 <td data-label="Konto">${e.account}</td>
                 <td data-label="Betrag" class="num">${formatMoney(Number(e.amount))}</td>
               </tr>`)}</tbody></table></div>

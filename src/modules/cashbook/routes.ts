@@ -19,7 +19,7 @@ import { assignToEntry, getInbox, inboxOf, type InboxFile } from '../inbox/repo.
 import {
   bookDue, getRecurring, nextDue, pendingDues, recurringOf, RHYTHMS, skipDue, type PendingDue, type Recurring, type Rhythm,
   accountsOf, assertOpen, balanceAt, balances, bookLinked, cashbookEnabled, changeCountDate, createManual, linkEntryToPurchase, purchaseCandidates, recalcCounts, reversalOf, reverseEntry, createTransfer, DENOMINATIONS,
-  entriesOf, entrySphere, getAccount, history, lastCount, saveCount, SOURCE_LABELS, unassigned, updateManual, checkContact, entryContactOptions, countDeleteBlocker, deleteCount, changeCounted,
+  entriesOf, entrySphere, getAccount, isVoided, voidedPairs, history, lastCount, saveCount, SOURCE_LABELS, unassigned, updateManual, checkContact, entryContactOptions, countDeleteBlocker, deleteCount, changeCounted,
   type CashAccount, type CashCount, type CashEntry, type EntryInput, type EntryRow, type LinkSource,
 } from './repo.ts';
 
@@ -70,10 +70,11 @@ function entryTable(t: Tenant, rows: EntryRow[], opening: number, showAccount: b
         const href = r.document_id ? `/invoices/${r.document_id}` : r.purchase_id ? `/purchases/${r.purchase_id}` : r.donation_id ? `/donations/${r.donation_id}`
           : r.count_id ? `/cashbook/counts?account=${r.account_id}` : `/cashbook/entries/${r.id}/edit`;
         const sphere = entrySphere(r, t.default_sphere);
-        return html`<tr class="rowlink" data-href="${href}">
+        const voided = isVoided(r);
+        return html`<tr class="rowlink${voided ? ' voided' : ''}" data-href="${href}">
           <td>${formatDate(r.entry_date)}</td>
           ${showAccount ? html`<td>${r.account_name}</td>` : ''}
-          <td><a href="${href}">${r.ref_label ?? r.text}</a>
+          <td><a href="${href}">${r.ref_label ?? r.text}</a>${r.reversed_by ? html` <span class="tag">storniert</span>` : r.reversal_of ? html` <span class="tag">Storno</span>` : ''}
             <div class="muted small">${r.contact_label ? `${r.contact_label} · ` : ''}${r.recurring_id ? 'Dauerauftrag' : SOURCE_LABELS[r.source]}${r.category ? ` · ${categoryLabel(r.category)}` : ''}${r.ref_label && r.text && r.text !== r.ref_label ? ` · ${r.text}` : ''}${r.receipt_ref ? ` · Beleg ${r.receipt_ref}` : ''}${r.vat_rate ? ` · inkl. ${r.vat_rate / 100} % USt.` : ''}${files.get(r.id) ? html` · <span class="has-file">${files.get(r.id)} ${files.get(r.id) === 1 ? 'Beleg' : 'Belege'}</span>` : ''}</div></td>
           ${t.nonprofit ? html`<td class="small">${sphere ? SPHERES.find((s) => s.value === sphere)?.short ?? '' : '–'}</td>` : ''}
           <td class="right num">${r.amount > 0 ? formatMoney(r.amount) : ''}</td>
@@ -385,8 +386,10 @@ function register(app: App) {
     const total = list.reduce((a, x) => a + x.balance, 0);
     const minus = points.find((p) => p.balance < 0 && selectedAcc?.kind === 'cash');
     const q = (acc?: number, year = r.year) => `/cashbook?${new URLSearchParams({ ...(acc ? { account: String(acc) } : {}), year: String(year) })}`;
-    const income = rows.filter((x) => x.amount > 0 && x.source !== 'transfer').reduce((a, x) => a + x.amount, 0);
-    const spend = rows.filter((x) => x.amount < 0 && x.source !== 'transfer').reduce((a, x) => a - x.amount, 0);
+    // Storno-Paare im Zeitraum heben sich auf – nicht als Einnahme und Ausgabe zählen
+    const voided = voidedPairs(rows);
+    const income = rows.filter((x) => !voided.has(x.id) && x.amount > 0 && x.source !== 'transfer').reduce((a, x) => a + x.amount, 0);
+    const spend = rows.filter((x) => !voided.has(x.id) && x.amount < 0 && x.source !== 'transfer').reduce((a, x) => a - x.amount, 0);
     return page(c, {
       title: 'Kassenbuch',
       actions: html`

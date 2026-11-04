@@ -153,6 +153,31 @@ export function assertOpen(t: Pick<Tenant, 'cashbook_locked_until'>, ...dates: (
 
 /* ---------------- Buchungen ---------------- */
 
+/**
+ * SQL-Bedingung „Buchung zählt“: weder eine Stornobuchung noch eine stornierte Buchung. Ein
+ * Storno-Paar hebt sich auf und gehört in keine Auswertung (Einnahmen, Ausgaben, Bereiche) –
+ * sonst stünde z. B. das Storno einer Ausgabe als Einnahme da. Im Kassenbuch selbst (Saldo,
+ * Journal, Export) bleiben beide Buchungen stehen, nur gekennzeichnet.
+ */
+export const liveSql = (alias = 'cash_entries') =>
+  `${alias}.reversal_of IS NULL AND NOT EXISTS (SELECT 1 FROM cash_entries rv WHERE rv.reversal_of = ${alias}.id)`;
+
+/** Storniert oder Storno? */
+export const isVoided = (r: Pick<EntryRow, 'reversal_of' | 'reversed_by'>) => !!(r.reversal_of || r.reversed_by);
+
+/**
+ * Buchungen in `rows`, deren Storno-Partner ebenfalls in `rows` liegt – sie heben sich in den
+ * Summen des Zeitraums auf und werden dort weggelassen (Endbestand bleibt stimmig).
+ */
+export function voidedPairs(rows: Pick<EntryRow, 'id' | 'reversal_of' | 'reversed_by'>[]): Set<number> {
+  const ids = new Set(rows.map((r) => r.id));
+  const out = new Set<number>();
+  for (const r of rows) {
+    if (r.reversal_of && ids.has(r.reversal_of)) out.add(r.id).add(r.reversal_of);
+  }
+  return out;
+}
+
 export interface EntryInput {
   account_id: number;
   entry_date: string;
@@ -307,6 +332,7 @@ export async function linkEntryToPurchase(t: Tenant, entryId: number, purchaseId
   if (p.status === 'draft') throw new UserError('Die Eingangsrechnung ist noch nicht erfasst – bitte zuerst die Angaben vervollständigen.');
   if (p.status === 'archived') throw new UserError('Die Eingangsrechnung ist archiviert – zuerst wiederherstellen.');
   if (entry.source !== 'manual') throw new UserError('Nur freie Buchungen lassen sich mit einer Eingangsrechnung verbinden.');
+  if (entry.reversal_of || await reversalOf(entry.id)) throw new UserError('Stornierte Buchungen und Stornobuchungen lassen sich nicht mit einer Eingangsrechnung verbinden.');
   assertOpen(t, entry.entry_date);
   if (await linkedEntry('purchase', p.id)) throw new UserError('Die Eingangsrechnung ist schon mit einer Buchung verbunden.');
   if (p.is_credit ? entry.amount <= 0 : entry.amount >= 0) {
@@ -372,7 +398,7 @@ export async function purchaseCandidates(t: Tenant, entry: CashEntry): Promise<P
 export async function entryCandidates(t: Tenant, p: { is_credit: number; gross_total: number; prepaid_total: number; issue_date: string | null }): Promise<EntryCandidate[]> {
   return all<EntryCandidate>(
     `SELECT e.id, e.entry_date, e.text, e.amount, a.name account FROM cash_entries e JOIN cash_accounts a ON a.id = e.account_id
-     WHERE e.tenant_id = ? AND e.source = 'manual' AND ${p.is_credit ? 'e.amount > 0' : 'e.amount < 0'} AND e.entry_date > ?
+     WHERE e.tenant_id = ? AND e.source = 'manual' AND ${p.is_credit ? 'e.amount > 0' : 'e.amount < 0'} AND e.entry_date > ? AND ${liveSql('e')}
      ORDER BY (ABS(e.amount) = ?) DESC, ABS(DATEDIFF(e.entry_date, ?)), e.id DESC
      LIMIT 100`,
     t.id, t.cashbook_locked_until ?? '0000-01-01', Number(p.gross_total) - Number(p.prepaid_total), p.issue_date ?? today(),
@@ -713,6 +739,8 @@ export interface EntryRow extends CashEntry {
   ref_category: string | null;
   /** Adresse einer freien Buchung */
   contact_label: string | null;
+  /** Stornobuchung zu dieser Buchung, falls storniert */
+  reversed_by: number | null;
 }
 
 /**
@@ -738,7 +766,8 @@ export async function entriesOf(accounts: CashAccount[], from: string, to: strin
          WHEN 'donation' THEN 'ideell'
          ELSE NULL END ref_sphere,
        IF(e.source = 'purchase', (SELECT p.category FROM purchase_invoices p WHERE p.id = e.purchase_id), NULL) ref_category,
-       (SELECT COALESCE(NULLIF(k.company, ''), k.name) FROM contacts k WHERE k.id = e.contact_id) contact_label
+       (SELECT COALESCE(NULLIF(k.company, ''), k.name) FROM contacts k WHERE k.id = e.contact_id) contact_label,
+       (SELECT rv.id FROM cash_entries rv WHERE rv.reversal_of = e.id) reversed_by
      FROM cash_entries e JOIN cash_accounts a ON a.id = e.account_id
      WHERE e.account_id IN (${ids.map(() => '?').join(',')}) AND e.entry_date BETWEEN ? AND ? ORDER BY e.entry_date, e.id`,
     ...ids, from, to,

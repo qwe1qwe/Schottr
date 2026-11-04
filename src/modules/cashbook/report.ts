@@ -5,7 +5,7 @@ import { SPHERES, sphereLabel } from '../../lib/nonprofit.ts';
 import { categoryLabel } from '../../lib/expenses.ts';
 import { renderTablePdf, type TableSection } from '../../lib/tablepdf.ts';
 import type { Tenant } from '../../types.ts';
-import { DENOMINATIONS, SOURCE_LABELS, accountsOf, entriesOf, entrySphere, type CashAccount, type CashCount, type EntryRow } from './repo.ts';
+import { DENOMINATIONS, SOURCE_LABELS, accountsOf, entriesOf, entrySphere, isVoided, voidedPairs, type CashAccount, type CashCount, type EntryRow } from './repo.ts';
 
 /**
  * Auswertungen für das Steuerbüro: Kassenbuch je Konto (CSV und PDF), Zählprotokolle,
@@ -40,7 +40,9 @@ export async function accountReports(t: Tenant, from: string, to: string): Promi
   for (const a of await accountsOf(t.id, true)) {
     if (a.opening_date > to) continue;
     const { opening, rows, closing } = await entriesOf([a], from, to);
-    const sum = (f: (r: EntryRow) => boolean) => rows.filter(f).reduce((s, r) => s + r.amount, 0);
+    // Storno-Paare im Zeitraum heben sich auf – nicht als Einnahme und Ausgabe zählen
+    const voided = voidedPairs(rows);
+    const sum = (f: (r: EntryRow) => boolean) => rows.filter((r) => !voided.has(r.id) && f(r)).reduce((s, r) => s + r.amount, 0);
     out.push({
       account: a, opening, closing, rows,
       income: sum((r) => r.amount > 0 && r.source !== 'transfer'),
@@ -56,7 +58,7 @@ export function cashbookCsv(t: Tenant, rep: AccountReport, files = new Map<numbe
   const lines: (string | number)[][] = [['', rep.account.name, '', 'Anfangsbestand', '', '', '', '', '', '', '', '', num(rep.opening), '']];
   for (const r of rep.rows) {
     lines.push([
-      formatDate(r.entry_date), rep.account.name, r.recurring_id ? 'Dauerauftrag' : SOURCE_LABELS[r.source], entryLabel(r) + (r.ref_label && r.text ? ` – ${r.text}` : ''), r.contact_label ?? '', r.receipt_ref,
+      formatDate(r.entry_date), rep.account.name, r.reversal_of ? 'Stornobuchung' : `${r.recurring_id ? 'Dauerauftrag' : SOURCE_LABELS[r.source]}${r.reversed_by ? ' (storniert)' : ''}`, entryLabel(r) + (r.ref_label && r.text ? ` – ${r.text}` : ''), r.contact_label ?? '', r.receipt_ref,
       r.category || r.ref_category ? categoryLabel(r.category || r.ref_category!) : '', sphereText(t, r), r.vat_rate ? `${r.vat_rate / 100} %` : '', r.vat_rate ? num(vatOf(Math.abs(r.amount), r.vat_rate)) : '',
       r.amount > 0 ? num(r.amount) : '', r.amount < 0 ? num(-r.amount) : '', num(r.balance), (files.get(r.id) ?? []).join(', '),
     ]);
@@ -75,9 +77,10 @@ export function cashbookPdf(t: Tenant, rep: AccountReport, from: string, to: str
     rows: [
       { cells: ['', 'Anfangsbestand', '', ...(t.nonprofit ? [''] : []), '', '', formatMoney(rep.opening)], muted: true },
       ...rep.rows.map((r) => ({
+        muted: isVoided(r),
         cells: [
           formatDate(r.entry_date),
-          `${entryLabel(r)}${r.ref_label && r.text ? ` – ${r.text}` : ''} (${r.recurring_id ? 'Dauerauftrag' : SOURCE_LABELS[r.source]}${r.category || r.ref_category ? `, ${categoryLabel(r.category || r.ref_category!)}` : ''}${r.vat_rate ? `, inkl. ${r.vat_rate / 100} % USt.` : ''})`,
+          `${r.reversed_by ? '[storniert] ' : ''}${entryLabel(r)}${r.ref_label && r.text ? ` – ${r.text}` : ''} (${r.reversal_of ? 'Stornobuchung' : r.recurring_id ? 'Dauerauftrag' : SOURCE_LABELS[r.source]}${r.category || r.ref_category ? `, ${categoryLabel(r.category || r.ref_category!)}` : ''}${r.vat_rate ? `, inkl. ${r.vat_rate / 100} % USt.` : ''})`,
           r.receipt_ref, ...(t.nonprofit ? [SPHERES.find((s) => s.value === entrySphere(r, t.default_sphere))?.short ?? ''] : []),
           r.amount > 0 ? formatMoney(r.amount) : '', r.amount < 0 ? formatMoney(-r.amount) : '', formatMoney(r.balance),
         ],
@@ -135,8 +138,9 @@ export function sphereSummary(t: Tenant, reports: AccountReport[]): SphereSum[] 
   const keys = t.nonprofit ? [...SPHERES.map((s) => s.value as string)] : [''];
   const map = new Map(keys.map((k) => [k, { sphere: k, label: k ? sphereLabel(k) : 'Verein gesamt', income: 0, expense: 0 }]));
   for (const rep of reports) {
+    const voided = voidedPairs(rep.rows);
     for (const r of rep.rows) {
-      if (r.source === 'transfer') continue;
+      if (r.source === 'transfer' || voided.has(r.id)) continue;
       const key = t.nonprofit ? entrySphere(r, t.default_sphere) : '';
       const m = map.get(key) ?? map.get(keys[0])!;
       if (r.amount > 0) m.income += r.amount;

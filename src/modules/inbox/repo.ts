@@ -4,6 +4,7 @@ import { copyCrop, viewOf } from '../../lib/crop.ts';
 import { UserError } from '../../lib/http.ts';
 import { appendPdfs, imagesToPdf } from '../../lib/pdfmerge.ts';
 import { attachData, MAX_ENTRY_FILE, mimeOf } from '../cashbook/files.ts';
+import { liveSql } from '../cashbook/repo.ts';
 import type { Tenant } from '../../types.ts';
 
 /**
@@ -177,7 +178,7 @@ export async function attachTargets(t: Tenant, withEntries: boolean): Promise<At
       `SELECT e.id, e.entry_date, e.text, e.amount, a.name account,
               (SELECT COUNT(*) FROM cash_entry_files f WHERE f.entry_id = e.id AND f.archived_at IS NULL) files
        FROM cash_entries e JOIN cash_accounts a ON a.id = e.account_id
-       WHERE e.tenant_id = ? AND e.source IN ('manual', 'transfer', 'count')
+       WHERE e.tenant_id = ? AND e.source IN ('manual', 'transfer', 'count') AND ${liveSql('e')}
        ORDER BY e.entry_date DESC, e.id DESC LIMIT 150`, t.id,
     )
     : [];

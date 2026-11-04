@@ -18,7 +18,7 @@ import { dueOf, payable, type Purchase } from './purchases/repo.ts';
 import { isSphere, nonprofitLimits, NONPROFIT_ALLOWANCE, SPHERES, type Sphere } from '../lib/nonprofit.ts';
 import { donationTotals } from './donations/repo.ts';
 import { cashbookDash, pendingCard } from './cashbook/routes.ts';
-import { cashbookEnabled, pendingDues } from './cashbook/repo.ts';
+import { cashbookEnabled, liveSql, pendingDues } from './cashbook/repo.ts';
 import { inboxCount } from './inbox/repo.ts';
 import { SOURCE_LABELS } from './cashbook/repo.ts';
 import { fileCounts } from './cashbook/files.ts';
@@ -93,9 +93,9 @@ const paidDocsParams = (t: Tenant) => [t.default_sphere || 'business', t.id, t.d
 /** Nettobetrag einer Kassenbuch-Buchung (enthaltene USt. abgezogen) */
 const CASH_NET = 'amount - IF(vat_rate > 0, ROUND(amount * vat_rate / (10000 + vat_rate)), 0)';
 /** Einnahmen ohne Rechnung: freie Einnahme-Buchungen und Kassenzählungen (deren Differenz ist der geschätzte Barumsatz) */
-const CASH_INCOME = "(source = 'count' OR (source = 'manual' AND amount > 0))";
+const CASH_INCOME = `(source = 'count' OR (source = 'manual' AND amount > 0)) AND ${liveSql()}`;
 /** Ausgaben ohne Eingangsrechnung: freie Ausgabe-Buchungen, z. B. Porto, Kontogebühren, Miete per Dauerauftrag */
-const CASH_EXPENSE = "source = 'manual' AND amount < 0";
+const CASH_EXPENSE = `source = 'manual' AND amount < 0 AND ${liveSql()}`;
 
 /**
  * Netto-Umsatz eines Jahres nach Zahlungseingang: bezahlte Rechnungen plus Bareinnahmen ohne
@@ -274,8 +274,7 @@ function dashSupplierCash(c: Ctx, t: Tenant): boolean {
  * Freie Ausgabe-Buchungen (ohne Eingangsrechnung) für die Lieferanten-Kachel – ohne stornierte
  * Buchungen und ohne Stornobuchungen, damit ein Storno nicht als Ausgabe stehen bleibt.
  */
-const CASH_OUT_LIVE = `e.source = 'manual' AND e.amount < 0 AND e.reversal_of IS NULL
-  AND NOT EXISTS (SELECT 1 FROM cash_entries r WHERE r.reversal_of = e.id)`;
+const CASH_OUT_LIVE = `e.source = 'manual' AND e.amount < 0 AND ${liveSql('e')}`;
 
 /**
  * Kachel mit Umschalter: Top-Lieferanten nach Kosten bzw. größte Verbindlichkeiten (alle
@@ -613,7 +612,7 @@ async function periodLines(t: Tenant, period: string, basis: Basis, sphere?: Sph
        SELECT e.id, e.account_id, e.entry_date, e.source, e.text, e.receipt_ref, e.category, e.vat_rate,
          COALESCE(NULLIF(e.sphere, ''), ?) sp, a.name account, ${amount} s
        FROM cash_entries e JOIN cash_accounts a ON a.id = e.account_id
-       WHERE e.tenant_id = ? AND substr(e.entry_date, 1, ${len}) = ? AND ${cond}
+       WHERE e.tenant_id = ? AND substr(e.entry_date, 1, ${len}) = ? AND (${cond}) AND ${liveSql('e')}
      ) x WHERE 1 = 1 ${filter} ORDER BY entry_date, id`,
     def, t.id, period, ...params,
   );
