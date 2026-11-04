@@ -19,7 +19,7 @@ import { assignToEntry, getInbox, inboxOf, type InboxFile } from '../inbox/repo.
 import {
   bookDue, getRecurring, nextDue, pendingDues, recurringOf, RHYTHMS, skipDue, type PendingDue, type Recurring, type Rhythm,
   accountsOf, assertOpen, balanceAt, balances, bookLinked, cashbookEnabled, changeCountDate, createManual, linkEntryToPurchase, purchaseCandidates, recalcCounts, reversalOf, reverseEntry, createTransfer, DENOMINATIONS,
-  entriesOf, entrySphere, getAccount, isVoided, voidedPairs, history, lastCount, saveCount, SOURCE_LABELS, unassigned, updateManual, checkContact, entryContactOptions, countDeleteBlocker, deleteCount, changeCounted,
+  entriesOf, entrySphere, getAccount, isVoided, voidedPairs, history, lastCount, saveCount, SOURCE_LABELS, unassigned, updateManual, checkContact, entryContactOptions, countDeleteBlocker, deleteCount, changeCounted, changeReversalDate,
   type CashAccount, type CashCount, type CashEntry, type EntryInput, type EntryRow, type LinkSource,
 } from './repo.ts';
 
@@ -732,6 +732,10 @@ function register(app: App) {
     const sides = e.source === 'transfer' && e.transfer_group
       ? (await all<{ id: number }>('SELECT id FROM cash_entries WHERE transfer_group = ?', e.transfer_group)).map((x) => x.id) : [e.id];
     const withFiles = await hasFiles(sides);
+    // Storno standardmäßig am Tag der Buchung (bzw. am ersten offenen Tag)
+    const firstOpen = t.cashbook_locked_until ? addDays(t.cashbook_locked_until, 1) : '';
+    const stornoDefault = [e.entry_date, firstOpen].sort().at(-1)! > today() ? today() : [e.entry_date, firstOpen].sort().at(-1)!;
+    const reversalOrig = e.reversal_of ? await one<CashEntry>('SELECT * FROM cash_entries WHERE id = ?', e.reversal_of) : null;
     return page(c, {
       title: e.reversal_of ? 'Stornobuchung' : e.source === 'transfer' ? 'Umbuchung' : 'Buchung bearbeiten',
       back: { href: `/cashbook?account=${e.account_id}&year=${e.entry_date.slice(0, 4)}`, label: 'Kassenbuch' },
@@ -742,7 +746,7 @@ function register(app: App) {
         : html`<section class="card"><dl class="dl">
             <dt>Datum</dt><dd>${formatDate(e.entry_date)}</dd><dt>Text</dt><dd>${e.text}</dd><dt>Betrag</dt><dd>${money(e.amount)}</dd>
             ${e.contact_id ? html`<dt>Adresse</dt><dd><a href="/contacts/${e.contact_id}">${(await one<{ l: string }>("SELECT COALESCE(NULLIF(company, ''), name) l FROM contacts WHERE id = ?", e.contact_id))?.l ?? 'Adresse'}</a></dd>` : ''}
-            ${e.reversal_of ? html`<dt>Storno zu</dt><dd><a href="/cashbook/entries/${e.reversal_of}/edit">Buchung ansehen</a></dd>` : ''}
+            ${e.reversal_of ? html`<dt>Storno zu</dt><dd><a href="/cashbook/entries/${e.reversal_of}/edit">Buchung vom ${formatDate(reversalOrig?.entry_date)} ansehen</a></dd>` : ''}
             ${e.sphere ? html`<dt>Bereich</dt><dd>${sphereLabel(e.sphere)}</dd>` : ''}</dl></section>`}
       ${files.length || !linked
         ? html`<section class="card"><h2>Belege <span class="count">${files.filter((f) => !f.archived_at).length}</span></h2>
@@ -755,16 +759,31 @@ function register(app: App) {
           </section>`
         : ''}
       ${e.source === 'manual' && !locked && !e.reversal_of && !reversed ? await linkPurchaseCard(c, t, e) : ''}
+      ${e.reversal_of && reversalOrig && !locked
+        ? html`<section class="card"><h2>Storno-Datum</h2>
+            <form method="post" action="/cashbook/entries/${e.id}/reversal-date" class="inline-form"
+              data-confirm="Datum des Stornos ändern? Kassenstände und Zählungen ab dem früheren Datum werden neu berechnet.">
+              ${csrfField(c)}
+              <input type="date" name="date" value="${e.entry_date}" min="${[reversalOrig.entry_date, firstOpen].sort().at(-1)}" max="${today()}" required aria-label="Neues Storno-Datum">
+              <button class="btn">Datum ändern</button>
+            </form>
+            ${e.entry_date !== reversalOrig.entry_date && reversalOrig.entry_date >= firstOpen
+              ? postButton(c, `/cashbook/entries/${e.id}/reversal-date?date=${reversalOrig.entry_date}`, `Auf den Tag der Buchung legen (${formatDate(reversalOrig.entry_date)})`, 'btn ghost')
+              : ''}
+            <p class="muted small">Hat die Buchung nie stattgefunden, gehört das Storno auf ihren Tag – dann heben sich beide sofort auf und der Kassenstand dazwischen stimmt.${e.source === 'transfer' ? ' Bei Umbuchungen gilt das Datum für beide Seiten.' : ''}</p>
+          </section>`
+        : ''}
       ${reversed ? html`<div class="notice soft">Storniert am ${formatDate(reversed.entry_date)} – <a href="/cashbook/entries/${reversed.id}/edit">Stornobuchung ansehen</a>.</div>` : ''}
       ${(e.source === 'manual' || e.source === 'transfer') && !reversed && !e.reversal_of
         ? html`<div class="danger-zone">
             <form method="post" action="/cashbook/entries/${e.id}/reverse" class="inline-form"
               data-confirm="Buchung stornieren? Es entsteht eine Gegenbuchung; Original und Belege bleiben unverändert stehen.">
               ${csrfField(c)}
-              <label>Storno zum <input type="date" name="date" value="${today()}" min="${e.entry_date}" max="${today()}" required></label>
+              <label>Storno zum <input type="date" name="date" value="${stornoDefault}" min="${e.entry_date}" max="${today()}" required></label>
               <button class="btn danger">${e.source === 'transfer' ? 'Umbuchung stornieren' : 'Buchung stornieren'}</button>
             </form>
-            <p class="muted small">Buchungen lassen sich nicht löschen (GoBD) – ein Storno hebt sie nachvollziehbar auf${withFiles ? '; Original und Belege bleiben unverändert stehen' : ''}.${locked ? ' Der Zeitraum ist abgeschlossen – das Storno muss in einem offenen Zeitraum liegen.' : ''}</p>
+            <p class="muted small">Buchungen lassen sich nicht löschen (GoBD) – ein Storno hebt sie nachvollziehbar auf${withFiles ? '; Original und Belege bleiben unverändert stehen' : ''}.
+              Hat die Buchung nie stattgefunden, das Storno auf ihren Tag legen (vorgeschlagen) – ein späteres Datum nur, wenn sie wirklich später rückgängig gemacht wurde; sonst stimmt der Kassenstand dazwischen nicht.${locked ? ' Der Zeitraum ist abgeschlossen – das Storno muss in einem offenen Zeitraum liegen.' : ''}</p>
           </div>`
         : ''}`,
     });
@@ -843,6 +862,16 @@ function register(app: App) {
     await setFileArchived(f, !f.archived_at);
     await audit(c, f.archived_at ? 'cashbook.file.restore' : 'cashbook.file.archive', `${formatDate(e.entry_date)} ${e.text}: ${f.file_name}`);
     return redirectWith(c, `/cashbook/entries/${e.id}/edit`, 'ok', f.archived_at ? 'Beleg wiederhergestellt.' : 'Beleg archiviert – er bleibt unverändert aufbewahrt.');
+  });
+
+  /** Datum einer Stornobuchung ändern (z. B. auf den Tag der stornierten Buchung) */
+  app.post('/cashbook/entries/:id/reversal-date', async (c) => {
+    const t = cbTenant(c);
+    const e = await one<CashEntry>('SELECT * FROM cash_entries WHERE tenant_id = ? AND id = ?', t.id, idParam(c)) ?? notFound();
+    const date = c.req.query('date') || str(await readForm(c), 'date');
+    const { from, changed } = await changeReversalDate(t, e, date);
+    if (changed) await audit(c, 'cashbook.entry.reversal-date', `${e.text}: ${formatDate(from)} → ${formatDate(date)}`);
+    return redirectWith(c, `/cashbook/entries/${e.id}/edit`, 'ok', changed ? `Storno-Datum auf ${formatDate(date)} geändert.` : 'Das Datum ist unverändert.');
   });
 
   /** Storno: Gegenbuchung, Original und Belege bleiben */

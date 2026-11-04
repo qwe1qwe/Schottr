@@ -412,6 +412,30 @@ async function sidesOf(t: Tenant, entry: CashEntry): Promise<CashEntry[]> {
     : [entry];
 }
 
+/**
+ * Datum einer Stornobuchung ändern (bei Umbuchungen beide Seiten) – z. B. wenn die Buchung nie
+ * stattgefunden hat und das Storno auf ihren Tag gehört, damit die Kasse dazwischen nicht ins
+ * Minus rutscht. Nicht vor der Originalbuchung, nicht in der Zukunft, nur in offenen Zeiträumen.
+ */
+export async function changeReversalDate(t: Tenant, storno: CashEntry, date: string): Promise<{ from: string; changed: boolean }> {
+  if (!storno.reversal_of) throw new UserError('Das ist keine Stornobuchung.');
+  const orig = await one<CashEntry>('SELECT * FROM cash_entries WHERE id = ?', storno.reversal_of);
+  if (!orig) throw new UserError('Die Originalbuchung fehlt.');
+  if (!isIsoDate(date)) throw new UserError('Bitte ein gültiges Datum angeben.');
+  if (date < orig.entry_date) throw new UserError(`Das Storno kann nicht vor der Buchung (${formatDate(orig.entry_date)}) liegen.`);
+  if (date > today()) throw new UserError('Das Storno-Datum liegt in der Zukunft.');
+  if (date === storno.entry_date) return { from: storno.entry_date, changed: false };
+  const sides = await sidesOf(t, storno);
+  assertOpen(t, storno.entry_date, date);
+  for (const x of sides) await checkAccount(t, x.account_id, date);
+  await tx(async () => {
+    for (const x of sides) await run('UPDATE cash_entries SET entry_date = ?, updated_at = ? WHERE id = ?', date, nowIso(), x.id);
+    const from = date < storno.entry_date ? date : storno.entry_date;
+    await recalcAfter(t, ...sides.map((x) => [x.account_id, from] as [number, string]));
+  });
+  return { from: storno.entry_date, changed: true };
+}
+
 /** Ist die Buchung (bzw. eine Seite der Umbuchung) schon storniert? */
 export async function reversalOf(entryId: number) {
   return one<CashEntry>('SELECT * FROM cash_entries WHERE reversal_of = ?', entryId);
