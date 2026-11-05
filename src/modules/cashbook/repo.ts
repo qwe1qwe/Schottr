@@ -39,6 +39,8 @@ export interface CashEntry {
   /** Adresse (Kunde/Lieferant) einer freien Buchung, optional */
   contact_id: number | null;
   count_id: number | null;
+  /** 1 = ermittelter Teilbetrag einer Zählung vor dem Zähltag (siehe allocateCount) */
+  count_part: number;
   transfer_group: string | null;
   text: string;
   receipt_ref: string;
@@ -542,6 +544,8 @@ export async function saveCount(
         input.sphere, input.vat_rate, userId, now, now,
       );
     }
+    // Minus-Stellen seit der letzten Zählung mit ermittelten Teilbeträgen ausgleichen
+    await recalcCounts(t, a.id, input.date);
     return { id, difference };
   });
 }
@@ -564,25 +568,118 @@ async function countBook(a: CashAccount, k: Pick<CashCount, 'id' | 'count_date'>
  */
 async function applyCountResult(t: Tenant, a: CashAccount, k: CashCount, book: number, difference: number) {
   const now = nowIso();
-  await run('UPDATE cash_counts SET book_balance = ?, difference = ? WHERE id = ?', book, difference, k.id);
-  const entry = await one<CashEntry>('SELECT * FROM cash_entries WHERE count_id = ?', k.id);
-  if (entry) {
-    const hasFiles = !!await one('SELECT 1 FROM cash_entry_files WHERE entry_id = ? LIMIT 1', entry.id);
-    if (difference === 0 && !hasFiles) {
-      await run('DELETE FROM cash_entries WHERE id = ?', entry.id);
+  if (book !== Number(k.book_balance) || difference !== Number(k.difference)) {
+    await run('UPDATE cash_counts SET book_balance = ?, difference = ? WHERE id = ?', book, difference, k.id);
+  }
+  // Wie viel der Differenz muss schon vor dem Zähltag eingenommen worden sein? Teilbeträge in einem
+  // abgeschlossenen Zeitraum bleiben unverändert und zählen als schon verteilt
+  const { parts, fixed } = await allocateCount(t, a, { ...k, difference });
+  const allocated = parts.reduce((s, p) => s + p.amount, 0) + fixed;
+  const mainAmount = difference - allocated;
+
+  // Differenzbuchung am Zähltag (Rest der Differenz); bei Teilbeträgen bleibt sie – ggf. mit 0,00 € –
+  // stehen, weil sie Text, Bereich und USt.-Satz für alle Teile trägt
+  let main = await one<CashEntry>('SELECT * FROM cash_entries WHERE count_id = ? AND count_part = 0 ORDER BY id LIMIT 1', k.id);
+  if (main) {
+    const hasFiles = !!await one('SELECT 1 FROM cash_entry_files WHERE entry_id = ? LIMIT 1', main.id);
+    if (difference === 0 && !hasFiles && !parts.length) {
+      await run('DELETE FROM cash_entries WHERE id = ?', main.id);
+      main = undefined;
     } else {
       // Standardtext an das (evtl. gedrehte) Vorzeichen anpassen, eigener Text bleibt
-      const text = difference !== 0 && isDefaultCountText(entry.text) ? countText(difference) : entry.text;
-      await run('UPDATE cash_entries SET entry_date = ?, amount = ?, text = ?, updated_at = ? WHERE id = ?', k.count_date, difference, text, now, entry.id);
+      const text = difference !== 0 && isDefaultCountText(main.text) ? countText(difference) : main.text;
+      if (main.entry_date !== k.count_date || Number(main.amount) !== mainAmount || main.text !== text) {
+        await run('UPDATE cash_entries SET entry_date = ?, amount = ?, text = ?, updated_at = ? WHERE id = ?', k.count_date, mainAmount, text, now, main.id);
+      }
     }
   } else if (difference !== 0) {
     // bisher ohne Differenz: Buchung mit den Vorgaben des Zählformulars anlegen
-    await run(
+    const res = await run(
       `INSERT INTO cash_entries (tenant_id, account_id, entry_date, amount, source, count_id, text, sphere, vat_rate, created_by, created_at, updated_at)
        VALUES (?, ?, ?, ?, 'count', ?, ?, ?, ?, NULL, ?, ?)`,
-      t.id, a.id, k.count_date, difference, k.id, countText(difference), t.nonprofit ? 'business' : '', t.small_business ? 0 : 1900, now, now,
+      t.id, a.id, k.count_date, mainAmount, k.id, countText(difference), t.nonprofit ? 'business' : '', t.small_business ? 0 : 1900, now, now,
     );
+    main = await one<CashEntry>('SELECT * FROM cash_entries WHERE id = ?', Number(res.insertId));
   }
+
+  // ermittelte Teilbeträge schreiben – vorhandene wiederverwenden, überzählige entfernen
+  const sphere = main?.sphere ?? (t.nonprofit ? 'business' : '');
+  const vat = main?.vat_rate ?? (t.small_business ? 0 : 1900);
+  const existing = await all<CashEntry>(
+    'SELECT * FROM cash_entries WHERE count_id = ? AND count_part = 1 AND entry_date > ? ORDER BY entry_date, id', k.id, t.cashbook_locked_until ?? '0000-01-01',
+  );
+  for (let i = 0; i < Math.max(parts.length, existing.length); i++) {
+    const p = parts[i];
+    const x = existing[i];
+    if (p) {
+      const text = `Bareinnahmen bis ${formatDate(p.date)} (ermittelt, Teil der Zählung vom ${formatDate(k.count_date)})`;
+      if (x) {
+        if (x.entry_date !== p.date || Number(x.amount) !== p.amount || x.text !== text || x.sphere !== sphere || Number(x.vat_rate) !== Number(vat)) {
+          await run('UPDATE cash_entries SET entry_date = ?, amount = ?, text = ?, sphere = ?, vat_rate = ?, updated_at = ? WHERE id = ?', p.date, p.amount, text, sphere, vat, now, x.id);
+        }
+      } else {
+        await run(
+          `INSERT INTO cash_entries (tenant_id, account_id, entry_date, amount, source, count_id, count_part, text, sphere, vat_rate, created_by, created_at, updated_at)
+           VALUES (?, ?, ?, ?, 'count', ?, 1, ?, ?, ?, NULL, ?, ?)`,
+          t.id, a.id, p.date, p.amount, k.id, text, sphere, vat, now, now,
+        );
+      }
+    } else if (x) {
+      // nicht mehr nötig: löschen – hängen Belege daran, bleibt sie mit 0,00 € stehen
+      const hasFiles = !!await one('SELECT 1 FROM cash_entry_files WHERE entry_id = ? LIMIT 1', x.id);
+      if (hasFiles) {
+        if (Number(x.amount) !== 0) await run('UPDATE cash_entries SET amount = 0, updated_at = ? WHERE id = ?', now, x.id);
+      } else {
+        await run('DELETE FROM cash_entries WHERE id = ?', x.id);
+      }
+    }
+  }
+}
+
+/**
+ * Mindest-Einnahmen vor dem Zähltag: Zwischen der vorherigen Zählung und dieser kann der Bestand
+ * nie unter 0 € gelegen haben. Wo er es rechnerisch tut (z. B. Entnahme zur Bank, bevor die
+ * Verkäufe mit der nächsten Zählung gebucht werden), muss bis zu diesem Tag mindestens so viel
+ * eingenommen worden sein. Diese Beträge werden – höchstens bis zur positiven Differenz der
+ * Zählung – auf die Minus-Tage verteilt; der Rest bleibt am Zähltag. Nur in offenen Zeiträumen.
+ */
+async function allocateCount(t: Tenant, a: CashAccount, k: CashCount): Promise<{ parts: { date: string; amount: number }[]; fixed: number }> {
+  const firstOpen = t.cashbook_locked_until ? addDays(t.cashbook_locked_until, 1) : '';
+  // Teilbeträge dieser Zählung in abgeschlossenen Zeiträumen: unveränderlich, gelten als verteilt
+  const locked = firstOpen
+    ? Number((await one<{ s: number | string }>(
+        'SELECT COALESCE(SUM(amount), 0) s FROM cash_entries WHERE count_id = ? AND count_part = 1 AND entry_date < ?', k.id, firstOpen,
+      ))?.s ?? 0)
+    : 0;
+  const difference = Number(k.difference) - locked;
+  if (difference <= 0) return { parts: [], fixed: locked };
+  const { prev } = await countNeighbours(a.id, k);
+  const start = [prev ? addDays(prev.count_date, 1) : a.opening_date, a.opening_date, firstOpen].sort().at(-1)!;
+  const end = addDays(k.count_date, -1);
+  if (start > end) return { parts: [], fixed: locked };
+  // Stand vor `start` (inkl. festgeschriebener Teilbeträge) und Tagessummen bis zum Vortag der
+  // Zählung – ohne die übrigen Buchungen dieser Zählung
+  const before = await one<{ s: number | string }>(
+    'SELECT COALESCE(SUM(amount), 0) s FROM cash_entries WHERE account_id = ? AND entry_date < ? AND (NOT (count_id <=> ?) OR count_part = 1)', a.id, start, k.id,
+  );
+  const days = await all<{ d: string; s: number | string }>(
+    `SELECT entry_date d, SUM(amount) s FROM cash_entries
+     WHERE account_id = ? AND entry_date BETWEEN ? AND ? AND NOT (count_id <=> ?) GROUP BY entry_date ORDER BY entry_date`,
+    a.id, start, end, k.id,
+  );
+  let bal = Number(a.opening_balance) + Number(before?.s ?? 0);
+  let allocated = 0;
+  const parts: { date: string; amount: number }[] = [];
+  for (const day of days) {
+    bal += Number(day.s);
+    const short = -(bal + allocated);
+    if (short > 0 && allocated < difference) {
+      const amount = Math.min(short, difference - allocated);
+      parts.push({ date: String(day.d), amount });
+      allocated += amount;
+    }
+  }
+  return { parts, fixed: locked };
 }
 
 /**
@@ -597,11 +694,35 @@ export async function recalcCounts(t: Tenant, accountId: number, from: string): 
   for (const k of counts) {
     const book = await countBook(a, k);
     const difference = Number(k.counted) - book;
-    if (book === Number(k.book_balance) && difference === Number(k.difference)) continue;
-    assertOpen(t, k.count_date);
+    const changed = book !== Number(k.book_balance) || difference !== Number(k.difference);
+    const locked = !!t.cashbook_locked_until && k.count_date <= t.cashbook_locked_until;
+    if (locked) {
+      if (changed) assertOpen(t, k.count_date);
+      continue;
+    }
+    // auch bei unveränderter Differenz: die Aufteilung auf Minus-Tage kann sich verschoben haben
     await applyCountResult(t, a, k, book, difference);
-    addNote(`Kassenzählung „${a.name}“ vom ${formatDate(k.count_date)} neu berechnet: Differenz ${formatMoney(Number(k.difference))} → ${formatMoney(difference)}.`);
+    if (changed) addNote(`Kassenzählung „${a.name}“ vom ${formatDate(k.count_date)} neu berechnet: Differenz ${formatMoney(Number(k.difference))} → ${formatMoney(difference)}.`);
   }
+}
+
+/**
+ * Beim Start: alle Bargeldkassen einmal neu rechnen, damit ermittelte Teilbeträge auch für
+ * bestehende Zählungen entstehen (idempotent – unveränderte Werte werden nicht neu geschrieben).
+ */
+export async function rebalanceAllCounts(): Promise<number> {
+  let n = 0;
+  for (const t of await all<Tenant>("SELECT * FROM tenants WHERE org_type = 'association'")) {
+    for (const a of await all<{ id: number }>("SELECT id FROM cash_accounts WHERE tenant_id = ? AND kind = 'cash'", t.id)) {
+      try {
+        await tx(() => recalcCounts(t, a.id, '0000-01-01'));
+        n++;
+      } catch (err) {
+        console.error(`Kasse ${a.id} (Mandant ${t.id}) nicht neu berechnet: ${(err as Error).message}`);
+      }
+    }
+  }
+  return n;
 }
 
 /** Nach Änderungen an Buchungen: betroffene Kassen ab dem frühesten Tag neu rechnen */
@@ -690,7 +811,7 @@ export async function changeCountDate(t: Tenant, a: CashAccount, count: CashCoun
   }
   await tx(async () => {
     await run('UPDATE cash_counts SET count_date = ? WHERE id = ?', date, count.id);
-    await run('UPDATE cash_entries SET entry_date = ?, updated_at = ? WHERE count_id = ?', date, nowIso(), count.id);
+    await run('UPDATE cash_entries SET entry_date = ?, updated_at = ? WHERE count_id = ? AND count_part = 0', date, nowIso(), count.id);
     await recalcCounts(t, a.id, date < count.count_date ? date : count.count_date);
   });
   return { changed: true };
@@ -793,7 +914,7 @@ export async function entriesOf(accounts: CashAccount[], from: string, to: strin
        (SELECT COALESCE(NULLIF(k.company, ''), k.name) FROM contacts k WHERE k.id = e.contact_id) contact_label,
        (SELECT rv.id FROM cash_entries rv WHERE rv.reversal_of = e.id) reversed_by
      FROM cash_entries e JOIN cash_accounts a ON a.id = e.account_id
-     WHERE e.account_id IN (${ids.map(() => '?').join(',')}) AND e.entry_date BETWEEN ? AND ? ORDER BY e.entry_date, e.id`,
+     WHERE e.account_id IN (${ids.map(() => '?').join(',')}) AND e.entry_date BETWEEN ? AND ? ORDER BY e.entry_date, e.count_part DESC, e.id`,
     ...ids, from, to,
   );
   let bal = opening;

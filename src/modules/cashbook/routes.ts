@@ -75,7 +75,7 @@ function entryTable(t: Tenant, rows: EntryRow[], opening: number, showAccount: b
           <td>${formatDate(r.entry_date)}</td>
           ${showAccount ? html`<td>${r.account_name}</td>` : ''}
           <td><a href="${href}">${r.ref_label ?? r.text}</a>${r.reversed_by ? html` <span class="tag">storniert</span>` : r.reversal_of ? html` <span class="tag">Storno</span>` : ''}
-            <div class="muted small">${r.contact_label ? `${r.contact_label} · ` : ''}${r.recurring_id ? 'Dauerauftrag' : SOURCE_LABELS[r.source]}${r.category ? ` · ${categoryLabel(r.category)}` : ''}${r.ref_label && r.text && r.text !== r.ref_label ? ` · ${r.text}` : ''}${r.receipt_ref ? ` · Beleg ${r.receipt_ref}` : ''}${r.vat_rate ? ` · inkl. ${r.vat_rate / 100} % USt.` : ''}${files.get(r.id) ? html` · <span class="has-file">${files.get(r.id)} ${files.get(r.id) === 1 ? 'Beleg' : 'Belege'}</span>` : ''}</div></td>
+            <div class="muted small">${r.contact_label ? `${r.contact_label} · ` : ''}${r.recurring_id ? 'Dauerauftrag' : SOURCE_LABELS[r.source]}${r.count_part ? ' · ermittelt' : ''}${r.category ? ` · ${categoryLabel(r.category)}` : ''}${r.ref_label && r.text && r.text !== r.ref_label ? ` · ${r.text}` : ''}${r.receipt_ref ? ` · Beleg ${r.receipt_ref}` : ''}${r.vat_rate ? ` · inkl. ${r.vat_rate / 100} % USt.` : ''}${files.get(r.id) ? html` · <span class="has-file">${files.get(r.id)} ${files.get(r.id) === 1 ? 'Beleg' : 'Belege'}</span>` : ''}</div></td>
           ${t.nonprofit ? html`<td class="small">${sphere ? SPHERES.find((s) => s.value === sphere)?.short ?? '' : '–'}</td>` : ''}
           <td class="right num">${r.amount > 0 ? formatMoney(r.amount) : ''}</td>
           <td class="right num">${r.amount < 0 ? formatMoney(-r.amount) : ''}</td>
@@ -1011,6 +1011,12 @@ function register(app: App) {
     const acc = cash.find((a) => a.id === Number(c.req.query('account') ?? 0)) ?? cash[0];
     if (!acc) throw new UserError('Es gibt noch keine Bargeldkasse.');
     const counts = await all<CashCount>('SELECT * FROM cash_counts WHERE account_id = ? ORDER BY count_date DESC, id DESC', acc.id);
+    // vor dem Zähltag ermittelte Teilbeträge je Zählung (Minus-Tage ausgeglichen)
+    const partRows = await all<{ count_id: number; n: number | string; s: number | string }>(
+      `SELECT e.count_id, COUNT(*) n, SUM(e.amount) s FROM cash_entries e JOIN cash_counts k ON k.id = e.count_id
+       WHERE k.account_id = ? AND e.count_part = 1 AND e.amount <> 0 GROUP BY e.count_id`, acc.id,
+    );
+    const partsOf = new Map(partRows.map((p) => [Number(p.count_id), { n: Number(p.n), s: Number(p.s) }]));
     // Datumsgrenzen je Zählung: zwischen den Nachbarn, nicht vor Kontoeröffnung bzw. Abschluss
     const lock = t.cashbook_locked_until ? addDays(t.cashbook_locked_until, 1) : '';
     const minOf = (i: number) => [counts[i + 1]?.count_date ?? '', acc.opening_date, lock].sort().at(-1)!;
@@ -1030,7 +1036,9 @@ function register(app: App) {
                 <td class="small">${Object.entries(den).sort((a, b) => Number(b[0]) - Number(a[0])).map(([d, n]) => `${n} × ${formatMoney(Number(d))}`).join(', ') || html`<span class="muted">nur Gesamtsumme</span>`}</td>
                 <td class="right num">${formatMoney(k.book_balance)}</td>
                 <td class="right num">${formatMoney(k.counted)}</td>
-                <td class="right">${money(k.difference)}</td>
+                <td class="right">${money(k.difference)}${partsOf.get(k.id)
+                  ? html`<div class="muted small" title="Davor lag die Kasse rechnerisch im Minus – so viel muss bis dahin schon eingenommen worden sein">davon ${formatMoney(partsOf.get(k.id)!.s)} vorher ermittelt (${partsOf.get(k.id)!.n}×)</div>`
+                  : ''}</td>
                 <td class="right">${isOpen(k)
                   ? html`<form method="post" action="/cashbook/counts/${k.id}/date" class="inline count-date"
                       data-confirm="Datum der Zählung ändern? Buchbestand und Differenz dieser und späterer Zählungen werden neu berechnet.">${csrfField(c)}

@@ -890,4 +890,17 @@ export const migrations: { version: number; statements: string[] }[] = [
       `ALTER TABLE contacts ADD COLUMN honorary_allowance TINYINT(1) NOT NULL DEFAULT 0 AFTER expense_category`,
     ],
   },
+  {
+    version: 20,
+    statements: [
+      // Zählungsdifferenz aufteilen: Rutscht die Kasse zwischen zwei Zählungen rechnerisch ins Minus
+      // (z. B. Entnahme zur Bank vor der nächsten Zählung), wird der Teil der Differenz, der bis dahin
+      // mindestens eingenommen sein muss, als „ermittelte Bareinnahme“ an diesem Tag gebucht. Eine
+      // Zählung hat dann mehrere Buchungen: die Differenzbuchung am Zähltag (count_part = 0) und
+      // ermittelte Teilbeträge davor (count_part = 1).
+      `ALTER TABLE cash_entries ADD KEY cash_entries_count_idx (count_id)`,
+      `ALTER TABLE cash_entries DROP KEY cash_entries_count`,
+      `ALTER TABLE cash_entries ADD COLUMN count_part TINYINT(1) NOT NULL DEFAULT 0 AFTER count_id`,
+    ],
+  },
 ];
