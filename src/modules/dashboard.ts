@@ -2,7 +2,7 @@ import { all, one } from '../db/index.ts';
 import { html, raw, selected } from '../lib/html.ts';
 import { barChart, compareChart, meter, pieChart, type ChartPoint, type ComparePoint, type PieSlice } from '../views/chart.ts';
 import { formatDate, MONTH_NAMES, today } from '../lib/dates.ts';
-import { formatMoney } from '../lib/money.ts';
+import { formatMoney, formatRate } from '../lib/money.ts';
 import { tenantOf } from '../lib/http.ts';
 import { getCookie, setCookie } from 'hono/cookie';
 import type { Ctx } from '../types.ts';
@@ -639,7 +639,7 @@ async function periodLines(t: Tenant, period: string, basis: Basis, sphere?: Sph
   const entryLine = (e: EntryRow): MonthLine => ({
     date: e.entry_date,
     title: e.text || SOURCE_LABELS[e.source as keyof typeof SOURCE_LABELS] || 'Buchung',
-    sub: [e.source === 'count' ? 'Kassenzählung' : 'ohne Rechnung', e.account, e.category ? categoryLabel(e.category) : '', e.receipt_ref ? `Beleg ${e.receipt_ref}` : '', e.vat_rate ? `inkl. ${e.vat_rate / 100} % USt.` : '']
+    sub: [e.source === 'count' ? 'Kassenzählung' : 'ohne Rechnung', e.account, e.category ? categoryLabel(e.category) : '', e.receipt_ref ? `Beleg ${e.receipt_ref}` : '', e.vat_rate ? `inkl. ${formatRate(e.vat_rate)} USt.` : '']
       .filter(Boolean).join(' · ') + sphereTxt(e.sp),
     href: e.source === 'count' ? `/cashbook/counts?account=${e.account_id}` : `/cashbook/entries/${e.id}/edit`,
     amount: Number(e.s),

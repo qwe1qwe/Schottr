@@ -3,6 +3,7 @@ import { all, one, run, tx, nowIso } from '../../db/index.ts';
 import { addDays, isIsoDate, today } from '../../lib/dates.ts';
 import { UserError, list, str, type Form } from '../../lib/http.ts';
 import { parseDecimal, roundDiv } from '../../lib/money.ts';
+import { isRate } from '../../lib/vat.ts';
 import { isValidEmail, isValidVatId, normalizeVatId, isCountryCode } from '../../lib/validate.ts';
 import { DEFAULT_CATEGORY, isExpenseCategory } from '../../lib/expenses.ts';
 import { discardUnreferenced, saveFile, sha256 } from '../../lib/files.ts';
@@ -281,7 +282,6 @@ export interface PurchaseInput {
   taxes: PurchaseTax[];
 }
 
-const RATES = [1900, 700, 0];
 
 /** Steuerzeile aus Netto/USt/Brutto: was fehlt, wird aus Satz und den übrigen Angaben berechnet. */
 export function taxRow(rate: number, net: number | null, tax: number | null, gross: number | null): PurchaseTax | null {
@@ -333,7 +333,7 @@ export function parsePurchaseForm(form: Form, locked: boolean): PurchaseInput {
         errors.push(`Betragszeile ${i + 1}: ungültiger Betrag.`);
         return;
       }
-      if (!RATES.includes(rate)) {
+      if (!isRate(rate)) {
         errors.push(`Betragszeile ${i + 1}: ungültiger Steuersatz.`);
         return;
       }

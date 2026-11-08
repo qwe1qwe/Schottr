@@ -4,6 +4,8 @@ import { readForm, str, redirectWith, tenantOf, idParam, notFound, type Form } f
 import { formatAmount, formatMoney, formatRate, parseDecimal } from '../lib/money.ts';
 import { UNITS, isUnit, unitShort } from '../lib/units.ts';
 import { VAT_RATES } from '../lib/calc.ts';
+import { isRate } from '../lib/vat.ts';
+import { rateList, vatOptions } from '../views/vat.ts';
 import { csrfField, page, empty } from '../views/layout.ts';
 import type { App, Ctx, Module } from '../types.ts';
 
@@ -44,7 +46,7 @@ function parseArticle(form: Form) {
   if (!v.title) errors.push('Bitte eine Bezeichnung angeben.');
   if (!isUnit(v.unit)) errors.push('Unbekannte Einheit.');
   if (v.unit_price === null) errors.push('Ungültiger Preis.');
-  if (!(VAT_RATES as readonly number[]).includes(v.vat_rate)) errors.push('Ungültiger Steuersatz.');
+  if (!isRate(v.vat_rate, false)) errors.push('Ungültiger Steuersatz.');
   return { v: { ...v, unit_price: v.unit_price ?? 0 }, errors };
 }
 
@@ -58,7 +60,7 @@ function articleForm(c: Ctx, action: string, a: Partial<Article>) {
       <label class="span-3">Beschreibung <textarea name="description" rows="3">${a.description ?? ''}</textarea></label>
       <label>Einheit <select name="unit">${UNITS.map((u) => html`<option value="${u.code}"${selected(u.code, a.unit ?? 'C62')}>${u.label}</option>`)}</select></label>
       <label>Einzelpreis netto (€) <input name="unit_price" class="num" inputmode="decimal" value="${a.unit_price !== undefined ? formatAmount(a.unit_price).replace(/\./g, '') : ''}" placeholder="0,00"></label>
-      <label>USt. <select name="vat_rate">${VAT_RATES.map((r) => html`<option value="${r}"${selected(r, a.vat_rate ?? 1900)}>${r / 100} %</option>`)}</select></label>
+      <label>USt. <select name="vat_rate" data-vat-select>${vatOptions(rateList(VAT_RATES), a.vat_rate ?? 1900)}</select></label>
     </div>
     <div class="form-actions"><button class="btn primary">Speichern</button></div>
   </form>`;

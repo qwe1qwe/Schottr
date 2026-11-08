@@ -11,7 +11,7 @@ import { formatDate, isIsoDate, today } from '../lib/dates.ts';
 import { html } from '../lib/html.ts';
 import { attachment, tenantOf, userOf } from '../lib/http.ts';
 import { orgDataLabel } from './settings.ts';
-import { formatAmount, formatMoney } from '../lib/money.ts';
+import { formatAmount, formatMoney, formatRate } from '../lib/money.ts';
 import { createZip } from '../lib/zip.ts';
 import { inboxCount } from './inbox/repo.ts';
 import { INVOICE_TYPES, dueAmount, type DocumentData } from '../einvoice/model.ts';
@@ -114,7 +114,7 @@ const num = (cents: number) => formatAmount(cents).replace(/\./g, '');
 function journalCsv(rows: ExportRow[]): string {
   const head = [
     'Rechnungsnr.', 'Art', 'Rechnungsdatum', 'Leistungsdatum', 'Kundennr.', 'Kunde', 'USt-IdNr. Kunde',
-    'Netto 19 %', 'USt 19 %', 'Netto 7 %', 'USt 7 %', 'Netto ohne USt', 'Netto gesamt', 'USt gesamt', 'Brutto',
+    'Netto 19 %', 'USt 19 %', 'Netto 7 %', 'USt 7 %', 'Netto andere Sätze', 'USt andere Sätze', 'Andere Sätze', 'Netto ohne USt', 'Netto gesamt', 'USt gesamt', 'Brutto',
     'Abgezogene Teilrechnungen', 'Zahlbetrag', 'Fällig am', 'Status', 'Bezahlt am',
   ];
   const statusLabel: Record<string, string> = { open: 'offen', paid: 'bezahlt', cancelled: 'storniert', settled: 'Storno' };
@@ -123,11 +123,14 @@ function journalCsv(rows: ExportRow[]): string {
     const sign = d.typeCode === '381' ? -1 : 1;
     const g = (rate: number) => d.taxes.find((x) => x.category === 'S' && x.rate === rate);
     const other = d.taxes.filter((x) => x.category !== 'S').reduce((s, x) => s + x.basis, 0);
+    // abweichende Sätze, z. B. 16 %/5 % im 2. Halbjahr 2020
+    const odd = d.taxes.filter((x) => x.category === 'S' && x.rate !== 1900 && x.rate !== 700);
     return [
       d.number, INVOICE_TYPES[d.typeCode] ?? d.typeCode, formatDate(d.issueDate),
       d.serviceDate ? formatDate(d.serviceDate) : d.serviceFrom ? `${formatDate(d.serviceFrom)} – ${formatDate(d.serviceTo)}` : '',
       d.buyer.customerNumber, d.buyer.name, d.buyer.vatId,
       num(sign * (g(1900)?.basis ?? 0)), num(sign * (g(1900)?.tax ?? 0)), num(sign * (g(700)?.basis ?? 0)), num(sign * (g(700)?.tax ?? 0)),
+      num(sign * odd.reduce((s, x) => s + x.basis, 0)), num(sign * odd.reduce((s, x) => s + x.tax, 0)), odd.map((x) => formatRate(x.rate)).join(', '),
       num(sign * other), num(sign * d.net), num(sign * d.tax), num(sign * d.gross),
       (d.prepayments ?? []).map((p) => p.number).join(', '), num(sign * dueAmount(d)),
       d.dueDate ? formatDate(d.dueDate) : '', statusLabel[r.status] ?? r.status, r.paid_at ? formatDate(r.paid_at) : '',
@@ -144,7 +147,7 @@ function purchaseJournalCsv(t: Tenant, rows: PurchaseRow[]): string {
   const accounts = expenseAccounts(t);
   const head = [
     'Interne Belegnr.', 'Rechnungsdatum', 'Lieferant', 'Lieferantennr.', 'USt-IdNr. Lieferant', 'Rechnungsnr.', 'Art', 'Kostenart', 'Aufwandskonto', 'Kreditor',
-    'Netto 19 %', 'Vorsteuer 19 %', 'Netto 7 %', 'Vorsteuer 7 %', 'Netto ohne USt', 'Netto gesamt', 'USt gesamt', 'Brutto', 'Währung',
+    'Netto 19 %', 'Vorsteuer 19 %', 'Netto 7 %', 'Vorsteuer 7 %', 'Netto andere Sätze', 'Vorsteuer andere Sätze', 'Andere Sätze', 'Netto ohne USt', 'Netto gesamt', 'USt gesamt', 'Brutto', 'Währung',
     'Fällig am', 'Status', 'Bezahlt am', 'Beschreibung', 'Format', 'Datei',
   ];
   const statusLabel: Record<string, string> = { open: 'offen', paid: 'bezahlt' };
@@ -152,11 +155,13 @@ function purchaseJournalCsv(t: Tenant, rows: PurchaseRow[]): string {
     const sign = r.is_credit ? -1 : 1;
     const g = (rate: number) => r.taxes.filter((x) => x.category === 'S' && x.rate === rate);
     const sum = (list: typeof r.taxes, k: 'basis' | 'tax') => list.reduce((a, x) => a + x[k], 0);
-    const other = r.taxes.filter((x) => !(x.category === 'S' && (x.rate === 1900 || x.rate === 700)));
+    const other = r.taxes.filter((x) => x.category !== 'S');
+    const odd = r.taxes.filter((x) => x.category === 'S' && x.rate !== 1900 && x.rate !== 700);
     return [
       r.internal_ref, formatDate(r.issue_date), r.supplier_name, r.supplier_number, r.supplier_vat, r.number, r.is_credit ? 'Gutschrift' : 'Rechnung',
       categoryLabel(r.category), accounts[r.category] ?? '', creditorAccount(t, r.supplier_number),
       num(sign * sum(g(1900), 'basis')), num(sign * sum(g(1900), 'tax')), num(sign * sum(g(700), 'basis')), num(sign * sum(g(700), 'tax')),
+      num(sign * sum(odd, 'basis')), num(sign * sum(odd, 'tax')), [...new Set(odd.map((x) => formatRate(x.rate)))].join(', '),
       num(sign * sum(other, 'basis')), num(sign * r.net_total), num(sign * r.tax_total), num(sign * r.gross_total), r.currency,
       r.due_date ? formatDate(r.due_date) : '', statusLabel[r.status] ?? r.status, r.paid_at ? formatDate(r.paid_at) : '',
       r.description, r.einvoice_format || (r.file_name ? 'Beleg' : 'ohne Beleg'), r.file_name ? zipPurchaseName(r) : '',

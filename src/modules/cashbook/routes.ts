@@ -1,5 +1,7 @@
 import { all, one, run, tx, nowIso } from '../../db/index.ts';
 import { clip } from '../../views/clip.ts';
+import { vatOptions } from '../../views/vat.ts';
+import { isRate } from '../../lib/vat.ts';
 import { attachFiles, fileCounts, filesFrom, filesOf, getFile, hasFiles, setFileArchived, viewEntryFile, type EntryFile } from './files.ts';
 import { handleCrop } from '../../lib/crop.ts';
 import { cropControls } from '../../views/crop.ts';
@@ -8,7 +10,7 @@ import { audit } from '../../lib/audit.ts';
 import { addDays, formatDate, isIsoDate, today } from '../../lib/dates.ts';
 import { checked, html, selected, type SafeHtml } from '../../lib/html.ts';
 import { attachment, idParam, notFound, readForm, redirectWith, requireOwner, str, tenantOf, userOf, UserError, type Form } from '../../lib/http.ts';
-import { formatAmount, formatMoney, parseDecimal } from '../../lib/money.ts';
+import { formatAmount, formatMoney, formatRate, parseDecimal } from '../../lib/money.ts';
 import { isSphere, SPHERES, sphereLabel, sphereSelect } from '../../lib/nonprofit.ts';
 import { formatIban, isValidIban, normalizeIban } from '../../lib/validate.ts';
 import { categoryLabel, isExpenseCategory } from '../../lib/expenses.ts';
@@ -100,7 +102,7 @@ function entryTable(t: Tenant, rows: EntryRow[], opening: number, showAccount: b
           <td>${formatDate(r.entry_date)}</td>
           ${showAccount ? html`<td>${r.account_name}</td>` : ''}
           <td><a href="${href}">${r.ref_label ?? r.text}</a>${files.get(r.id) ? html` ${clip(files.get(r.id)!.title, files.get(r.id)!.n)}` : ''}${r.reversed_by ? html` <span class="tag">storniert</span>` : r.reversal_of ? html` <span class="tag">Storno</span>` : ''}
-            <div class="muted small">${r.contact_label ? `${r.contact_label} · ` : ''}${r.recurring_id ? 'Dauerauftrag' : SOURCE_LABELS[r.source]}${r.count_part ? ' · ermittelt' : ''}${r.category ? ` · ${categoryLabel(r.category)}` : ''}${r.ref_label && r.text && r.text !== r.ref_label ? ` · ${r.text}` : ''}${r.receipt_ref ? ` · Beleg ${r.receipt_ref}` : ''}${r.vat_rate ? ` · inkl. ${r.vat_rate / 100} % USt.` : ''}</div></td>
+            <div class="muted small">${r.contact_label ? `${r.contact_label} · ` : ''}${r.recurring_id ? 'Dauerauftrag' : SOURCE_LABELS[r.source]}${r.count_part ? ' · ermittelt' : ''}${r.category ? ` · ${categoryLabel(r.category)}` : ''}${r.ref_label && r.text && r.text !== r.ref_label ? ` · ${r.text}` : ''}${r.receipt_ref ? ` · Beleg ${r.receipt_ref}` : ''}${r.vat_rate ? ` · inkl. ${formatRate(r.vat_rate)} USt.` : ''}</div></td>
           ${t.nonprofit ? html`<td class="small">${sphere ? SPHERES.find((s) => s.value === sphere)?.short ?? '' : '–'}</td>` : ''}
           <td class="right num">${r.amount > 0 ? formatMoney(r.amount) : ''}</td>
           <td class="right num">${r.amount < 0 ? formatMoney(-r.amount) : ''}</td>
@@ -124,7 +126,7 @@ function parseEntry(form: Form, t: Tenant): EntryInput {
     text,
     receipt_ref: str(form, 'receipt_ref', 100),
     sphere: t.nonprofit && isSphere(sphere) ? sphere : '',
-    vat_rate: t.small_business ? 0 : [0, 700, 1900].includes(vat) ? vat : 0,
+    vat_rate: t.small_business ? 0 : isRate(vat) ? vat : 0,
     category: str(form, 'direction') === 'out' && isExpenseCategory(str(form, 'category')) ? str(form, 'category') : '',
     contact_id: Number(str(form, 'contact_id')) || null,
   };
@@ -162,7 +164,7 @@ function sphereField(t: Tenant, value: string, name = 'sphere'): SafeHtml {
 function vatField(t: Tenant, value: number): SafeHtml {
   if (t.small_business) return html``;
   return html`<label>Enthaltene Umsatzsteuer
-    <select name="vat_rate">${VAT_OPTIONS.map(([v, l]) => html`<option value="${v}"${selected(v, value)}>${l}</option>`)}</select>
+    <select name="vat_rate" data-vat-select>${vatOptions(VAT_OPTIONS, value)}</select>
     <small class="muted">Einnahme: USt., die der Verein abführt (z. B. 19 % Getränkeverkauf). Ausgabe: USt. laut Rechnung oder Vertrag (Vorsteuer).</small></label>`;
 }
 
@@ -362,7 +364,7 @@ function parseRecurring(form: Form, t: Tenant, isNew: boolean) {
     receipt_ref: str(form, 'receipt_ref', 100),
     category: str(form, 'direction') !== 'in' && isExpenseCategory(str(form, 'category')) ? str(form, 'category') : '',
     sphere: t.nonprofit && isSphere(sphere) ? sphere : '',
-    vat_rate: t.small_business ? 0 : [0, 700, 1900].includes(vat) ? vat : 0,
+    vat_rate: t.small_business ? 0 : isRate(vat) ? vat : 0,
     active: isNew || str(form, 'active') === '1' ? 1 : 0,
     contact_id: Number(str(form, 'contact_id')) || null,
   };
@@ -1022,7 +1024,7 @@ function register(app: App) {
     const vat = Number(str(form, 'vat_rate') || 0);
     const { difference } = await saveCount(t, a, {
       date: str(form, 'count_date'), denominations, counted, note: str(form, 'note', 300), text: str(form, 'text', 300),
-      sphere: t.nonprofit && isSphere(sphere) ? sphere : '', vat_rate: t.small_business ? 0 : [0, 700, 1900].includes(vat) ? vat : 0,
+      sphere: t.nonprofit && isSphere(sphere) ? sphere : '', vat_rate: t.small_business ? 0 : isRate(vat) ? vat : 0,
     }, userOf(c).id);
     await audit(c, 'cashbook.count', `${a.name}: Differenz ${formatMoney(difference)}`);
     return redirectWith(c, `/cashbook?account=${a.id}`, 'ok',

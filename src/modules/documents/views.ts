@@ -3,6 +3,7 @@ import { formatDate, today } from '../../lib/dates.ts';
 import { formatAmount, formatMoney } from '../../lib/money.ts';
 import { UNITS } from '../../lib/units.ts';
 import { VAT_RATES, type TaxMode } from '../../lib/calc.ts';
+import { rateList, vatOptions } from '../../views/vat.ts';
 import { badge, csrfField } from '../../views/layout.ts';
 import { INVOICE_TYPES, SELECTABLE_TYPES } from '../../einvoice/model.ts';
 import type { Ctx } from '../../types.ts';
@@ -71,7 +72,7 @@ function itemRow(it?: DraftInput['items'][number]): SafeHtml {
     <td data-label="Menge"><input name="item_quantity[]" value="${qty}" inputmode="decimal" class="num" aria-label="Menge"></td>
     <td data-label="Einheit"><select name="item_unit[]" aria-label="Einheit">${UNITS.map((u) => html`<option value="${u.code}"${selected(u.code, it?.unit ?? 'C62')}>${u.short}</option>`)}</select></td>
     <td data-label="Einzelpreis €"><input name="item_price[]" value="${price}" inputmode="decimal" class="num" placeholder="0,00" aria-label="Einzelpreis netto"></td>
-    <td class="vat-col" data-label="USt."><select name="item_vat[]" aria-label="USt.">${VAT_RATES.map((r) => html`<option value="${r}"${selected(r, it?.vatRate ?? 1900)}>${r / 100} %</option>`)}</select></td>
+    <td class="vat-col" data-label="USt."><select name="item_vat[]" aria-label="USt." data-vat-select>${vatOptions(rateList(VAT_RATES), it?.vatRate ?? 1900)}</select></td>
     <td class="right num line-total" data-label="Gesamt €">–</td>
     <td class="remove-cell"><button type="button" class="icon remove" title="Position entfernen" aria-label="Position entfernen">×</button></td>
   </tr>`;

@@ -2,6 +2,7 @@ import type { Tenant } from '../types.ts';
 import type { DocumentData } from '../einvoice/model.ts';
 import type { TaxGroup } from './calc.ts';
 import { expenseAccounts } from './expenses.ts';
+import { datevStandardRate } from './vat.ts';
 
 /**
  * DATEV-Buchungsstapel (Format „EXTF“, Version 700, Kategorie 21).
@@ -31,11 +32,13 @@ export function revenueAccounts(t: Tenant): Record<AccountKey, string> {
   return accounts;
 }
 
-function accountFor(group: TaxGroup, taxMode: DocumentData['taxMode'], accounts: Record<AccountKey, string>): string {
+function accountFor(group: TaxGroup, taxMode: DocumentData['taxMode'], accounts: Record<AccountKey, string>, date: string): string {
   if (group.category === 'AE') return accounts.rc;
   if (group.category === 'E') return taxMode === 'small_business' ? accounts.ku : accounts.frei;
-  if (group.rate === 700) return accounts['7'];
-  if (group.rate === 1900) return accounts['19'];
+  // 16 %/5 % im 2. Halbjahr 2020: DATEV rechnet auf den Automatikkonten nach dem Belegdatum
+  const std = datevStandardRate(group.rate, date);
+  if (std === 700) return accounts['7'];
+  if (std === 1900) return accounts['19'];
   return accounts.frei;
 }
 
@@ -63,9 +66,10 @@ export function creditorAccount(t: Tenant, supplierNumber: string): string {
 }
 
 /** BU-Schlüssel für die Vorsteuer (DATEV-Standard seit 2021: 9 = 19 %, 8 = 7 %) */
-function inputTaxKey(category: string, rate: number): string {
+function inputTaxKey(category: string, rate: number, date: string): string {
   if (category !== 'S') return '';
-  return rate === 1900 ? '9' : rate === 700 ? '8' : '';
+  const std = datevStandardRate(rate, date);
+  return std === 1900 ? '9' : std === 700 ? '8' : '';
 }
 
 /** Eingangsrechnung für den Export (Daten aus purchase_invoices + Steuerzeilen) */
@@ -125,12 +129,13 @@ export function buildDatevCsv(
     const debtor = debtorAccount(t, d.buyer.customerNumber);
     const credit = d.typeCode === '381';
     for (const g of d.taxes) {
-      book(g.basis + g.tax, credit ? 'H' : 'S', debtor, accountFor(g, d.taxMode, accounts), '', d.issueDate, d.number, d.buyer.name);
+      const manual = g.category === 'S' && !datevStandardRate(g.rate, d.issueDate) ? `USt ${g.rate / 100}% manuell: ` : '';
+      book(g.basis + g.tax, credit ? 'H' : 'S', debtor, accountFor(g, d.taxMode, accounts, d.issueDate), '', d.issueDate, d.number, `${manual}${d.buyer.name}`);
     }
     // abgezogene Teilrechnungen zurückbuchen
     for (const p of prepaidSnapshots) {
       for (const g of p.taxes) {
-        book(g.basis + g.tax, 'H', debtor, accountFor(g, p.taxMode, accounts), '', d.issueDate, d.number, `Verrechnung ${p.number}`);
+        book(g.basis + g.tax, 'H', debtor, accountFor(g, p.taxMode, accounts, d.issueDate), '', d.issueDate, d.number, `Verrechnung ${p.number}`);
       }
     }
   }
@@ -140,9 +145,11 @@ export function buildDatevCsv(
     const account = expense[p.category] ?? expense.sonstiges;
     for (const g of p.taxes) {
       // Kleinunternehmer: kein Vorsteuerabzug – Bruttobetrag ohne BU-Schlüssel
-      const bu = t.small_business ? '' : inputTaxKey(g.category, g.rate);
+      const bu = t.small_business ? '' : inputTaxKey(g.category, g.rate, p.issueDate);
+      // Satz ohne DATEV-Automatik (z. B. 16 % außerhalb von 2020): im Buchungstext vermerken, Vorsteuer bitte im Steuerbüro buchen
       const note = g.category === 'AE' ? ' § 13b' : '';
-      book(g.basis + g.tax, p.isCredit ? 'S' : 'H', creditor, account, bu, p.issueDate, p.number || `ER${p.id}`, `${p.supplierName}${note}`, p.currency, p.internalRef ?? '');
+      const manual = g.category === 'S' && g.rate && !bu && !t.small_business ? `USt ${g.rate / 100}% manuell: ` : '';
+      book(g.basis + g.tax, p.isCredit ? 'S' : 'H', creditor, account, bu, p.issueDate, p.number || `ER${p.id}`, `${manual}${p.supplierName}${note}`, p.currency, p.internalRef ?? '');
     }
   }
   return toWindows1252([header, columns, ...rows].join('\r\n') + '\r\n');

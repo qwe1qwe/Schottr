@@ -7,6 +7,7 @@ import { tenantOf } from '../../lib/http.ts';
 import { unitShort } from '../../lib/units.ts';
 import { csrfField } from '../../views/layout.ts';
 import { cropControls } from '../../views/crop.ts';
+import { rateList, vatOptions } from '../../views/vat.ts';
 import { clip } from '../../views/clip.ts';
 import type { Ctx } from '../../types.ts';
 import type { Contact } from '../contacts.ts';
@@ -93,7 +94,7 @@ export function uploadCard(c: Ctx): SafeHtml {
 function taxRowHtml(t?: PurchaseTax): SafeHtml {
   const v = (n: number | undefined) => (n === undefined ? '' : formatAmount(n).replace(/\./g, ''));
   return html`<tr class="tax-row">
-    <td data-label="USt.-Satz"><select name="tax_rate[]" aria-label="Steuersatz">${[1900, 700, 0].map((r) => html`<option value="${r}"${selected(r, t?.rate ?? 1900)}>${r / 100} %</option>`)}</select></td>
+    <td data-label="USt.-Satz"><select name="tax_rate[]" aria-label="Steuersatz" data-vat-select>${vatOptions(rateList([1900, 700, 0]), t?.rate ?? 1900)}</select></td>
     <td data-label="Netto €"><input name="tax_net[]" value="${v(t?.basis)}" inputmode="decimal" class="num" placeholder="0,00" aria-label="Netto"></td>
     <td data-label="USt. €"><input name="tax_tax[]" value="${v(t?.tax)}" inputmode="decimal" class="num" placeholder="0,00" aria-label="Umsatzsteuer"></td>
     <td data-label="Brutto €"><input name="tax_gross[]" value="${t ? v(t.basis + t.tax) : ''}" inputmode="decimal" class="num" placeholder="0,00" aria-label="Brutto"></td>

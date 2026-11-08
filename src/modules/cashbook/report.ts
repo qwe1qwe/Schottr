@@ -1,6 +1,6 @@
 import { all, one } from '../../db/index.ts';
 import { formatDate } from '../../lib/dates.ts';
-import { formatAmount, formatMoney } from '../../lib/money.ts';
+import { formatAmount, formatMoney, formatRate } from '../../lib/money.ts';
 import { SPHERES, sphereLabel } from '../../lib/nonprofit.ts';
 import { categoryLabel } from '../../lib/expenses.ts';
 import { renderTablePdf, type TableSection } from '../../lib/tablepdf.ts';
@@ -59,7 +59,7 @@ export function cashbookCsv(t: Tenant, rep: AccountReport, files = new Map<numbe
   for (const r of rep.rows) {
     lines.push([
       formatDate(r.entry_date), rep.account.name, r.reversal_of ? 'Stornobuchung' : `${r.recurring_id ? 'Dauerauftrag' : SOURCE_LABELS[r.source]}${r.reversed_by ? ' (storniert)' : ''}`, entryLabel(r) + (r.ref_label && r.text ? ` – ${r.text}` : ''), r.contact_label ?? '', r.receipt_ref,
-      r.category || r.ref_category ? categoryLabel(r.category || r.ref_category!) : '', sphereText(t, r), r.vat_rate ? `${r.vat_rate / 100} %` : '', r.vat_rate ? num(vatOf(Math.abs(r.amount), r.vat_rate)) : '',
+      r.category || r.ref_category ? categoryLabel(r.category || r.ref_category!) : '', sphereText(t, r), r.vat_rate ? `${formatRate(r.vat_rate)}` : '', r.vat_rate ? num(vatOf(Math.abs(r.amount), r.vat_rate)) : '',
       r.amount > 0 ? num(r.amount) : '', r.amount < 0 ? num(-r.amount) : '', num(r.balance), (files.get(r.id) ?? []).join(', '),
     ]);
   }
@@ -80,7 +80,7 @@ export function cashbookPdf(t: Tenant, rep: AccountReport, from: string, to: str
         muted: isVoided(r),
         cells: [
           formatDate(r.entry_date),
-          `${r.reversed_by ? '[storniert] ' : ''}${entryLabel(r)}${r.ref_label && r.text ? ` – ${r.text}` : ''} (${r.reversal_of ? 'Stornobuchung' : r.recurring_id ? 'Dauerauftrag' : SOURCE_LABELS[r.source]}${r.category || r.ref_category ? `, ${categoryLabel(r.category || r.ref_category!)}` : ''}${r.vat_rate ? `, inkl. ${r.vat_rate / 100} % USt.` : ''})`,
+          `${r.reversed_by ? '[storniert] ' : ''}${entryLabel(r)}${r.ref_label && r.text ? ` – ${r.text}` : ''} (${r.reversal_of ? 'Stornobuchung' : r.recurring_id ? 'Dauerauftrag' : SOURCE_LABELS[r.source]}${r.category || r.ref_category ? `, ${categoryLabel(r.category || r.ref_category!)}` : ''}${r.vat_rate ? `, inkl. ${formatRate(r.vat_rate)} USt.` : ''})`,
           r.receipt_ref, ...(t.nonprofit ? [SPHERES.find((s) => s.value === entrySphere(r, t.default_sphere))?.short ?? ''] : []),
           r.amount > 0 ? formatMoney(r.amount) : '', r.amount < 0 ? formatMoney(-r.amount) : '', formatMoney(r.balance),
         ],

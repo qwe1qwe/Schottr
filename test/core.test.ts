@@ -5,6 +5,7 @@ import { parseDecimal, centsToDecimal, milliToDecimal, bpToDecimal } from '../sr
 import { formatNumber, periodFor } from '../src/lib/numbering.ts';
 import { isValidIban, isValidVatId } from '../src/lib/validate.ts';
 import { addDays } from '../src/lib/dates.ts';
+import { datevStandardRate, isRate, rateFrom } from '../src/lib/vat.ts';
 
 test('Dezimalzahlen deutsch und englisch', () => {
   assert.equal(parseDecimal('1.234,56', 2), 123456);
@@ -88,4 +89,17 @@ test('Zuwendungsbestätigung: Bescheid-Gültigkeit nach § 63 Abs. 5 AO', async 
     notice: { type: 'exemption', taxOffice: 'München', taxNumber: '143/123/45678', date: '2024-05-14', period: '2021 bis 2023' },
   });
   assert.match(text, /^Wir sind wegen Förderung des Sports nach dem Freistellungsbescheid bzw\. nach der Anlage zum Körperschaftsteuerbescheid des Finanzamtes München StNr\. 143\/123\/45678 vom 14\.05\.2024 für den letzten Veranlagungszeitraum 2021 bis 2023 nach § 5 Abs\. 1 Nr\. 9/);
+});
+
+test('Eigene USt.-Sätze (z. B. 16 % im 2. Halbjahr 2020)', () => {
+  assert.equal(rateFrom('1600'), 1600);
+  assert.equal(rateFrom('custom'), null);
+  assert.equal(rateFrom('0', false), null);
+  assert.ok(isRate(550) && !isRate(10001) && !isRate(16.5));
+  assert.equal(datevStandardRate(1600, '2020-09-15'), 1900);
+  assert.equal(datevStandardRate(500, '2020-12-31'), 700);
+  assert.equal(datevStandardRate(1600, '2021-01-01'), null);
+  assert.equal(datevStandardRate(1900, '2020-09-15'), 1900);
+  const totals = calculate([{ title: 'x', description: '', quantity: 1000, unit: 'C62', unitPrice: 10000, vatRate: 1600 }], 'standard');
+  assert.equal(totals.tax, 1600);
 });

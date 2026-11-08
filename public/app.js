@@ -2,6 +2,43 @@
 (() => {
   'use strict';
 
+  /* ---------- USt.-Satz: „Anderer Satz …“ fragt nach dem Prozentwert (z. B. 16 % für 2020) ---------- */
+  const rateLabel = (bp) => `${new Intl.NumberFormat('de-DE', { maximumFractionDigits: 2 }).format(bp / 100)} %`;
+  /** Option für einen Satz (Basispunkte) anlegen, falls es sie noch nicht gibt, und auswählen */
+  const ensureVatOption = (select, bp) => {
+    const value = String(bp);
+    if (![...select.options].some((o) => o.value === value)) {
+      const opt = new Option(rateLabel(bp), value);
+      select.insertBefore(opt, select.querySelector('option[value="custom"]'));
+    }
+    select.value = value;
+    select.dataset.prev = value;
+  };
+  window.schottrEnsureVat = ensureVatOption;
+  document.addEventListener('focusin', (e) => {
+    const el = e.target;
+    if (el instanceof HTMLSelectElement && el.matches('[data-vat-select]')) el.dataset.prev = el.value;
+  });
+  // in der Capture-Phase, damit Summen-Berechnungen schon den neuen Satz sehen
+  document.addEventListener('change', (e) => {
+    const el = e.target;
+    if (!(el instanceof HTMLSelectElement) || !el.matches('[data-vat-select]')) return;
+    if (el.value !== 'custom') {
+      el.dataset.prev = el.value;
+      return;
+    }
+    const prev = el.dataset.prev && el.dataset.prev !== 'custom' ? el.dataset.prev : el.options[0].value;
+    const input = window.prompt('USt.-Satz in Prozent (z. B. 16 für die Senkung im 2. Halbjahr 2020):', '');
+    const n = input === null ? NaN : Number(input.trim().replace('%', '').replace(',', '.'));
+    const bp = Math.round(n * 100);
+    if (!Number.isFinite(n) || bp < 0 || bp > 10000 || Math.abs(n * 100 - bp) > 1e-6) {
+      if (input !== null && input.trim()) window.alert('Bitte einen Satz zwischen 0 und 100 mit höchstens zwei Nachkommastellen eingeben.');
+      el.value = prev;
+      return;
+    }
+    ensureVatOption(el, bp);
+  }, true);
+
   // Formulare mit Rückfrage
   document.addEventListener('submit', (e) => {
     const form = e.target;
@@ -741,7 +778,9 @@
         continue;
       }
       const i = (seen[name] = (seen[name] ?? -1) + 1);
-      if (els[i]) els[i].value = value;
+      // eigener USt.-Satz (z. B. 16 %) fehlt in neu angelegten Zeilen als Option
+      if (els[i] instanceof HTMLSelectElement && els[i].matches('[data-vat-select]') && /^\d+$/.test(value)) ensureVatOption(els[i], Number(value));
+      else if (els[i]) els[i].value = value;
     }
     // Artikelnummer-Kennzeichen der Positionen nachziehen
     target.querySelectorAll('tr.item').forEach((row) => {
@@ -1078,7 +1117,7 @@
       autogrow(desc);
       row.querySelector('[name="item_unit[]"]').value = a.unit;
       row.querySelector('[name="item_price[]"]').value = a.price;
-      row.querySelector('[name="item_vat[]"]').value = String(a.vat);
+      ensureVatOption(row.querySelector('[name="item_vat[]"]'), Number(a.vat));
       recalc();
       const qty = row.querySelector('[name="item_quantity[]"]');
       qty.focus();

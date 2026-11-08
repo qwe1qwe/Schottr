@@ -1,5 +1,6 @@
 import { all, one, run, tx, nowIso } from '../../db/index.ts';
-import { calculate, type ItemInput, type TaxMode, VAT_RATES } from '../../lib/calc.ts';
+import { calculate, type ItemInput, type TaxMode } from '../../lib/calc.ts';
+import { isRate } from '../../lib/vat.ts';
 import { addDays, isIsoDate, today } from '../../lib/dates.ts';
 import { UserError, list, str, type Form } from '../../lib/http.ts';
 import { parseDecimal } from '../../lib/money.ts';
@@ -241,7 +242,7 @@ export async function parseDraft(form: Form, kind: Kind, tenantId: number): Prom
     if (quantity === null || quantity === 0 || Math.abs(quantity) > 1e12) errors.push(`Position ${n}: ungültige Menge.`);
     if (unitPrice === null || Math.abs(unitPrice) > 1e12) errors.push(`Position ${n}: ungültiger Preis.`);
     if (!isUnit(unit)) errors.push(`Position ${n}: unbekannte Einheit.`);
-    if (!(VAT_RATES as readonly number[]).includes(vatRate)) errors.push(`Position ${n}: ungültiger Steuersatz.`);
+    if (!isRate(vatRate, false)) errors.push(`Position ${n}: ungültiger Steuersatz.`);
     const articleNumber = (articleNumbers[i] ?? '').trim().slice(0, 40) || undefined;
     d.items.push({ title, description, quantity: quantity ?? 0, unit, unitPrice: unitPrice ?? 0, vatRate, articleNumber });
   });
