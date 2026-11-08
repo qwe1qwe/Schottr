@@ -1487,9 +1487,24 @@ test('Kassenbuch: Konten, Zuordnung, Umbuchung, Kassenzählung, Abschluss, Steue
   assert.equal(withFile.file_mime, 'image/jpeg');
   assert.equal((await req(`/purchases/${pidNoFile}/file`)).status, 200);
   assert.equal((await inboxRows()).length, 0);
-  // Rechnung mit Datei wird nicht mehr angeboten
+  // Rechnung mit Datei wird weiter angeboten – ein weiterer Beleg (z. B. zweite Seite) kommt dazu
   page = await (await req('/capture')).text();
-  assert.doesNotMatch(page, new RegExp(`value="p:${pidNoFile}"`));
+  assert.match(page, new RegExp(`<option value="p:${pidNoFile}">[^<]*📎 1`));
+  r = await multipart('/capture', { target: 'existing', existing: `p:${pidNoFile}`, internal_ref: 'ER-77' }, [{ name: 'seite2.jpg', data: Buffer.concat([jpeg, Buffer.from('seite2')]), type: 'image/jpeg' }]);
+  assert.equal(location(r), `/purchases/${pidNoFile}`);
+  assert.match(flashOf(r), /weiterer Beleg/);
+  const extra = await all('SELECT * FROM purchase_files WHERE purchase_id = ?', pidNoFile);
+  assert.equal(extra.length, 1);
+  assert.equal((await one('SELECT file_path FROM purchase_invoices WHERE id = ?', pidNoFile))!.file_path, withFile.file_path, 'Rechnungsdatei unverändert');
+  assert.equal((await one('SELECT internal_ref FROM purchase_invoices WHERE id = ?', pidNoFile))!.internal_ref, 'ER-77', 'Belegnummer übernommen');
+  assert.equal((await req(`/purchases/files/${extra[0].id}`)).status, 200);
+  assert.match(await (await req(`/purchases/${pidNoFile}`)).text(), /Weitere Belege/);
+  assert.equal((await inboxRows()).length, 0);
+  // weitere Belege sind aufbewahrungspflichtig – nur archivieren
+  await assert.rejects(run('DELETE FROM purchase_files WHERE id = ?', extra[0].id), /aufbewahrungspflichtig/);
+  r = await req(`/purchases/files/${extra[0].id}/archive`, { form: {} });
+  assert.ok((await one('SELECT archived_at FROM purchase_files WHERE id = ?', extra[0].id))!.archived_at);
+  await req(`/purchases/files/${extra[0].id}/archive`, { form: {} });
 
   // Einnahmen haben keine Kostenart – auch wenn eine mitgeschickt wird
   r = await req('/cashbook/entries', { form: { account_id: String(kasse), entry_date: today, direction: 'in', amount: '5', text: 'Kuchenverkauf', category: 'verband', vat_rate: '0' } });
