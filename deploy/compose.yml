@@ -5,7 +5,7 @@
 #
 services:
   db:
-    image: mariadb:11.4
+    image: mariadb:11.8
     container_name: schottr-db
     restart: unless-stopped
     environment:

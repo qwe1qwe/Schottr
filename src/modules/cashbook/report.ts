@@ -54,7 +54,7 @@ export async function accountReports(t: Tenant, from: string, to: string): Promi
 }
 
 export function cashbookCsv(t: Tenant, rep: AccountReport, files = new Map<number, string[]>()): string {
-  const head = ['Datum', 'Konto', 'Art', 'Buchungstext', 'Adresse', 'Beleg', 'Kostenart', 'Bereich', 'USt-Satz', 'darin USt', 'Einnahme', 'Ausgabe', 'Saldo', 'Belegdateien'];
+  const head = ['Datum', 'Konto', 'Art', 'Buchungstext', 'Adresse', 'Belegnr.', 'Kostenart', 'Bereich', 'USt-Satz', 'darin USt', 'Einnahme', 'Ausgabe', 'Saldo', 'Belegdateien'];
   const lines: (string | number)[][] = [['', rep.account.name, '', 'Anfangsbestand', '', '', '', '', '', '', '', '', num(rep.opening), '']];
   for (const r of rep.rows) {
     lines.push([
@@ -70,7 +70,7 @@ export function cashbookCsv(t: Tenant, rep: AccountReport, files = new Map<numbe
 export function cashbookPdf(t: Tenant, rep: AccountReport, from: string, to: string): Promise<Buffer> {
   const sections: TableSection[] = [{
     columns: [
-      { label: 'Datum', width: 11 }, { label: 'Buchungstext', width: 44 }, { label: 'Beleg', width: 10 },
+      { label: 'Datum', width: 11 }, { label: 'Buchungstext', width: 44 }, { label: 'Belegnr.', width: 10 },
       ...(t.nonprofit ? [{ label: 'Bereich', width: 15 }] : []),
       { label: 'Einnahme', width: 12, right: true }, { label: 'Ausgabe', width: 12, right: true }, { label: 'Saldo', width: 13, right: true },
     ],

@@ -1,4 +1,5 @@
 import { all, one, run, tx, nowIso } from '../../db/index.ts';
+import { clip } from '../../views/clip.ts';
 import { attachFiles, fileCounts, filesFrom, filesOf, getFile, hasFiles, setFileArchived, viewEntryFile, type EntryFile } from './files.ts';
 import { handleCrop } from '../../lib/crop.ts';
 import { cropControls } from '../../views/crop.ts';
@@ -60,7 +61,31 @@ function rangeOf(year: number) {
   return { year, from: `${year}-01-01`, to: `${year}-12-31`, chartFrom: `${year}-01-01`, chartTo: `${year}-12-31` };
 }
 
-function entryTable(t: Tenant, rows: EntryRow[], opening: number, showAccount: boolean, files = new Map<number, number>()): SafeHtml {
+/**
+ * Anlagen je Buchung: eigene Belege plus – bei verknüpften Buchungen – die Datei der
+ * Eingangsrechnung bzw. das PDF der (festgeschriebenen) Ausgangsrechnung.
+ */
+async function attachmentsOf(rows: EntryRow[]): Promise<Map<number, { n: number; title: string }>> {
+  const own = await fileCounts(rows.map((x) => x.id));
+  const purchaseIds = [...new Set(rows.map((r) => r.purchase_id).filter((x): x is number => !!x))];
+  const withFile = new Set(purchaseIds.length
+    ? (await all<{ id: number }>(
+        `SELECT id FROM purchase_invoices WHERE file_path <> '' AND id IN (${purchaseIds.map(() => '?').join(',')})`, ...purchaseIds,
+      )).map((x) => x.id)
+    : []);
+  const out = new Map<number, { n: number; title: string }>();
+  for (const r of rows) {
+    const n = own.get(r.id) ?? 0;
+    const parts = n ? [`${n} ${n === 1 ? 'Beleg' : 'Belege'}`] : [];
+    if (r.purchase_id && withFile.has(r.purchase_id)) parts.push('Beleg der Eingangsrechnung');
+    if (r.document_id) parts.push('Rechnungs-PDF');
+    const total = n + (r.purchase_id && withFile.has(r.purchase_id) ? 1 : 0) + (r.document_id ? 1 : 0);
+    if (total) out.set(r.id, { n: total, title: parts.join(' + ') });
+  }
+  return out;
+}
+
+function entryTable(t: Tenant, rows: EntryRow[], opening: number, showAccount: boolean, files = new Map<number, { n: number; title: string }>()): SafeHtml {
   return html`<div class="card flush"><table class="table cash-table">
     <thead><tr><th>Datum</th>${showAccount ? html`<th>Konto</th>` : ''}<th>Buchung</th>${t.nonprofit ? html`<th>Bereich</th>` : ''}
       <th class="right">Einnahme</th><th class="right">Ausgabe</th><th class="right">Saldo</th></tr></thead>
@@ -74,8 +99,8 @@ function entryTable(t: Tenant, rows: EntryRow[], opening: number, showAccount: b
         return html`<tr class="rowlink${voided ? ' voided' : ''}" data-href="${href}">
           <td>${formatDate(r.entry_date)}</td>
           ${showAccount ? html`<td>${r.account_name}</td>` : ''}
-          <td><a href="${href}">${r.ref_label ?? r.text}</a>${r.reversed_by ? html` <span class="tag">storniert</span>` : r.reversal_of ? html` <span class="tag">Storno</span>` : ''}
-            <div class="muted small">${r.contact_label ? `${r.contact_label} · ` : ''}${r.recurring_id ? 'Dauerauftrag' : SOURCE_LABELS[r.source]}${r.count_part ? ' · ermittelt' : ''}${r.category ? ` · ${categoryLabel(r.category)}` : ''}${r.ref_label && r.text && r.text !== r.ref_label ? ` · ${r.text}` : ''}${r.receipt_ref ? ` · Beleg ${r.receipt_ref}` : ''}${r.vat_rate ? ` · inkl. ${r.vat_rate / 100} % USt.` : ''}${files.get(r.id) ? html` · <span class="has-file">${files.get(r.id)} ${files.get(r.id) === 1 ? 'Beleg' : 'Belege'}</span>` : ''}</div></td>
+          <td><a href="${href}">${r.ref_label ?? r.text}</a>${files.get(r.id) ? html` ${clip(files.get(r.id)!.title, files.get(r.id)!.n)}` : ''}${r.reversed_by ? html` <span class="tag">storniert</span>` : r.reversal_of ? html` <span class="tag">Storno</span>` : ''}
+            <div class="muted small">${r.contact_label ? `${r.contact_label} · ` : ''}${r.recurring_id ? 'Dauerauftrag' : SOURCE_LABELS[r.source]}${r.count_part ? ' · ermittelt' : ''}${r.category ? ` · ${categoryLabel(r.category)}` : ''}${r.ref_label && r.text && r.text !== r.ref_label ? ` · ${r.text}` : ''}${r.receipt_ref ? ` · Beleg ${r.receipt_ref}` : ''}${r.vat_rate ? ` · inkl. ${r.vat_rate / 100} % USt.` : ''}</div></td>
           ${t.nonprofit ? html`<td class="small">${sphere ? SPHERES.find((s) => s.value === sphere)?.short ?? '' : '–'}</td>` : ''}
           <td class="right num">${r.amount > 0 ? formatMoney(r.amount) : ''}</td>
           <td class="right num">${r.amount < 0 ? formatMoney(-r.amount) : ''}</td>
@@ -246,7 +271,7 @@ function entryForm(c: Ctx, t: Tenant, accounts: CashAccount[], action: string, e
       <label>Konto ${accountSelect(accounts, e.account_id)}</label>
       <label>Datum <input type="date" name="entry_date" value="${e.entry_date ?? today()}" required></label>
       <label>Betrag (€) <input name="amount" class="num" inputmode="decimal" required value="${e.amount ? formatAmount(Math.abs(e.amount)).replace(/\./g, '') : ''}" placeholder="0,00"></label>
-      <label>Beleg-Nr. (optional) <input name="receipt_ref" maxlength="100" value="${e.receipt_ref ?? ''}" placeholder="z. B. Quittung 12"></label>
+      <label>Interne Belegnr. (optional) <input name="receipt_ref" maxlength="100" class="mono" autocomplete="off" value="${e.receipt_ref ?? ''}" placeholder="z. B. K-2026-012"></label>
       ${contactField(contacts, e.contact_id)}
       <label class="span-2">Buchungstext <input name="text" maxlength="300" required value="${e.text ?? ''}" placeholder="z. B. Getränkeverkauf Sommerfest, Porto, Kontoführungsgebühr"></label>
       ${categoryField(c, e.category ?? '')}
@@ -433,7 +458,7 @@ function register(app: App) {
         <span class="muted small">Einnahmen ${formatMoney(income)} · Ausgaben ${formatMoney(spend)} · Endbestand ${formatMoney(closing)}</span>
         <noscript><button class="btn">OK</button></noscript>
       </form>
-      ${rows.length ? entryTable(t, rows, opening, !selectedAcc && list.length > 1, await fileCounts(rows.map((x) => x.id))) : empty(`Keine Buchungen in ${r.year}.`)}`,
+      ${rows.length ? entryTable(t, rows, opening, !selectedAcc && list.length > 1, await attachmentsOf(rows)) : empty(`Keine Buchungen in ${r.year}.`)}`,
     });
   });
 
@@ -696,7 +721,7 @@ function register(app: App) {
     // ?contact= (z. B. von der Adresse aus) wählt die Adresse vor
     const contactId = Number(c.req.query('contact') ?? 0) || null;
     const form = entryForm(c, t, accounts, '/cashbook/entries', {
-      account_id: Number(c.req.query('account') ?? 0) || accounts[0].id, text: chosen?.note || undefined, contact_id: contactId,
+      account_id: Number(c.req.query('account') ?? 0) || accounts[0].id, text: chosen?.note || undefined, receipt_ref: chosen?.internal_ref || undefined, contact_id: contactId,
     }, await entryContactOptions(t.id, contactId), inbox, chosen?.id);
     return page(c, {
       title: 'Buchung erfassen',

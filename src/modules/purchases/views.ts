@@ -7,6 +7,7 @@ import { tenantOf } from '../../lib/http.ts';
 import { unitShort } from '../../lib/units.ts';
 import { csrfField } from '../../views/layout.ts';
 import { cropControls } from '../../views/crop.ts';
+import { clip } from '../../views/clip.ts';
 import type { Ctx } from '../../types.ts';
 import type { Contact } from '../contacts.ts';
 import { dueOf, payable, type EInvoiceInfo, type Purchase, type PurchaseInput, type PurchaseTax } from './repo.ts';
@@ -41,15 +42,18 @@ export function purchaseTitle(p: Pick<Purchase, 'number' | 'status' | 'file_name
 }
 
 export function purchaseTable(rows: any[], showSupplier = true): SafeHtml {
+  // Spalte „Belegnr.“ nur, wenn überhaupt interne Belegnummern vergeben sind
+  const refs = rows.some((p) => p.internal_ref);
   return html`<div class="card flush"><table class="table">
     <thead><tr>
-      <th>Rechnungsnr.</th><th>Datum</th>${showSupplier ? html`<th>Lieferant</th>` : ''}<th>Beschreibung</th><th>Kostenart</th>
+      ${refs ? html`<th>Belegnr.</th>` : ''}<th>Rechnungsnr.</th><th>Datum</th>${showSupplier ? html`<th>Lieferant</th>` : ''}<th>Beschreibung</th><th>Kostenart</th>
       <th>Status</th><th>Fällig</th><th class="right">Brutto</th>
     </tr></thead>
     <tbody>${rows.map((p) => {
       const st = purchaseStatus(p);
       return html`<tr class="rowlink" data-href="/purchases/${p.id}">
-        <td><a href="/purchases/${p.id}" class="${p.number ? 'mono' : ''}">${purchaseTitle(p)}</a>
+        ${refs ? html`<td class="mono">${p.internal_ref || html`<span class="muted">–</span>`}</td>` : ''}
+        <td><a href="/purchases/${p.id}" class="${p.number ? 'mono' : ''}">${purchaseTitle(p)}</a>${p.file_path ? html` ${clip(p.einvoice_format ? `E-Rechnung: ${p.file_name}` : p.file_name || 'Beleg')}` : ''}
           ${p.is_credit ? html` <span class="tag">Gutschrift</span>` : ''}${p.einvoice_format ? html` <span class="tag info" title="${p.einvoice_format}">E-Rechnung</span>` : ''}</td>
         <td>${formatDate(p.issue_date)}</td>
         ${showSupplier ? html`<td>${p.contact_label ?? html`<span class="muted">–</span>`}</td>` : ''}
@@ -117,6 +121,12 @@ export function purchaseForm(
     accounts?: { id: number; name: string; kind: string }[]; paidAccountId?: number | null;
     /** zusätzliche Felder/Hinweise oben im Formular (z. B. „aus Buchung anlegen“) */
     extra?: SafeHtml;
+    /** zuletzt vergebene interne Belegnummer (Hinweis beim Eintragen) */
+    lastRef?: string;
+    /** Kostenart und Bereich der letzten Rechnung je Lieferant (Vorbelegung bei Auswahl) */
+    lastBySupplier?: Map<number, { category: string; sphere: string }>;
+    /** beim Bearbeiten: eigene ID (für die Prüfung auf doppelte Rechnungsnummern) */
+    purchaseId?: number;
   } = {},
 ): SafeHtml {
   const locked = opts.locked;
@@ -128,17 +138,24 @@ export function purchaseForm(
             <label class="span-2">Lieferant
               <select name="contact_id" data-supplier>
                 <option value="">– neuer Lieferant –</option>
-                ${suppliers.map((s) => html`<option value="${s.id}" data-category="${s.expense_category}"${selected(s.id, d.contact_id)}>${s.company || s.name}${s.city ? ` (${s.city})` : ''}</option>`)}
+                ${suppliers.map((s) => {
+                  const last = opts.lastBySupplier?.get(s.id);
+                  const sphere = opts.defaultSphere && last ? last.sphere || opts.defaultSphere : '';
+                  return html`<option value="${s.id}" data-category="${last?.category || s.expense_category}" data-sphere="${sphere}"${selected(s.id, d.contact_id)}>${s.company || s.name}${s.city ? ` (${s.city})` : ''}</option>`;
+                })}
               </select>
             </label>
             <label class="span-2" data-new-supplier>Name des neuen Lieferanten
               <input name="new_supplier" value="${d.new_supplier}" maxlength="200" placeholder="z. B. Bürobedarf Meier GmbH">
               <small class="muted">Wird als Lieferant angelegt; Anschrift usw. kannst du später unter Adressen ergänzen.</small>
             </label>
-            <label>Rechnungsnummer <input name="number" value="${d.number}" maxlength="100"></label>
+            <label>Rechnungsnummer <input name="number" value="${d.number}" maxlength="100" autocomplete="off" data-number-check>
+              <small class="field-warning" data-number-warning hidden></small></label>
             <label>Rechnungsdatum <input type="date" name="issue_date" value="${d.issue_date ?? ''}" required></label>
           </div>`}
       <div class="grid-2 ${locked ? '' : 'spaced-top'}">
+        <label>Interne Belegnr. <input name="internal_ref" value="${d.internal_ref}" maxlength="50" class="mono" autocomplete="off" placeholder="optional, z. B. ER-2026-001">
+          <small class="muted">${opts.lastRef && opts.lastRef !== d.internal_ref ? html`zuletzt vergeben: <span class="mono">${opts.lastRef}</span>` : 'deine eigene Nummer für die Ablage'}</small></label>
         <label>Kostenart
           <select name="category" data-category>${categoryOptions(c, d.category)}</select>
         </label>
@@ -182,7 +199,7 @@ export function purchaseForm(
         </section>`}
     <div class="form-actions sticky"><button class="btn primary">Speichern</button></div>`;
 
-  return html`<form method="post" action="${action}" class="purchase-form${opts.preview ? ' with-preview' : ''}" data-purchase-form
+  return html`<form method="post" action="${action}" class="purchase-form${opts.preview ? ' with-preview' : ''}" data-purchase-form data-purchase-id="${opts.purchaseId ?? 0}"
     ${opts.extra ? '' : html`data-count-check data-count-accounts="paid_account_id" data-count-date="paid_at"`}>
     ${csrfField(c)}${opts.extra ?? ''}
     <div class="purchase-fields">${fields}</div>

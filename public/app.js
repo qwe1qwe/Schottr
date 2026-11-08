@@ -824,14 +824,74 @@
     const newSupplier = pform.querySelector('[data-new-supplier]');
     // select[...] – die Lieferanten-Optionen tragen selbst ein data-category-Attribut
     const category = pform.querySelector('select[data-category]');
+    // Bereich (Vereine) wie bei der letzten Rechnung dieses Lieferanten
+    const sphere = pform.querySelector('select[data-sphere-select]');
+    const numberInput = pform.querySelector('[data-number-check]');
+    let checkNumber = () => {};
     if (supplier && newSupplier) {
       const sync = (fromUser) => {
         newSupplier.hidden = !!supplier.value;
-        const cat = supplier.selectedOptions[0]?.dataset.category;
+        const opt = supplier.selectedOptions[0];
+        const cat = opt?.dataset.category;
         if (fromUser && cat && category) category.value = cat;
+        const sph = opt?.dataset.sphere;
+        if (fromUser && sph && sphere && [...sphere.options].some((o) => o.value === sph)) {
+          sphere.value = sph;
+          sphere.dispatchEvent(new Event('change', { bubbles: true }));
+        }
       };
-      supplier.addEventListener('change', () => sync(true));
+      supplier.addEventListener('change', () => {
+        sync(true);
+        checkNumber();
+      });
       sync(false);
+    }
+
+    // Rechnungsnummer schon erfasst? Beim Eintippen warnen (beim selben Lieferanten wird das Speichern abgewiesen)
+    const numberWarning = pform.querySelector('[data-number-warning]');
+    if (numberInput && numberWarning) {
+      let timer = 0;
+      let seq = 0;
+      checkNumber = () => {
+        clearTimeout(timer);
+        timer = setTimeout(async () => {
+          const value = numberInput.value.trim();
+          const mine = ++seq;
+          if (!value) {
+            numberWarning.hidden = true;
+            return;
+          }
+          const qs = new URLSearchParams({ number: value, contact: supplier?.value || '', id: pform.dataset.purchaseId || '0' });
+          try {
+            const res = await fetch(`/purchases/number-check?${qs}`, { credentials: 'same-origin', headers: { accept: 'application/json' } });
+            if (!res.ok || mine !== seq) return;
+            const { matches } = await res.json();
+            if (mine !== seq) return;
+            if (!matches?.length) {
+              numberWarning.hidden = true;
+              return;
+            }
+            const same = matches.filter((m) => m.sameSupplier);
+            const label = (m) => `${m.supplier || 'ohne Lieferant'}${m.date ? ` vom ${m.date}` : ''}`;
+            numberWarning.replaceChildren();
+            numberWarning.classList.toggle('danger', same.length > 0);
+            numberWarning.append(same.length
+              ? `⚠ Diese Rechnungsnummer ist für diesen Lieferanten schon erfasst (${label(same[0])}) – sie lässt sich nicht doppelt speichern. `
+              : `⚠ Die Rechnungsnummer gibt es schon bei ${matches.map(label).join(', ')}. `);
+            const link = document.createElement('a');
+            link.href = `/purchases/${(same[0] || matches[0]).id}`;
+            link.target = '_blank';
+            link.rel = 'noopener';
+            link.textContent = 'Ansehen';
+            numberWarning.append(link);
+            numberWarning.hidden = false;
+          } catch {
+            /* Prüfung ist nur ein Hinweis */
+          }
+        }, 350);
+      };
+      numberInput.addEventListener('input', checkNumber);
+      if (numberInput.value.trim()) checkNumber();
     }
 
     // Kassenbuch: Konto nur zeigen und verlangen, wenn „Bezahlt am“ gesetzt ist

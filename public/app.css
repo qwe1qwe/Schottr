@@ -277,6 +277,9 @@ input.num { text-align: right; }
 .notice { background: var(--warn-soft); border: 1px solid var(--warn-line); border-radius: 8px; padding: .75rem 1rem; margin-bottom: 1rem; }
 .notice ul { margin: .4rem 0; padding-left: 1.2rem; }
 .notice.soft { background: var(--surface-2); border-color: var(--line); }
+.field-warning { display: block; margin-top: .3rem; padding: .35rem .55rem; background: var(--warn-soft); border: 1px solid var(--warn-line); border-radius: 6px; font-size: .85rem; }
+.field-warning.danger { background: var(--danger-soft); border-color: var(--danger); }
+.field-warning[hidden] { display: none; }
 .year-select { width: auto; }
 .entry-files { display: flex; flex-direction: column; gap: .4rem; }
 .field-label { font-size: .88rem; color: var(--muted); }
@@ -347,6 +350,8 @@ input.num { text-align: right; }
 .chart-tabs { margin-bottom: 1rem; }
 .pdf-badge { display: grid; place-items: center; height: 8rem; border-radius: 6px; background: var(--surface-2); color: var(--danger); font-weight: 700; letter-spacing: .05em; }
 .has-file { color: var(--accent); font-weight: 600; }
+.clip { font-size: .85em; white-space: nowrap; cursor: help; opacity: .8; }
+.clip-n { font-size: .8em; margin-left: .05rem; color: var(--muted); }
 .sphere-field .sphere-hint { display: block; line-height: 1.4; }
 .sphere-help { margin-top: .2rem; font-weight: 400; color: var(--muted); }
 .sphere-help summary { cursor: pointer; color: var(--accent); width: fit-content; }
@@ -376,6 +381,7 @@ input.num { text-align: right; }
 .row-card p { margin: .25rem 0 0; }
 .inline-form { display: flex; gap: .5rem; flex-wrap: wrap; align-items: center; }
 .inline-form input { width: auto; flex: 1 1 14rem; }
+.inline-form input.ref-input { flex: 0 1 11rem; min-width: 8rem; }
 .empty { text-align: center; padding: 3rem 1rem; border: 1px dashed var(--line-strong); border-radius: var(--radius); color: var(--muted); }
 
 /* ---------- Werkzeugleiste, Tabs ---------- */

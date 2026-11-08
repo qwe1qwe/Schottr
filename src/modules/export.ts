@@ -60,6 +60,7 @@ async function invoicesIn(t: Tenant, from: string, to: string): Promise<ExportRo
 interface PurchaseRow {
   id: number;
   number: string;
+  internal_ref: string;
   issue_date: string;
   due_date: string | null;
   status: string;
@@ -86,7 +87,7 @@ interface PurchaseRow {
 
 async function purchasesIn(t: Tenant, from: string, to: string): Promise<PurchaseRow[]> {
   const rows = await all<Omit<PurchaseRow, 'taxes'>>(
-    `SELECT p.id, p.number, p.issue_date, p.due_date, p.status, p.paid_at, p.is_credit, p.category, p.currency, p.description,
+    `SELECT p.id, p.number, p.internal_ref, p.issue_date, p.due_date, p.status, p.paid_at, p.is_credit, p.category, p.currency, p.description,
             p.net_total, p.tax_total, p.gross_total, p.prepaid_total, p.einvoice_format, p.file_name, p.file_path, p.file_mime, p.crop_path, p.crop_mime,
             COALESCE(NULLIF(c.company, ''), c.name, '') AS supplier_name, COALESCE(c.customer_number, '') AS supplier_number,
             COALESCE(c.vat_id, '') AS supplier_vat
@@ -142,7 +143,7 @@ const safeName = (s: string) => s.replace(/[^\w.\-]+/g, '_');
 function purchaseJournalCsv(t: Tenant, rows: PurchaseRow[]): string {
   const accounts = expenseAccounts(t);
   const head = [
-    'Rechnungsdatum', 'Lieferant', 'Lieferantennr.', 'USt-IdNr. Lieferant', 'Rechnungsnr.', 'Art', 'Kostenart', 'Aufwandskonto', 'Kreditor',
+    'Interne Belegnr.', 'Rechnungsdatum', 'Lieferant', 'Lieferantennr.', 'USt-IdNr. Lieferant', 'Rechnungsnr.', 'Art', 'Kostenart', 'Aufwandskonto', 'Kreditor',
     'Netto 19 %', 'Vorsteuer 19 %', 'Netto 7 %', 'Vorsteuer 7 %', 'Netto ohne USt', 'Netto gesamt', 'USt gesamt', 'Brutto', 'Währung',
     'Fällig am', 'Status', 'Bezahlt am', 'Beschreibung', 'Format', 'Datei',
   ];
@@ -153,7 +154,7 @@ function purchaseJournalCsv(t: Tenant, rows: PurchaseRow[]): string {
     const sum = (list: typeof r.taxes, k: 'basis' | 'tax') => list.reduce((a, x) => a + x[k], 0);
     const other = r.taxes.filter((x) => !(x.category === 'S' && (x.rate === 1900 || x.rate === 700)));
     return [
-      formatDate(r.issue_date), r.supplier_name, r.supplier_number, r.supplier_vat, r.number, r.is_credit ? 'Gutschrift' : 'Rechnung',
+      r.internal_ref, formatDate(r.issue_date), r.supplier_name, r.supplier_number, r.supplier_vat, r.number, r.is_credit ? 'Gutschrift' : 'Rechnung',
       categoryLabel(r.category), accounts[r.category] ?? '', creditorAccount(t, r.supplier_number),
       num(sign * sum(g(1900), 'basis')), num(sign * sum(g(1900), 'tax')), num(sign * sum(g(700), 'basis')), num(sign * sum(g(700), 'tax')),
       num(sign * sum(other, 'basis')), num(sign * r.net_total), num(sign * r.tax_total), num(sign * r.gross_total), r.currency,
@@ -165,10 +166,11 @@ function purchaseJournalCsv(t: Tenant, rows: PurchaseRow[]): string {
 }
 
 /** Dateiname im ZIP: Datum_Lieferant_Nummer.ext */
-function zipPurchaseName(r: Pick<PurchaseRow, 'issue_date' | 'supplier_name' | 'number' | 'id' | 'file_name' | 'file_path' | 'file_mime' | 'crop_path' | 'crop_mime'>): string {
+function zipPurchaseName(r: Pick<PurchaseRow, 'issue_date' | 'supplier_name' | 'number' | 'internal_ref' | 'id' | 'file_name' | 'file_path' | 'file_mime' | 'crop_path' | 'crop_mime'>): string {
   // zugeschnittene Fotos werden als Ausschnitt exportiert (Endung des Ausschnitts)
   const ext = (/\.(pdf|xml|png|jpe?g)$/i.exec(viewName(r))?.[0] ?? '').toLowerCase();
-  return `Eingangsrechnungen/${safeName(`${r.issue_date}_${r.supplier_name}_${r.number || `ER${r.id}`}`).slice(0, 120)}${ext}`;
+  // mit interner Belegnummer vorneweg, damit die Dateien in der Ablage danach sortiert sind
+  return `Eingangsrechnungen/${safeName(`${r.internal_ref ? `${r.internal_ref}_` : ''}${r.issue_date}_${r.supplier_name}_${r.number || `ER${r.id}`}`).slice(0, 120)}${ext}`;
 }
 
 /** Welche Rechnungen in den DATEV-Stapel? Ohne Angabe beide. */
@@ -289,7 +291,7 @@ function register(app: App) {
       invoices.push({ data: JSON.parse(r.snapshot), prepaidSnapshots: prepaid.map((p) => JSON.parse(p.snapshot)) });
     }
     const purchases: DatevPurchase[] = (sel.in ? await purchasesIn(t, from, to) : []).map((p) => ({
-      id: p.id, number: p.number, issueDate: p.issue_date, isCredit: !!p.is_credit, currency: p.currency, category: p.category,
+      id: p.id, number: p.number, internalRef: p.internal_ref, issueDate: p.issue_date, isCredit: !!p.is_credit, currency: p.currency, category: p.category,
       supplierName: p.supplier_name, supplierNumber: p.supplier_number, taxes: p.taxes,
     }));
     const csv = buildDatevCsv(t, { invoices, purchases }, from, to, userOf(c).name || userOf(c).email);

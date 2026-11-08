@@ -2,7 +2,7 @@
 # Vorher: cp .env.example .env  und die Passwörter setzen.
 services:
   db:
-    image: mariadb:11.4          # LTS-Version, Support bis 2029
+    image: mariadb:11.8          # LTS-Version, Support bis Juni 2028
     container_name: schottr-db
     restart: unless-stopped
     environment:

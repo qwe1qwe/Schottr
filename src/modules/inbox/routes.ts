@@ -8,8 +8,8 @@ import { csrfField, empty, page } from '../../views/layout.ts';
 import { cashbookEnabled } from '../cashbook/repo.ts';
 import { filesFrom } from '../cashbook/files.ts';
 import { fileUploader } from '../cashbook/routes.ts';
-import { importPurchaseFile, importRedirect } from '../purchases/routes.ts';
-import { addInbox, archivedInbox, assignInbox, attachTargets, carryCrop, combine, getInbox, inboxOf, markAssigned, openInbox, readInbox, setInboxArchived, viewInbox, type AttachTargets, type InboxFile } from './repo.ts';
+import { applyInternalRef, importPurchaseFile, importRedirect } from '../purchases/routes.ts';
+import { addInbox, archivedInbox, assignInbox, attachTargets, carryCrop, combine, getInbox, inboxOf, markAssigned, openInbox, readInbox, setInboxArchived, setInboxRef, viewInbox, type AttachTargets, type InboxFile } from './repo.ts';
 import { handleCrop } from '../../lib/crop.ts';
 import { cropControls } from '../../views/crop.ts';
 import type { App, Ctx, Module, Tenant } from '../../types.ts';
@@ -43,6 +43,10 @@ function postButton(c: Ctx, action: string, label: string, cls = 'btn', confirm?
   return html`<form method="post" action="${action}" class="inline" ${confirm ? html`data-confirm="${confirm}"` : ''}>${csrfField(c)}<button class="${cls}">${label}</button></form>`;
 }
 
+/** Eingabefeld für die interne Belegnummer (beim Ablegen bzw. Erfassen) */
+const refField = (value = '') => html`<label>Interne Belegnr. (optional) <input name="internal_ref" maxlength="50" class="mono" autocomplete="off" value="${value}" placeholder="z. B. ER-2026-001">
+  <small class="muted">wird beim Zuordnen an die Eingangsrechnung bzw. Buchung übernommen</small></label>`;
+
 const kb = (n: number) => `${Math.max(1, Math.round(n / 1024))} KB`;
 
 function thumb(f: InboxFile): SafeHtml {
@@ -59,6 +63,10 @@ function inboxCard(c: Ctx, t: Tenant, f: InboxFile, targets: AttachTargets): Saf
       <strong class="truncate">${f.file_name}</strong>
       <span class="muted small">${formatDate(f.created_at.slice(0, 10))} · ${kb(f.file_size)}${f.crop_path ? ' · zugeschnitten' : ''}${f.note ? html` · ${f.note}` : ''}</span>
       <div class="small">${cropControls(c, f, `/inbox/${f.id}/crop`, `/inbox/${f.id}/file`, { small: true })}</div>
+      <form method="post" action="/inbox/${f.id}/ref" class="inline-form">
+        ${csrfField(c)}<input name="internal_ref" maxlength="50" class="mono ref-input" autocomplete="off" value="${f.internal_ref}" placeholder="Interne Belegnr." aria-label="Interne Belegnummer">
+        <button class="btn small ghost">${f.internal_ref ? 'Ändern' : 'Speichern'}</button>
+      </form>
       <div class="inline-form">
         ${postButton(c, `/inbox/${f.id}/purchase`, 'Als Eingangsrechnung', 'btn small primary')}
         ${cashbookEnabled(t) ? html`<a class="btn small" href="/cashbook/new?inbox=${f.id}">Als Buchung</a>` : ''}
@@ -101,6 +109,7 @@ function register(app: App) {
         ${csrfField(c)}
         ${fileUploader('Beleg', [], undefined, 'Mehrere Fotos nacheinander aufnehmen, wenn der Beleg mehrere Seiten hat – sie werden zu einem PDF zusammengefasst. PDF, JPEG oder PNG, je höchstens 10 MB.')}
         ${targetChoice(t, target, targets)}
+        ${refField()}
         <label>Notiz (optional) <input name="note" maxlength="300" placeholder="z. B. Getränke fürs Sommerfest, bar bezahlt"></label>
         <div class="form-actions"><button class="btn primary">Weiter</button> <a class="btn ghost" href="/inbox">Belegeingang</a></div>
       </form>`,
@@ -116,6 +125,7 @@ function register(app: App) {
     const existing = str(form, 'existing');
     if (target === 'existing' && !existing) return redirectWith(c, '/capture?target=existing', 'error', 'Bitte die Buchung bzw. Eingangsrechnung auswählen.');
     const note = str(form, 'note', 300);
+    const ref = str(form, 'internal_ref', 50);
     let prepared;
     try {
       prepared = await combine(filesFrom(await c.req.parseBody({ all: true })));
@@ -124,16 +134,16 @@ function register(app: App) {
       throw err;
     }
     if (target === 'purchase') {
-      const r = await importPurchaseFile(c, t, user.id, { name: prepared.name, data: prepared.data });
+      const r = await applyInternalRef(t, await importPurchaseFile(c, t, user.id, { name: prepared.name, data: prepared.data }), ref);
       if (r.kind === 'skipped' && !r.id) {
         // nicht übernehmbar (z. B. defektes PDF) – nicht verlieren, sondern in den Belegeingang
-        const id = await addInbox(t, user.id, prepared, note);
+        const id = await addInbox(t, user.id, prepared, note, ref);
         await audit(c, 'inbox.add', prepared.name);
         return redirectWith(c, '/inbox', 'error', `Als Eingangsrechnung nicht übernommen (${r.message}) – der Beleg liegt jetzt im Belegeingang (Nr. ${id}).`);
       }
       return importRedirect(c, r);
     }
-    const id = await addInbox(t, user.id, prepared, note);
+    const id = await addInbox(t, user.id, prepared, note, ref);
     await audit(c, 'inbox.add', prepared.name);
     if (target === 'existing') {
       try {
@@ -174,7 +184,7 @@ function register(app: App) {
               ${thumb(f)}
               <div class="inbox-meta">
                 <strong class="truncate">${f.file_name}</strong>
-                <span class="muted small">hochgeladen ${formatDate(f.created_at.slice(0, 10))} · archiviert ${formatDate(String(f.archived_at).slice(0, 10))} · ${kb(f.file_size)}${f.note ? html` · ${f.note}` : ''}</span>
+                <span class="muted small">hochgeladen ${formatDate(f.created_at.slice(0, 10))} · archiviert ${formatDate(String(f.archived_at).slice(0, 10))} · ${kb(f.file_size)}${f.internal_ref ? html` · Belegnr. <span class="mono">${f.internal_ref}</span>` : ''}${f.note ? html` · ${f.note}` : ''}</span>
                 <div class="inline-form">${postButton(c, `/inbox/${f.id}/archive`, 'Wiederherstellen', 'btn small')}</div>
               </div>
             </li>`)}</ul>`
@@ -186,7 +196,8 @@ function register(app: App) {
       <form method="post" action="/capture" enctype="multipart/form-data" class="stack">
         ${csrfField(c)}<input type="hidden" name="target" value="later">
         ${fileUploader('Beleg ablegen', [], undefined, 'Mehrere Dateien oder Fotos werden zu einem PDF zusammengefasst – für einzelne Belege bitte einzeln ablegen.')}
-        <label>Notiz (optional) <input name="note" maxlength="300"></label>
+        <div class="grid-2">${refField()}
+        <label>Notiz (optional) <input name="note" maxlength="300"></label></div>
         <div><button class="btn primary">Ablegen</button></div>
       </form>
     </section>`;
@@ -208,20 +219,20 @@ function register(app: App) {
     // Archivierte Belege nur auf ausdrücklichen Wunsch (Häkchen „Archivierte zeigen“)
     const showArchived = c.req.query('archived') === '1';
     const archivedItems = showArchived ? await archivedInbox(t.id) : [];
-    type Row = { kind: 'purchase' | 'cash' | 'inbox'; date: string; title: string; sub: string; amount: number | null; href: string; file: string; name: string };
-    const purchases = await all<{ id: number; issue_date: string | null; created_at: string; number: string; description: string; file_name: string; gross_total: number; is_credit: number; status: string; label: string | null }>(
-      `SELECT p.id, p.issue_date, p.created_at, p.number, p.description, p.file_name, p.gross_total, p.is_credit, p.status,
+    type Row = { kind: 'purchase' | 'cash' | 'inbox'; date: string; ref: string; title: string; sub: string; amount: number | null; href: string; file: string; name: string };
+    const purchases = await all<{ id: number; issue_date: string | null; created_at: string; number: string; internal_ref: string; description: string; file_name: string; gross_total: number; is_credit: number; status: string; label: string | null }>(
+      `SELECT p.id, p.issue_date, p.created_at, p.number, p.internal_ref, p.description, p.file_name, p.gross_total, p.is_credit, p.status,
               COALESCE(NULLIF(c.company, ''), c.name) label
        FROM purchase_invoices p LEFT JOIN contacts c ON c.id = p.contact_id
        WHERE p.tenant_id = ? AND p.file_path IS NOT NULL AND p.file_path <> ''
          ${showArchived ? '' : "AND p.status <> 'archived'"}
-         ${q ? 'AND (p.number LIKE ? OR p.description LIKE ? OR p.file_name LIKE ? OR c.company LIKE ? OR c.name LIKE ?)' : ''}
+         ${q ? 'AND (p.number LIKE ? OR p.internal_ref LIKE ? OR p.description LIKE ? OR p.file_name LIKE ? OR c.company LIKE ? OR c.name LIKE ?)' : ''}
        ORDER BY COALESCE(p.issue_date, DATE(p.created_at)) DESC, p.id DESC LIMIT 500`,
-      t.id, ...(q ? Array(5).fill(like) : []),
+      t.id, ...(q ? Array(6).fill(like) : []),
     );
     const cash = cashbookEnabled(t)
-      ? await all<{ id: number; entry_id: number; file_name: string; entry_date: string; text: string; amount: number; account: string; archived_at: string | null }>(
-        `SELECT f.id, f.entry_id, f.file_name, f.archived_at, e.entry_date, e.text, e.amount, a.name account
+      ? await all<{ id: number; entry_id: number; file_name: string; entry_date: string; text: string; receipt_ref: string; amount: number; account: string; archived_at: string | null }>(
+        `SELECT f.id, f.entry_id, f.file_name, f.archived_at, e.entry_date, e.text, e.receipt_ref, e.amount, a.name account
          FROM cash_entry_files f JOIN cash_entries e ON e.id = f.entry_id JOIN cash_accounts a ON a.id = e.account_id
          WHERE f.tenant_id = ? ${showArchived ? '' : 'AND f.archived_at IS NULL'}
            -- dieselbe Datei auch als Rechnungsdatei verwendet: nur einmal (bei der Eingangsrechnung) zeigen
@@ -233,16 +244,16 @@ function register(app: App) {
       : [];
     const rows: Row[] = [
       ...purchases.map((p): Row => ({
-        kind: 'purchase', date: p.issue_date ?? p.created_at.slice(0, 10), title: p.label || (p.status === 'draft' ? 'Noch nicht erfasst' : 'Eingangsrechnung'),
+        kind: 'purchase', date: p.issue_date ?? p.created_at.slice(0, 10), ref: p.internal_ref, title: p.label || (p.status === 'draft' ? 'Noch nicht erfasst' : 'Eingangsrechnung'),
         sub: [p.status === 'archived' ? 'archiviert' : '', p.number, p.description].filter(Boolean).join(' · '), amount: p.status === 'draft' || p.status === 'archived' ? null : (p.is_credit ? -p.gross_total : p.gross_total),
         href: p.status === 'draft' ? `/purchases/${p.id}/edit` : `/purchases/${p.id}`, file: `/purchases/${p.id}/file?inline=1`, name: p.file_name,
       })),
       ...cash.map((f): Row => ({
-        kind: 'cash', date: f.entry_date, title: f.text, sub: f.archived_at ? `${f.account} · archiviert` : f.account, amount: f.amount,
+        kind: 'cash', date: f.entry_date, ref: f.receipt_ref, title: f.text, sub: f.archived_at ? `${f.account} · archiviert` : f.account, amount: f.amount,
         href: `/cashbook/entries/${f.entry_id}/edit`, file: `/cashbook/files/${f.id}?inline=1`, name: f.file_name,
       })),
-      ...[...items, ...archivedItems].filter((f) => !q || `${f.file_name} ${f.note}`.toLowerCase().includes(q.toLowerCase())).map((f): Row => ({
-        kind: 'inbox', date: f.created_at.slice(0, 10), title: f.archived_at ? 'Archiviert' : 'Nicht zugeordnet', sub: f.note, amount: null,
+      ...[...items, ...archivedItems].filter((f) => !q || `${f.file_name} ${f.note} ${f.internal_ref}`.toLowerCase().includes(q.toLowerCase())).map((f): Row => ({
+        kind: 'inbox', date: f.created_at.slice(0, 10), ref: f.internal_ref, title: f.archived_at ? 'Archiviert' : 'Nicht zugeordnet', sub: f.note, amount: null,
         href: f.archived_at ? '/inbox?tab=archived' : '/inbox', file: `/inbox/${f.id}/file?inline=1`, name: f.file_name,
       })),
     ].sort((a, b) => b.date.localeCompare(a.date));
@@ -256,9 +267,10 @@ function register(app: App) {
         <label class="check small"><input type="checkbox" name="archived" value="1" data-autosubmit${checked(showArchived)}> Archivierte zeigen</label></form>
       ${rows.length
         ? html`<div class="card flush"><table class="table stack-mobile">
-            <thead><tr><th>Datum</th><th>Art</th><th>Beleg</th><th>Datei</th><th class="num">Betrag</th></tr></thead>
+            <thead><tr><th>Datum</th><th>Belegnr.</th><th>Art</th><th>Beleg</th><th>Datei</th><th class="num">Betrag</th></tr></thead>
             <tbody>${rows.map((r) => html`<tr>
               <td data-label="Datum">${formatDate(r.date)}</td>
+              <td data-label="Belegnr." class="mono">${r.ref || html`<span class="muted">–</span>`}</td>
               <td data-label="Art"><span class="tag">${KIND[r.kind]}</span></td>
               <td data-label="Beleg"><a href="${r.href}">${r.title}</a>${r.sub ? html`<div class="muted small">${r.sub}</div>` : ''}</td>
               <td data-label="Datei"><a href="${r.file}" target="_blank" rel="noopener" class="truncate">${r.name}</a></td>
@@ -293,7 +305,7 @@ function register(app: App) {
     }
     await markAssigned(f, `Eingangsrechnung ID ${r.id}`);
     if (r.id) await carryCrop(f, 'purchase_invoices', t.id, r.id);
-    return importRedirect(c, r);
+    return importRedirect(c, await applyInternalRef(t, r, f.internal_ref));
   });
 
   /** Foto im Belegeingang zuschneiden – das Original bleibt unverändert erhalten */
@@ -312,6 +324,15 @@ function register(app: App) {
     const r = await assignInbox(t, f.id, str(await readForm(c), 'target'), userOf(c).id, cashbookEnabled(t));
     await audit(c, 'inbox.assign', `${f.file_name} → ${r.label}`);
     return redirectWith(c, r.href, 'ok', `Beleg hinterlegt bei ${r.label}.`);
+  });
+
+  /** Interne Belegnummer eines noch nicht zugeordneten Belegs eintragen bzw. ändern */
+  app.post('/inbox/:id/ref', async (c) => {
+    const t = tenantOf(c);
+    const f = await getInbox(t.id, idParam(c)) ?? notFound();
+    const ref = str(await readForm(c), 'internal_ref', 50);
+    await setInboxRef(f, ref);
+    return redirectWith(c, '/inbox', 'ok', ref ? `Interne Belegnummer ${ref} gespeichert.` : 'Interne Belegnummer entfernt.');
   });
 
   /** Archivieren statt Löschen – Belege sind aufbewahrungspflichtig */

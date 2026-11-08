@@ -903,4 +903,17 @@ export const migrations: { version: number; statements: string[] }[] = [
       `ALTER TABLE cash_entries ADD COLUMN count_part TINYINT(1) NOT NULL DEFAULT 0 AFTER count_id`,
     ],
   },
+  {
+    version: 21,
+    statements: [
+      // Interne Belegnummer, frei vergeben (z. B. „ER-2026-017“) – neben der Rechnungsnummer des
+      // Lieferanten. Gehört nicht zum Beleg selbst, bleibt daher jederzeit änderbar (keine Sperre).
+      // Bei Kassenbuch-Buchungen übernimmt das vorhandene Feld receipt_ref diese Rolle.
+      `ALTER TABLE purchase_invoices
+        ADD COLUMN internal_ref VARCHAR(50) NOT NULL DEFAULT '' AFTER number,
+        ADD KEY purchases_internal_ref (tenant_id, internal_ref)`,
+      // Im Belegeingang schon beim Ablegen eintragbar – wird beim Zuordnen übernommen
+      `ALTER TABLE inbox_files ADD COLUMN internal_ref VARCHAR(50) NOT NULL DEFAULT '' AFTER note`,
+    ],
+  },
 ];

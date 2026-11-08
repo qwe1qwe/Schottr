@@ -327,8 +327,8 @@ export interface EntryCandidate { id: number; entry_date: string; text: string; 
 export async function linkEntryToPurchase(t: Tenant, entryId: number, purchaseId: number): Promise<{ entry: CashEntry; purchase: { id: number; number: string } }> {
   const entry = await one<CashEntry>('SELECT * FROM cash_entries WHERE tenant_id = ? AND id = ?', t.id, entryId);
   if (!entry) throw new UserError('Buchung nicht gefunden.');
-  const p = await one<{ id: number; number: string; status: string; is_credit: number }>(
-    'SELECT id, number, status, is_credit FROM purchase_invoices WHERE tenant_id = ? AND id = ?', t.id, purchaseId,
+  const p = await one<{ id: number; number: string; internal_ref: string; status: string; is_credit: number }>(
+    'SELECT id, number, internal_ref, status, is_credit FROM purchase_invoices WHERE tenant_id = ? AND id = ?', t.id, purchaseId,
   );
   if (!p) throw new UserError('Bitte eine Eingangsrechnung auswählen.');
   if (p.status === 'draft') throw new UserError('Die Eingangsrechnung ist noch nicht erfasst – bitte zuerst die Angaben vervollständigen.');
@@ -342,7 +342,9 @@ export async function linkEntryToPurchase(t: Tenant, entryId: number, purchaseId
   }
   const now = nowIso();
   await tx(async () => {
-    await run("UPDATE cash_entries SET source = 'purchase', purchase_id = ?, updated_at = ? WHERE id = ?", p.id, now, entry.id);
+    // interne Belegnummer der Rechnung übernehmen, sofern die Buchung noch keine hat
+    await run("UPDATE cash_entries SET source = 'purchase', purchase_id = ?, receipt_ref = IF(receipt_ref = '', ?, receipt_ref), updated_at = ? WHERE id = ?",
+      p.id, p.internal_ref, now, entry.id);
     await run("UPDATE purchase_invoices SET status = 'paid', paid_at = ?, updated_at = ? WHERE id = ?", entry.entry_date, now, p.id);
   });
   return { entry, purchase: p };

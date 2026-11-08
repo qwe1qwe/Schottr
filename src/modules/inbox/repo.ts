@@ -5,6 +5,7 @@ import { UserError } from '../../lib/http.ts';
 import { appendPdfs, imagesToPdf } from '../../lib/pdfmerge.ts';
 import { attachData, MAX_ENTRY_FILE, mimeOf } from '../cashbook/files.ts';
 import { liveSql } from '../cashbook/repo.ts';
+import { adoptInternalRef } from '../purchases/repo.ts';
 import type { Tenant } from '../../types.ts';
 
 /**
@@ -25,6 +26,8 @@ export interface InboxFile {
   file_size: number;
   file_sha256: string;
   note: string;
+  /** interne Belegnummer, wird beim Zuordnen übernommen */
+  internal_ref: string;
   created_by: number | null;
   created_at: string;
   archived_at: string | null;
@@ -95,13 +98,13 @@ export async function combine(files: File[]): Promise<Prepared> {
   return { name: `${base}.pdf`.slice(-120), data: merged, mime: 'application/pdf' };
 }
 
-export async function addInbox(t: Tenant, userId: number, p: Prepared, note = ''): Promise<number> {
+export async function addInbox(t: Tenant, userId: number, p: Prepared, note = '', internalRef = ''): Promise<number> {
   const stored = await saveFile(AREA, t.id, p.name, p.data);
   try {
     const r = await run(
-      `INSERT INTO inbox_files (tenant_id, file_name, file_path, file_mime, file_size, file_sha256, note, created_by, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      t.id, p.name, stored.path, p.mime, stored.size, stored.sha256, note.slice(0, 300), userId, nowIso(),
+      `INSERT INTO inbox_files (tenant_id, file_name, file_path, file_mime, file_size, file_sha256, note, internal_ref, created_by, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      t.id, p.name, stored.path, p.mime, stored.size, stored.sha256, note.slice(0, 300), internalRef.slice(0, 50), userId, nowIso(),
     );
     return Number(r.insertId);
   } catch (err) {
@@ -145,6 +148,24 @@ export async function openInbox(tenantId: number, id: number): Promise<InboxFile
 /** Als zugeordnet markieren – Eintrag und Original bleiben erhalten (Aufbewahrungspflicht) */
 export async function markAssigned(f: InboxFile, to: string): Promise<void> {
   await run('UPDATE inbox_files SET assigned_at = ?, assigned_to = ? WHERE id = ? AND assigned_at IS NULL', nowIso(), to.slice(0, 300), f.id);
+}
+
+/** Interne Belegnummer eines noch offenen Belegs ändern (gehört nicht zur Datei, daher änderbar) */
+export async function setInboxRef(f: InboxFile, ref: string): Promise<void> {
+  if (f.assigned_at) throw new UserError('Der Beleg ist schon zugeordnet – die Nummer bitte dort ändern.');
+  await run('UPDATE inbox_files SET internal_ref = ? WHERE id = ?', ref.slice(0, 50), f.id);
+}
+
+/**
+ * Interne Belegnummer an eine Kassenbuch-Buchung geben, sofern sie noch keine hat. In
+ * abgeschlossenen Zeiträumen bleibt die Buchung unverändert (dort ist sie gesperrt).
+ */
+export async function adoptEntryRef(t: Tenant, entryId: number, ref: string): Promise<void> {
+  if (!ref) return;
+  await run(
+    "UPDATE cash_entries SET receipt_ref = ?, updated_at = ? WHERE tenant_id = ? AND id = ? AND receipt_ref = '' AND entry_date > COALESCE(?, '0000-01-01')",
+    ref.slice(0, 100), nowIso(), t.id, entryId, t.cashbook_locked_until ?? null,
+  );
 }
 
 /** Archivieren statt Löschen bzw. wiederherstellen */
@@ -213,6 +234,7 @@ export async function assignInbox(t: Tenant, inboxId: number, target: string, us
         );
         await markAssigned(f, `Eingangsrechnung ${p.number || `ID ${p.id}`}`);
         await carryCrop(f, 'purchase_invoices', t.id, p.id);
+        await adoptInternalRef(t.id, p.id, f.internal_ref);
       });
     } catch (err) {
       await discardUnreferenced('verbindlichkeiten', stored.path);
@@ -230,6 +252,7 @@ export async function assignInbox(t: Tenant, inboxId: number, target: string, us
     await tx(async () => {
       const fileId = await attachData(t, e.id, { name: f.file_name, data, mime: f.file_mime }, userId);
       await carryCrop(f, 'cash_entry_files', t.id, fileId);
+      await adoptEntryRef(t, e.id, f.internal_ref);
       await markAssigned(f, result.label);
     });
   }
@@ -244,6 +267,7 @@ export async function assignToEntry(t: Tenant, inboxId: number, entryId: number,
   const f = await openInbox(t.id, inboxId);
   const fileId = await attachData(t, entryId, { name: f.file_name, data: new Uint8Array(await readInbox(f)), mime: f.file_mime }, userId);
   await carryCrop(f, 'cash_entry_files', t.id, fileId);
+  await adoptEntryRef(t, entryId, f.internal_ref);
   await markAssigned(f, `Kassenbuch-Buchung ID ${entryId}`);
   return f;
 }

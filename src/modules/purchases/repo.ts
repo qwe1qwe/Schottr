@@ -28,6 +28,8 @@ export interface Purchase {
   archive_reason: string;
   is_credit: number;
   number: string;
+  /** interne Belegnummer, frei vergeben (leer = keine) */
+  internal_ref: string;
   issue_date: string | null;
   due_date: string | null;
   service_date: string | null;
@@ -268,6 +270,7 @@ export interface PurchaseInput {
   contact_id: number | null;
   new_supplier: string;
   number: string;
+  internal_ref: string;
   issue_date: string | null;
   due_date: string | null;
   description: string;
@@ -304,6 +307,7 @@ export function parsePurchaseForm(form: Form, locked: boolean): PurchaseInput {
     contact_id: Number(str(form, 'contact_id')) || null,
     new_supplier: str(form, 'new_supplier', 200),
     number: str(form, 'number', 100),
+    internal_ref: str(form, 'internal_ref', 50),
     issue_date: optDate('issue_date', 'Rechnungsdatum'),
     due_date: optDate('due_date', 'Fällig am'),
     description: str(form, 'description', 300),
@@ -369,7 +373,9 @@ export async function savePurchase(t: Tenant, userId: number, existing: Purchase
   const locked = !!existing?.einvoice_format;
   return tx(async () => {
     const status = input.paid_at ? 'paid' : existing && existing.status !== 'draft' && locked && payable(existing) <= 0 ? 'paid' : 'open';
+    await assertInternalRefFree(t.id, input.internal_ref, existing?.id ?? 0);
     const common = {
+      internal_ref: input.internal_ref,
       description: input.description,
       category: input.category,
       sphere: input.sphere,
@@ -424,6 +430,77 @@ export async function savePurchase(t: Tenant, userId: number, existing: Purchase
   });
 }
 
+/* ---------------- Vorschläge und Prüfungen beim Erfassen ---------------- */
+
+/**
+ * Kostenart und Bereich der jeweils letzten erfassten Eingangsrechnung je Lieferant –
+ * als Vorbelegung, wenn im Formular ein Lieferant gewählt wird.
+ */
+export async function lastBySupplier(tenantId: number): Promise<Map<number, { category: string; sphere: string }>> {
+  const rows = await all<{ contact_id: number; category: string; sphere: string }>(
+    `SELECT p.contact_id, p.category, p.sphere FROM purchase_invoices p
+     JOIN (SELECT contact_id, MAX(id) id FROM purchase_invoices
+           WHERE tenant_id = ? AND contact_id IS NOT NULL AND status IN ('open', 'paid') GROUP BY contact_id) l ON l.id = p.id`,
+    tenantId,
+  );
+  return new Map(rows.map((r) => [r.contact_id, { category: r.category, sphere: r.sphere }]));
+}
+
+export interface NumberMatch { id: number; number: string; issue_date: string | null; supplier: string | null; same_supplier: number }
+
+/** Schon erfasste Eingangsrechnungen mit derselben Rechnungsnummer (archivierte zählen nicht) */
+export async function sameNumber(tenantId: number, number: string, contactId: number | null, exceptId = 0): Promise<NumberMatch[]> {
+  const n = number.trim();
+  if (!n) return [];
+  const rows = await all<NumberMatch>(
+    `SELECT p.id, p.number, p.issue_date, COALESCE(NULLIF(c.company, ''), c.name) supplier, (p.contact_id <=> ?) same_supplier
+     FROM purchase_invoices p LEFT JOIN contacts c ON c.id = p.contact_id
+     WHERE p.tenant_id = ? AND p.number = ? AND p.id <> ? AND p.status NOT IN ('draft', 'archived')
+     ORDER BY same_supplier DESC, p.issue_date DESC LIMIT 5`,
+    contactId, tenantId, n, exceptId,
+  );
+  return rows.map((r) => ({ ...r, same_supplier: Number(r.same_supplier) }));
+}
+
+/* ---------------- Interne Belegnummer ---------------- */
+
+/** Dieselbe interne Belegnummer nicht zweimal vergeben (archivierte zählen nicht) */
+export async function assertInternalRefFree(tenantId: number, ref: string, exceptId = 0) {
+  if (!ref) return;
+  const dup = await one<{ id: number; number: string; label: string | null }>(
+    `SELECT p.id, p.number, COALESCE(NULLIF(c.company, ''), c.name) label FROM purchase_invoices p LEFT JOIN contacts c ON c.id = p.contact_id
+     WHERE p.tenant_id = ? AND p.internal_ref = ? AND p.id <> ? AND p.status <> 'archived' LIMIT 1`,
+    tenantId, ref, exceptId,
+  );
+  if (dup) {
+    const what = [dup.label, dup.number].filter(Boolean).join(', ') || `ID ${dup.id}`;
+    throw new UserError(`Die interne Belegnummer ${ref} ist schon vergeben (Eingangsrechnung ${what}).`);
+  }
+}
+
+/** Zuletzt vergebene interne Belegnummer – als Hilfe beim Eintragen der nächsten */
+export async function lastInternalRef(tenantId: number): Promise<string> {
+  return (await one<{ r: string }>(
+    "SELECT internal_ref r FROM purchase_invoices WHERE tenant_id = ? AND internal_ref <> '' ORDER BY created_at DESC, id DESC LIMIT 1", tenantId,
+  ))?.r ?? '';
+}
+
+/**
+ * Interne Belegnummer setzen, sofern noch keine eingetragen ist (z. B. aus dem Belegeingang
+ * übernommen). Ist die Nummer schon an anderer Stelle vergeben, bleibt das Feld leer – Rückgabe false.
+ */
+export async function adoptInternalRef(tenantId: number, purchaseId: number, ref: string): Promise<boolean> {
+  if (!ref) return true;
+  try {
+    await assertInternalRefFree(tenantId, ref, purchaseId);
+  } catch (err) {
+    if (err instanceof UserError) return false;
+    throw err;
+  }
+  await run("UPDATE purchase_invoices SET internal_ref = ?, updated_at = ? WHERE tenant_id = ? AND id = ? AND internal_ref = ''", ref.slice(0, 50), nowIso(), tenantId, purchaseId);
+  return true;
+}
+
 export async function setPaid(p: Purchase, paidAt: string | null) {
   assertNotArchived(p);
   await run(
@@ -464,6 +541,7 @@ export function emptyInput(contact?: Contact): PurchaseInput {
     contact_id: contact?.id ?? null,
     new_supplier: '',
     number: '',
+    internal_ref: '',
     issue_date: today(),
     due_date: null,
     description: '',
@@ -480,6 +558,7 @@ export function purchaseToInput(p: Purchase, taxes: PurchaseTax[]): PurchaseInpu
     contact_id: p.contact_id,
     new_supplier: '',
     number: p.number,
+    internal_ref: p.internal_ref,
     issue_date: p.issue_date ?? (p.status === 'draft' ? today() : null),
     due_date: p.due_date,
     description: p.description,

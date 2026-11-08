@@ -15,7 +15,7 @@ import { EInvoiceError, readEInvoice } from '../../einvoice/parse.ts';
 import { contactLabel, getContact, supplierOptions } from '../contacts.ts';
 import {
   archivePurchase, assertNotArchived, createFromEInvoice, createFromUpload, detectFile, emptyInput, findBySha, getPurchase, getTaxes, MAX_FILE_SIZE,
-  parsePurchaseForm, payable, purchaseToInput, restorePurchase, savePurchase, setPaid, sha256, SIGNED, taxRow, type EInvoiceInfo, type Purchase,
+  adoptInternalRef, lastBySupplier, lastInternalRef, sameNumber, parsePurchaseForm, payable, purchaseToInput, restorePurchase, savePurchase, setPaid, sha256, SIGNED, taxRow, type EInvoiceInfo, type Purchase,
 } from './repo.ts';
 import {
   einvoiceDetails, previewFrame, purchaseBadge, purchaseForm, purchaseStatus, purchaseTable, purchaseTitle, taxSummary, uploadCard,
@@ -47,7 +47,8 @@ async function syncPayment(t: Tenant, id: number, paidAt: string | null, account
   const p = (await getPurchase(t.id, id))!;
   const existing = await linkedEntry('purchase', id);
   const amount = existing?.amount ?? (p.is_credit ? 1 : -1) * payable(p);
-  await bookLinked(t, 'purchase', id, { account_id: accountId, entry_date: paidAt, amount, text: existing?.text ?? '' }, userId);
+  // interne Belegnummer der Rechnung auch an der Zahlung im Kassenbuch zeigen
+  await bookLinked(t, 'purchase', id, { account_id: accountId, entry_date: paidAt, amount, text: existing?.text ?? '', receipt_ref: p.internal_ref || existing?.receipt_ref || '' }, userId);
 }
 
 function postButton(c: Ctx, action: string, label: string, cls = 'btn', confirm?: string): SafeHtml {
@@ -74,7 +75,14 @@ async function uploadedFiles(c: Ctx): Promise<File[]> {
   return (Array.isArray(raw) ? raw : [raw]).filter((f): f is File => f instanceof File && f.size > 0);
 }
 
-export type ImportResult = { id?: number; name: string; kind: 'einvoice' | 'draft' | 'skipped'; message?: string; supplierCreated?: boolean };
+export type ImportResult = { id?: number; name: string; kind: 'einvoice' | 'draft' | 'skipped'; message?: string; supplierCreated?: boolean; refTaken?: string; numberHint?: string };
+
+/** Interne Belegnummer (z. B. beim Erfassen oder aus dem Belegeingang) an die neue Eingangsrechnung geben */
+export async function applyInternalRef(t: Tenant, r: ImportResult, ref: string): Promise<ImportResult> {
+  if (!ref || r.kind === 'skipped' || !r.id) return r;
+  if (!await adoptInternalRef(t.id, r.id, ref)) r.refTaken = ref;
+  return r;
+}
 
 /**
  * Eine Datei als Eingangsrechnung übernehmen: E-Rechnungen (XRechnung/ZUGFeRD) vollständig,
@@ -94,7 +102,7 @@ export async function importPurchaseFile(c: Ctx, t: Tenant, userId: number, file
     if (inv) {
       const r = await createFromEInvoice(t, userId, { name, data, kind }, inv);
       await audit(c, 'purchase.import', `${inv.formatLabel} ${inv.number} (${inv.seller.name})`);
-      return { id: r.id, name, kind: 'einvoice', supplierCreated: r.supplierCreated };
+      return { id: r.id, name, kind: 'einvoice', supplierCreated: r.supplierCreated, numberHint: await numberHint(t, r.id) };
     }
     if (kind === 'xml') return { name, kind: 'skipped', message: 'XML ist keine E-Rechnung' };
     return { id: await createFromUpload(t, userId, { name, data, kind }), name, kind: 'draft' };
@@ -106,13 +114,30 @@ export async function importPurchaseFile(c: Ctx, t: Tenant, userId: number, file
 
 /** Weiterleitung nach dem Übernehmen einer einzelnen Datei */
 export function importRedirect(c: Ctx, r: ImportResult, fallback = '/purchases') {
-  if (r.kind === 'einvoice') return redirectWith(c, `/purchases/${r.id}`, 'ok', `E-Rechnung übernommen${r.supplierCreated ? ' – der Lieferant wurde neu angelegt' : ''}. Bitte noch die Kostenart prüfen.`);
-  if (r.kind === 'draft') return redirectWith(c, `/purchases/${r.id}/edit`, 'ok', 'Beleg hochgeladen. Bitte jetzt die Angaben erfassen.');
+  const taken = (r.refTaken ? ` Die interne Belegnummer ${r.refTaken} ist schon vergeben und wurde nicht übernommen.` : '') + (r.numberHint ?? '');
+  if (r.kind === 'einvoice') return redirectWith(c, `/purchases/${r.id}`, taken ? 'error' : 'ok', `E-Rechnung übernommen${r.supplierCreated ? ' – der Lieferant wurde neu angelegt' : ''}. Bitte noch die Kostenart prüfen.${taken}`);
+  if (r.kind === 'draft') return redirectWith(c, `/purchases/${r.id}/edit`, taken ? 'error' : 'ok', `Beleg hochgeladen. Bitte jetzt die Angaben erfassen.${taken}`);
   if (r.id) return redirectWith(c, `/purchases/${r.id}`, 'error', `${r.name}: ${r.message}.`);
   return redirectWith(c, fallback, 'error', `${r.name}: ${r.message}.`);
 }
 
+/** Hinweis nach dem Speichern, wenn dieselbe Rechnungsnummer bei einem anderen Lieferanten vorkommt */
+async function numberHint(t: Tenant, id: number): Promise<string> {
+  const p = await getPurchase(t.id, id);
+  if (!p?.number) return '';
+  const other = (await sameNumber(t.id, p.number, p.contact_id, p.id)).filter((m) => !m.same_supplier);
+  if (!other.length) return '';
+  return ` Hinweis: Die Rechnungsnummer ${p.number} gibt es auch bei ${other.map((m) => m.supplier || 'einer Rechnung ohne Lieferant').join(', ')} – bitte prüfen, ob es kein Doppel ist.`;
+}
+
 function register(app: App) {
+  /** Prüfung beim Eintippen: gibt es die Rechnungsnummer schon? (vor /purchases/:id registriert) */
+  app.get('/purchases/number-check', async (c) => {
+    const t = tenantOf(c);
+    const matches = await sameNumber(t.id, (c.req.query('number') ?? '').slice(0, 100), Number(c.req.query('contact') ?? 0) || null, Number(c.req.query('id') ?? 0) || 0);
+    return c.json({ matches: matches.map((m) => ({ id: m.id, supplier: m.supplier ?? '', date: m.issue_date ? formatDate(m.issue_date) : '', sameSupplier: !!m.same_supplier })) });
+  });
+
   app.get('/purchases', async (c) => {
     const t = tenantOf(c);
     const status = c.req.query('status') ?? '';
@@ -143,8 +168,8 @@ function register(app: App) {
       params.push(pp.from, pp.to);
     }
     if (q) {
-      where += ' AND (p.number LIKE ? OR p.description LIKE ? OR p.file_name LIKE ? OR c.company LIKE ? OR c.name LIKE ?)';
-      params.push(...Array(5).fill(`%${q}%`));
+      where += ' AND (p.number LIKE ? OR p.internal_ref LIKE ? OR p.description LIKE ? OR p.file_name LIKE ? OR c.company LIKE ? OR c.name LIKE ?)';
+      params.push(...Array(6).fill(`%${q}%`));
     }
     const rows = await all(
       `SELECT p.*, COALESCE(NULLIF(c.company, ''), c.name) AS contact_label
@@ -221,11 +246,17 @@ function register(app: App) {
     const contactId = Number(c.req.query('contact') ?? 0) || entry?.contact_id || 0;
     const contact = contactId ? await getContact(t.id, contactId) : undefined;
     const input = emptyInput(contact);
+    const last = await lastBySupplier(t.id);
+    if (contact && last.get(contact.id)) {
+      input.category = last.get(contact.id)!.category;
+      input.sphere = last.get(contact.id)!.sphere;
+    }
     if (entry) {
       const gross = Math.abs(entry.amount);
       const rate = t.small_business ? 0 : entry.vat_rate;
       Object.assign(input, {
         issue_date: entry.entry_date, paid_at: entry.entry_date, description: entry.text, is_credit: entry.amount > 0,
+        internal_ref: entry.receipt_ref.slice(0, 50),
         category: isExpenseCategory(entry.category) ? entry.category : input.category, sphere: entry.sphere,
         taxes: [taxRow(rate, null, null, gross)!],
       });
@@ -234,7 +265,7 @@ function register(app: App) {
       title: 'Eingangsrechnung erfassen',
       back: entry ? { href: `/cashbook/entries/${entry.id}/edit`, label: 'Buchung' } : { href: '/purchases', label: 'Eingangsrechnungen' },
       body: purchaseForm(c, '/purchases', input, await supplierOptions(t.id, contact?.id), {
-        smallBusiness: !!t.small_business, defaultSphere: t.nonprofit ? t.default_sphere : null,
+        smallBusiness: !!t.small_business, defaultSphere: t.nonprofit ? t.default_sphere : null, lastRef: await lastInternalRef(t.id), lastBySupplier: last,
         accounts: cashbookEnabled(t) ? await accountsOf(t.id) : [], paidAccountId: entry?.account_id ?? null,
         extra: entry ? html`<input type="hidden" name="from_entry" value="${entry.id}">
           <div class="notice soft">Aus der Buchung vom ${formatDate(entry.entry_date)} „${entry.text}“ (${formatMoney(entry.amount)}): Die Buchung wird zur Zahlung
@@ -270,7 +301,8 @@ function register(app: App) {
         return newId;
       });
       if (fromEntry) await audit(c, 'cashbook.entry.link', `Eingangsrechnung (ID ${id}) aus Buchung ID ${fromEntry} angelegt`);
-      return redirectWith(c, `/purchases/${id}`, 'ok', fromEntry ? 'Eingangsrechnung angelegt und mit der Buchung verbunden.' : 'Eingangsrechnung gespeichert.');
+      const hint = await numberHint(t, id);
+      return redirectWith(c, `/purchases/${id}`, hint ? 'error' : 'ok', `${fromEntry ? 'Eingangsrechnung angelegt und mit der Buchung verbunden.' : 'Eingangsrechnung gespeichert.'}${hint}`);
     } catch (err) {
       if (err instanceof UserError) return redirectWith(c, fromEntry ? `/purchases/new?entry=${fromEntry}` : '/purchases/new', 'error', err.message);
       throw err;
@@ -289,6 +321,7 @@ function register(app: App) {
     const info = p.einvoice_data ? (JSON.parse(p.einvoice_data) as EInvoiceInfo) : null;
     const st = purchaseStatus(p);
     const meta: [string, SafeHtml | string][] = [
+      ...(p.internal_ref ? [['Interne Belegnr.', html`<span class="mono">${p.internal_ref}</span>`] as [string, SafeHtml]] : []),
       ['Lieferant', contact ? html`<a href="/contacts/${contact.id}">${contactLabel(contact)}</a>` : '–'],
       ['Rechnungsnummer', p.number || '–'],
       ['Rechnungsdatum', formatDate(p.issue_date)],
@@ -369,7 +402,7 @@ function register(app: App) {
       body: html`
       ${purchaseForm(c, `/purchases/${p.id}`, purchaseToInput(p, taxes), await supplierOptions(t.id, p.contact_id), {
         locked, taxes, preview: p.file_path && p.file_mime !== 'application/xml' ? previewFrame(p, c) : undefined, smallBusiness: !!t.small_business,
-        defaultSphere: t.nonprofit ? t.default_sphere : null,
+        defaultSphere: t.nonprofit ? t.default_sphere : null, lastRef: await lastInternalRef(t.id), lastBySupplier: await lastBySupplier(t.id), purchaseId: p.id,
         accounts: cashbookEnabled(t) ? await accountsOf(t.id) : [], paidAccountId: (await linkedEntry('purchase', p.id))?.account_id ?? null,
       })}
       ${draft
@@ -393,7 +426,9 @@ function register(app: App) {
         await syncPayment(t, p.id, input.paid_at, accountId, userOf(c).id);
       });
       if (p.status !== 'draft') await audit(c, 'purchase.update', `${purchaseTitle(p)} (ID ${p.id})`);
-      return redirectWith(c, `/purchases/${p.id}`, 'ok', 'Eingangsrechnung gespeichert.');
+      // Hinweis nur, wenn die Nummer gerade erst eingetragen bzw. geändert wurde
+      const hint = input.number && input.number !== p.number && !p.einvoice_format ? await numberHint(t, p.id) : '';
+      return redirectWith(c, `/purchases/${p.id}`, hint ? 'error' : 'ok', `Eingangsrechnung gespeichert.${hint}`);
     } catch (err) {
       if (err instanceof UserError) return redirectWith(c, `/purchases/${p.id}/edit`, 'error', err.message);
       throw err;
@@ -414,7 +449,7 @@ function register(app: App) {
       if (accountId) {
         const amount = parseDecimal(str(form, 'amount'), 2);
         if (amount === null || amount <= 0) throw new UserError('Bitte den gezahlten Betrag angeben.');
-        await bookLinked(t, 'purchase', p.id, { account_id: accountId, entry_date: date, amount: p.is_credit ? amount : -amount, text: '' }, userOf(c).id);
+        await bookLinked(t, 'purchase', p.id, { account_id: accountId, entry_date: date, amount: p.is_credit ? amount : -amount, text: '', receipt_ref: p.internal_ref }, userOf(c).id);
       }
     });
     return redirectWith(c, `/purchases/${p.id}`, 'ok', accountId ? 'Als bezahlt gebucht.' : 'Als bezahlt markiert.');

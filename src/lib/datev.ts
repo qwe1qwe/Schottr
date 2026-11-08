@@ -50,7 +50,7 @@ export function debtorAccount(t: Tenant, customerNumber: string): string {
 const amount = (cents: number) => (Math.abs(cents) / 100).toFixed(2).replace('.', ',');
 const text = (v: string, max: number) => `"${v.replace(/"/g, '""').replace(/[\r\n;]+/g, ' ').slice(0, max)}"`;
 /** Belegfeld 1: nur bestimmte Zeichen zulässig, max. 36 */
-const beleg = (v: string) => `"${v.replace(/[^A-Za-z0-9$&%*+\-/]/g, '').slice(0, 36)}"`;
+const beleg = (v: string, max = 36) => `"${v.replace(/[^A-Za-z0-9$&%*+\-/]/g, '').slice(0, max)}"`;
 const ddmm = (iso: string) => `${iso.slice(8, 10)}${iso.slice(5, 7)}`;
 const ymd = (iso: string) => iso.replaceAll('-', '');
 
@@ -71,6 +71,8 @@ function inputTaxKey(category: string, rate: number): string {
 /** Eingangsrechnung für den Export (Daten aus purchase_invoices + Steuerzeilen) */
 export interface DatevPurchase {
   number: string;
+  /** interne Belegnummer → Belegfeld 2 */
+  internalRef?: string;
   id: number;
   issueDate: string;
   isCredit: boolean;
@@ -111,10 +113,11 @@ export function buildDatevCsv(
   ].join(';');
 
   const rows: string[] = [];
-  const book = (cents: number, sh: 'S' | 'H', konto: string, gegenkonto: string, bu: string, date: string, belegnr: string, label: string, currency = 'EUR') => {
+  const book = (cents: number, sh: 'S' | 'H', konto: string, gegenkonto: string, bu: string, date: string, belegnr: string, label: string, currency = 'EUR', belegnr2 = '') => {
     if (!cents) return;
     rows.push([
-      amount(cents), `"${sh}"`, `"${currency}"`, '', '', '', konto, gegenkonto, `"${bu}"`, ddmm(date), beleg(belegnr), '""', '', text(label, 60),
+      // Belegfeld 2: max. 12 Zeichen
+      amount(cents), `"${sh}"`, `"${currency}"`, '', '', '', konto, gegenkonto, `"${bu}"`, ddmm(date), beleg(belegnr), beleg(belegnr2, 12), '', text(label, 60),
     ].join(';'));
   };
 
@@ -139,7 +142,7 @@ export function buildDatevCsv(
       // Kleinunternehmer: kein Vorsteuerabzug – Bruttobetrag ohne BU-Schlüssel
       const bu = t.small_business ? '' : inputTaxKey(g.category, g.rate);
       const note = g.category === 'AE' ? ' § 13b' : '';
-      book(g.basis + g.tax, p.isCredit ? 'S' : 'H', creditor, account, bu, p.issueDate, p.number || `ER${p.id}`, `${p.supplierName}${note}`, p.currency);
+      book(g.basis + g.tax, p.isCredit ? 'S' : 'H', creditor, account, bu, p.issueDate, p.number || `ER${p.id}`, `${p.supplierName}${note}`, p.currency, p.internalRef ?? '');
     }
   }
   return toWindows1252([header, columns, ...rows].join('\r\n') + '\r\n');
