@@ -30,8 +30,8 @@ type Target = 'purchase' | 'cash' | 'existing' | 'later';
 function existingSelect(x: AttachTargets, name = 'existing'): SafeHtml {
   return html`<select name="${name}" aria-label="Vorhandene Buchung oder Eingangsrechnung">
     <option value="">– bitte wählen –</option>
-    ${x.purchases.length ? html`<optgroup label="Eingangsrechnungen ohne Beleg">${x.purchases.map((p) => html`<option value="p:${p.id}">${
-      [p.supplier || 'ohne Lieferant', p.number || 'ohne Nr.', p.issue_date ? formatDate(p.issue_date) : '', formatMoney(p.is_credit ? -p.gross_total : p.gross_total)].filter(Boolean).join(' · ')}</option>`)}</optgroup>` : ''}
+    ${x.purchases.length ? html`<optgroup label="Eingangsrechnungen">${x.purchases.map((p) => html`<option value="p:${p.id}">${
+      [p.supplier || 'ohne Lieferant', p.number || 'ohne Nr.', p.issue_date ? formatDate(p.issue_date) : '', formatMoney(p.is_credit ? -p.gross_total : p.gross_total), p.files ? `📎 ${p.files}` : 'ohne Beleg'].filter(Boolean).join(' · ')}</option>`)}</optgroup>` : ''}
     ${x.entries.length ? html`<optgroup label="Kassenbuch-Buchungen">${x.entries.map((e) => html`<option value="e:${e.id}">${
       [formatDate(e.entry_date), e.account, e.text, formatMoney(e.amount), e.files ? `📎 ${e.files}` : ''].filter(Boolean).join(' · ')}</option>`)}</optgroup>` : ''}
   </select>`;
@@ -87,8 +87,8 @@ function targetChoice(t: Tenant, current: Target, targets: AttachTargets): SafeH
     ${opt('purchase', 'Eingangsrechnung', 'Rechnung eines Lieferanten – danach Betrag, Lieferant und Kostenart erfassen. E-Rechnungen werden automatisch übernommen.')}
     ${cashbookEnabled(t) ? opt('cash', 'Kassenbuch-Buchung', 'Quittung, Kassenbon, Auslage aus der Barkasse – danach direkt die Buchung erfassen.') : ''}
     ${hasTargets(targets) ? html`${opt('existing', 'Zu vorhandener Buchung oder Eingangsrechnung', cashbookEnabled(t)
-        ? 'Die Ausgabe ist schon gebucht bzw. die Rechnung schon erfasst – der Beleg wird nur noch hinterlegt.'
-        : 'Die Rechnung ist schon erfasst – der Beleg wird nur noch hinterlegt.')}
+        ? 'Die Ausgabe ist schon gebucht bzw. die Rechnung schon erfasst – der Beleg wird nur noch hinterlegt (auch als zweite Seite).'
+        : 'Die Rechnung ist schon erfasst – der Beleg wird nur noch hinterlegt (auch als zweite Seite).')}
       <label data-show-if="target=existing">Zuordnen zu ${existingSelect(targets)}</label>` : ''}
     ${opt('later', 'Später zuordnen', 'Erst einmal ablegen – im Belegeingang wartet der Beleg auf die Zuordnung.')}
   </fieldset>`;
@@ -230,6 +230,16 @@ function register(app: App) {
        ORDER BY COALESCE(p.issue_date, DATE(p.created_at)) DESC, p.id DESC LIMIT 500`,
       t.id, ...(q ? Array(6).fill(like) : []),
     );
+    // weitere Belege zu Eingangsrechnungen (zweite Seite, Lieferschein …)
+    const extras = await all<{ id: number; purchase_id: number; file_name: string; archived_at: string | null; issue_date: string | null; created_at: string; number: string; internal_ref: string; label: string | null; p_archived: number }>(
+      `SELECT f.id, f.purchase_id, f.file_name, f.archived_at, p.issue_date, f.created_at, p.number, p.internal_ref,
+              COALESCE(NULLIF(c.company, ''), c.name) label, p.status = 'archived' p_archived
+       FROM purchase_files f JOIN purchase_invoices p ON p.id = f.purchase_id LEFT JOIN contacts c ON c.id = p.contact_id
+       WHERE f.tenant_id = ? ${showArchived ? '' : "AND f.archived_at IS NULL AND p.status <> 'archived'"}
+         ${q ? 'AND (f.file_name LIKE ? OR p.number LIKE ? OR p.internal_ref LIKE ? OR c.company LIKE ? OR c.name LIKE ?)' : ''}
+       ORDER BY f.id DESC LIMIT 500`,
+      t.id, ...(q ? Array(5).fill(like) : []),
+    );
     const cash = cashbookEnabled(t)
       ? await all<{ id: number; entry_id: number; file_name: string; entry_date: string; text: string; receipt_ref: string; amount: number; account: string; archived_at: string | null }>(
         `SELECT f.id, f.entry_id, f.file_name, f.archived_at, e.entry_date, e.text, e.receipt_ref, e.amount, a.name account
@@ -247,6 +257,11 @@ function register(app: App) {
         kind: 'purchase', date: p.issue_date ?? p.created_at.slice(0, 10), ref: p.internal_ref, title: p.label || (p.status === 'draft' ? 'Noch nicht erfasst' : 'Eingangsrechnung'),
         sub: [p.status === 'archived' ? 'archiviert' : '', p.number, p.description].filter(Boolean).join(' · '), amount: p.status === 'draft' || p.status === 'archived' ? null : (p.is_credit ? -p.gross_total : p.gross_total),
         href: p.status === 'draft' ? `/purchases/${p.id}/edit` : `/purchases/${p.id}`, file: `/purchases/${p.id}/file?inline=1`, name: p.file_name,
+      })),
+      ...extras.map((f): Row => ({
+        kind: 'purchase', date: f.issue_date ?? f.created_at.slice(0, 10), ref: f.internal_ref, title: f.label || 'Eingangsrechnung',
+        sub: [f.archived_at || Number(f.p_archived) ? 'archiviert' : '', f.number, 'weiterer Beleg'].filter(Boolean).join(' · '), amount: null,
+        href: `/purchases/${f.purchase_id}`, file: `/purchases/files/${f.id}?inline=1`, name: f.file_name,
       })),
       ...cash.map((f): Row => ({
         kind: 'cash', date: f.entry_date, ref: f.receipt_ref, title: f.text, sub: f.archived_at ? `${f.account} · archiviert` : f.account, amount: f.amount,

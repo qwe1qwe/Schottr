@@ -14,7 +14,7 @@ import { UserError } from './http.ts';
 export const MAX_CROP_FILE = 10 * 1024 * 1024;
 
 /** Tabellen mit Belegdateien, die sich zuschneiden lassen */
-export type CropTable = 'cash_entry_files' | 'purchase_invoices' | 'inbox_files';
+export type CropTable = 'cash_entry_files' | 'purchase_invoices' | 'purchase_files' | 'inbox_files';
 
 export interface Croppable {
   file_name: string;

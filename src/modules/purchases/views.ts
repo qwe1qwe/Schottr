@@ -42,6 +42,15 @@ export function purchaseTitle(p: Pick<Purchase, 'number' | 'status' | 'file_name
   return 'ohne Nr.';
 }
 
+/** Büroklammer: Rechnungsdatei und weitere Belege (Spalte extra_files aus der Abfrage) */
+function attachClip(p: { file_path: string; file_name: string; einvoice_format: string; extra_files?: number | string }): SafeHtml | string {
+  const extra = Number(p.extra_files ?? 0);
+  const n = (p.file_path ? 1 : 0) + extra;
+  if (!n) return '';
+  const main = p.file_path ? (p.einvoice_format ? `E-Rechnung: ${p.file_name}` : p.file_name || 'Beleg') : '';
+  return html` ${clip([main, extra ? `${extra} weitere(r) Beleg(e)` : ''].filter(Boolean).join(' + '), n)}`;
+}
+
 export function purchaseTable(rows: any[], showSupplier = true): SafeHtml {
   // Spalte „Belegnr.“ nur, wenn überhaupt interne Belegnummern vergeben sind
   const refs = rows.some((p) => p.internal_ref);
@@ -54,7 +63,7 @@ export function purchaseTable(rows: any[], showSupplier = true): SafeHtml {
       const st = purchaseStatus(p);
       return html`<tr class="rowlink" data-href="/purchases/${p.id}">
         ${refs ? html`<td class="mono">${p.internal_ref || html`<span class="muted">–</span>`}</td>` : ''}
-        <td><a href="/purchases/${p.id}" class="${p.number ? 'mono' : ''}">${purchaseTitle(p)}</a>${p.file_path ? html` ${clip(p.einvoice_format ? `E-Rechnung: ${p.file_name}` : p.file_name || 'Beleg')}` : ''}
+        <td><a href="/purchases/${p.id}" class="${p.number ? 'mono' : ''}">${purchaseTitle(p)}</a>${attachClip(p)}
           ${p.is_credit ? html` <span class="tag">Gutschrift</span>` : ''}${p.einvoice_format ? html` <span class="tag info" title="${p.einvoice_format}">E-Rechnung</span>` : ''}</td>
         <td>${formatDate(p.issue_date)}</td>
         ${showSupplier ? html`<td>${p.contact_label ?? html`<span class="muted">–</span>`}</td>` : ''}

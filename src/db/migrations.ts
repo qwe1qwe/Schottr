@@ -916,4 +916,39 @@ export const migrations: { version: number; statements: string[] }[] = [
       `ALTER TABLE inbox_files ADD COLUMN internal_ref VARCHAR(50) NOT NULL DEFAULT '' AFTER note`,
     ],
   },
+  {
+    version: 22,
+    statements: [
+      // Weitere Belege zu einer Eingangsrechnung (z. B. zweite Seite, Lieferschein) – neben der
+      // Rechnungsdatei. Wie alle Belege unveränderbar: nicht löschen, nicht austauschen, nur archivieren.
+      `CREATE TABLE purchase_files (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        tenant_id INT NOT NULL,
+        purchase_id INT NOT NULL,
+        file_name VARCHAR(200) NOT NULL,
+        file_path VARCHAR(300) NOT NULL,
+        file_mime VARCHAR(60) NOT NULL,
+        file_size INT NOT NULL,
+        file_sha256 CHAR(64) NOT NULL,
+        crop_path VARCHAR(300) NULL,
+        crop_mime VARCHAR(60) NULL,
+        crop_size INT NULL,
+        crop_sha256 CHAR(64) NULL,
+        cropped_at DATETIME(3) NULL,
+        archived_at DATETIME(3) NULL,
+        created_by INT NULL,
+        created_at DATETIME(3) NOT NULL,
+        KEY purchase_files_purchase (purchase_id),
+        CONSTRAINT purchase_files_tenant FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
+        CONSTRAINT purchase_files_purchase FOREIGN KEY (purchase_id) REFERENCES purchase_invoices(id),
+        CONSTRAINT purchase_files_user FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
+      ) ${TABLE}`,
+      `CREATE TRIGGER purchase_files_keep BEFORE DELETE ON purchase_files FOR EACH ROW
+       ${forbid('Belege sind aufbewahrungspflichtig und koennen nur archiviert werden')}`,
+      `CREATE TRIGGER purchase_files_lock BEFORE UPDATE ON purchase_files FOR EACH ROW
+       IF NEW.purchase_id <> OLD.purchase_id OR NEW.tenant_id <> OLD.tenant_id OR NEW.file_path <> OLD.file_path OR NEW.file_sha256 <> OLD.file_sha256
+          OR NEW.file_mime <> OLD.file_mime OR NEW.file_size <> OLD.file_size OR NEW.file_name <> OLD.file_name
+       THEN ${forbid('Belege sind unveraenderbar - nur archivieren ist moeglich')}; END IF`,
+    ],
+  },
 ];

@@ -12,6 +12,7 @@ import { html } from '../lib/html.ts';
 import { attachment, tenantOf, userOf } from '../lib/http.ts';
 import { orgDataLabel } from './settings.ts';
 import { formatAmount, formatMoney, formatRate } from '../lib/money.ts';
+import { viewPurchaseFile, type PurchaseFile } from './purchases/files.ts';
 import { createZip } from '../lib/zip.ts';
 import { inboxCount } from './inbox/repo.ts';
 import { INVOICE_TYPES, dueAmount, type DocumentData } from '../einvoice/model.ts';
@@ -176,6 +177,36 @@ function zipPurchaseName(r: Pick<PurchaseRow, 'issue_date' | 'supplier_name' | '
   const ext = (/\.(pdf|xml|png|jpe?g)$/i.exec(viewName(r))?.[0] ?? '').toLowerCase();
   // mit interner Belegnummer vorneweg, damit die Dateien in der Ablage danach sortiert sind
   return `Eingangsrechnungen/${safeName(`${r.internal_ref ? `${r.internal_ref}_` : ''}${r.issue_date}_${r.supplier_name}_${r.number || `ER${r.id}`}`).slice(0, 120)}${ext}`;
+}
+
+/**
+ * Belege der Eingangsrechnungen fürs ZIP: Rechnungsdatei und weitere Belege (archivierte nicht),
+ * weitere als „…_Anlage1.pdf“ usw. neben der Rechnungsdatei.
+ */
+async function purchaseZipFiles(purchases: PurchaseRow[], used: Set<string>, folder: string): Promise<{ name: string; data: Buffer | string }[]> {
+  const out: { name: string; data: Buffer | string }[] = [];
+  const unique = (name: string, id: number) => {
+    let n = name;
+    if (used.has(n)) n = n.replace(/(\.\w+)?$/, `_${id}$1`);
+    used.add(n);
+    return n;
+  };
+  const extras = purchases.length
+    ? await all<PurchaseFile>(
+        `SELECT * FROM purchase_files WHERE archived_at IS NULL AND purchase_id IN (${purchases.map(() => '?').join(',')}) ORDER BY id`,
+        ...purchases.map((p) => p.id),
+      )
+    : [];
+  for (const p of purchases) {
+    const base = zipPurchaseName(p).replace(/^Eingangsrechnungen\//, folder);
+    if (p.file_path) out.push({ name: unique(base, p.id), data: (await viewOf('verbindlichkeiten', p)).data });
+    let i = 0;
+    for (const f of extras.filter((x) => x.purchase_id === p.id)) {
+      const ext = (/\.(pdf|png|jpe?g)$/i.exec(viewName(f))?.[0] ?? '').toLowerCase();
+      out.push({ name: unique(`${base.replace(/\.\w+$/, '')}_Anlage${++i}${ext}`, p.id), data: (await viewPurchaseFile(f)).data });
+    }
+  }
+  return out;
 }
 
 /** Welche Rechnungen in den DATEV-Stapel? Ohne Angabe beide. */
@@ -378,13 +409,7 @@ function register(app: App) {
     const purchases = await purchasesIn(t, from, to);
     if (purchases.length) files.push({ name: `04_Eingangsrechnungen/Rechnungseingangsbuch_${year}.csv`, data: purchaseJournalCsv(t, purchases) });
     const used = new Set<string>();
-    for (const p of purchases) {
-      if (!p.file_path) continue;
-      let name = zipPurchaseName(p).replace(/^Eingangsrechnungen\//, '04_Eingangsrechnungen/');
-      if (used.has(name)) name = name.replace(/(\.\w+)?$/, `_${p.id}$1`);
-      used.add(name);
-      files.push({ name, data: (await viewOf('verbindlichkeiten', p)).data });
-    }
+    files.push(...await purchaseZipFiles(purchases, used, '04_Eingangsrechnungen/'));
 
     // Spenden
     const donations = await donationsCsv(t, from, to);
@@ -442,13 +467,7 @@ function register(app: App) {
       if (blobs[0]?.xml) files.push({ name: `${base}_XRechnung.xml`, data: blobs[0].xml });
     }
     const used = new Set<string>();
-    for (const p of purchases) {
-      if (!p.file_path) continue;
-      let name = zipPurchaseName(p);
-      if (used.has(name)) name = name.replace(/(\.\w+)?$/, `_${p.id}$1`);
-      used.add(name);
-      files.push({ name, data: (await viewOf('verbindlichkeiten', p)).data });
-    }
+    files.push(...await purchaseZipFiles(purchases, used, 'Eingangsrechnungen/'));
     await audit(c, 'export.zip', `${from} – ${to}, ${rows.length} Ausgangs-, ${purchases.length} Eingangsrechnungen`);
     return c.body(new Uint8Array(createZip(files)), 200, {
       'Content-Type': 'application/zip',

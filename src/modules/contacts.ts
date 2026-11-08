@@ -275,7 +275,9 @@ function register(app: App) {
     // Archivierte Eingangsrechnungen nur auf Wunsch (?archived=1)
     const showArchived = c.req.query('archived') === '1';
     const allPurchases = await all(
-      `SELECT p.*, COALESCE(NULLIF(c.company, ''), c.name) AS contact_label FROM purchase_invoices p LEFT JOIN contacts c ON c.id = p.contact_id
+      `SELECT p.*, COALESCE(NULLIF(c.company, ''), c.name) AS contact_label,
+              (SELECT COUNT(*) FROM purchase_files f WHERE f.purchase_id = p.id AND f.archived_at IS NULL) AS extra_files
+       FROM purchase_invoices p LEFT JOIN contacts c ON c.id = p.contact_id
        WHERE p.tenant_id = ? AND p.contact_id = ? ORDER BY p.issue_date DESC, p.id DESC`,
       t.id, ct.id,
     );

@@ -1,7 +1,12 @@
 import { sphereLabel } from '../../lib/nonprofit.ts';
 import { accountsOf, bookLinked, cashbookEnabled, entryCandidates, entryForPurchase, getAccount, linkEntryToPurchase, linkedEntry, shareEntryFileWithPurchase, unlink } from '../cashbook/repo.ts';
-import { accountSelect } from '../cashbook/routes.ts';
-import { all, one, tx } from '../../db/index.ts';
+import { accountSelect, fileUploader } from '../cashbook/routes.ts';
+import { filesFrom, MAX_ENTRY_FILE, mimeOf } from '../cashbook/files.ts';
+import { assignToPurchase, inboxOf, openInbox, type InboxFile } from '../inbox/repo.ts';
+import { cropControls } from '../../views/crop.ts';
+import { attachPurchaseData, getPurchaseFile, purchaseFilesOf, setPurchaseFileArchived, viewPurchaseFile, type PurchaseFile } from './files.ts';
+import { all, one, run, tx, nowIso } from '../../db/index.ts';
+import { saveFile } from '../../lib/files.ts';
 import { audit } from '../../lib/audit.ts';
 import { formatDate, isIsoDate, monthEnd, monthLabel, paidPeriod, today } from '../../lib/dates.ts';
 import { handleCrop, viewOf } from '../../lib/crop.ts';
@@ -53,6 +58,34 @@ async function syncPayment(t: Tenant, id: number, paidAt: string | null, account
 
 function postButton(c: Ctx, action: string, label: string, cls = 'btn', confirm?: string): SafeHtml {
   return html`<form method="post" action="${action}" class="inline" ${confirm ? html`data-confirm="${confirm}"` : ''}>${csrfField(c)}<button class="${cls}">${label}</button></form>`;
+}
+
+/** Weitere Belege (zweite Seite, Lieferschein …): Liste, Zuschneiden, Archivieren, Hochladen */
+function extraFiles(c: Ctx, p: Purchase, files: PurchaseFile[], inbox: InboxFile[]): SafeHtml {
+  const archived = p.status === 'archived';
+  const item = (f: PurchaseFile) => html`<li class="${f.archived_at ? 'archived' : ''}">
+    <a href="/purchases/files/${f.id}?inline=1" target="_blank" rel="noopener" class="entry-file">
+      ${f.file_mime.startsWith('image/') ? html`<img src="/purchases/files/${f.id}?inline=1${f.cropped_at ? `&v=${encodeURIComponent(f.cropped_at)}` : ''}" alt="Beleg ${f.file_name}" loading="lazy">` : html`<span class="pdf-badge">PDF</span>`}
+      <span>${f.file_name}<span class="muted small"> · ${Math.max(1, Math.round(f.file_size / 1024))} KB${f.crop_path ? ' · zugeschnitten' : ''}${f.archived_at ? ' · archiviert' : ''}</span></span>
+    </a>
+    ${archived ? '' : html`<span class="entry-file-actions">
+      ${f.archived_at ? '' : cropControls(c, f, `/purchases/files/${f.id}/crop`, `/purchases/files/${f.id}`, { small: true })}
+      ${postButton(c, `/purchases/files/${f.id}/archive`, f.archived_at ? 'Wiederherstellen' : 'Archivieren', f.archived_at ? 'link' : 'link danger',
+        f.archived_at ? undefined : `Beleg „${f.file_name}“ archivieren? Er bleibt unverändert aufbewahrt, wird aber nicht mehr angezeigt und nicht exportiert.`)}
+    </span>`}
+  </li>`;
+  const active = files.filter((f) => !f.archived_at);
+  const old = files.filter((f) => f.archived_at);
+  if (archived && !active.length) return html``;
+  return html`<section class="card">
+    <h2>${p.file_path ? 'Weitere Belege' : 'Belege'} <span class="count">${active.length}</span></h2>
+    ${active.length ? html`<ul class="plain entry-file-list">${active.map(item)}</ul>` : html`<p class="muted small">${p.file_path ? 'z. B. zweite Seite, Lieferschein oder Zahlungsbeleg.' : 'Noch kein Beleg – der erste wird zur Rechnungsdatei.'}</p>`}
+    ${old.length ? html`<details class="archived-files"><summary class="muted small">${old.length} archivierte(r) Beleg(e) anzeigen</summary>
+      <ul class="plain entry-file-list">${old.map(item)}</ul></details>` : ''}
+    ${archived ? '' : html`<form method="post" action="/purchases/${p.id}/files" enctype="multipart/form-data" class="stack">
+      ${csrfField(c)}${fileUploader(p.file_path ? 'Beleg anhängen (PDF oder Foto)' : 'Rechnungsdatei hochladen (PDF oder Foto)', inbox)}
+      <div><button class="btn">Hochladen</button></div></form>`}
+  </section>`;
 }
 
 /** Archivieren (statt Löschen) mit optionalem Grund */
@@ -172,7 +205,8 @@ function register(app: App) {
       params.push(...Array(6).fill(`%${q}%`));
     }
     const rows = await all(
-      `SELECT p.*, COALESCE(NULLIF(c.company, ''), c.name) AS contact_label
+      `SELECT p.*, COALESCE(NULLIF(c.company, ''), c.name) AS contact_label,
+              (SELECT COUNT(*) FROM purchase_files f WHERE f.purchase_id = p.id AND f.archived_at IS NULL) AS extra_files
        FROM purchase_invoices p LEFT JOIN contacts c ON c.id = p.contact_id
        WHERE ${where} ORDER BY (p.status = 'draft') DESC, p.issue_date DESC, p.id DESC LIMIT 500`,
       ...params,
@@ -367,6 +401,7 @@ function register(app: App) {
         <div>
           <section class="card"><dl class="dl cols">${meta.map(([l, v]) => html`<dt>${l}</dt><dd>${v}</dd>`)}</dl></section>
           ${taxSummary(taxes, p)}
+          ${extraFiles(c, p, await purchaseFilesOf(p.id), archived ? [] : await inboxOf(t.id))}
           ${candidates.length ? html`<section class="card">
             <h2>Schon im Kassenbuch gebucht?</h2>
             <p class="muted small">Wurde die Ausgabe bereits als freie Buchung erfasst (z. B. bar bezahlt, Rechnung kam später), hier verbinden statt nochmals
@@ -503,6 +538,79 @@ function register(app: App) {
     await audit(c, r === 'saved' ? 'purchase.crop' : 'purchase.uncrop', `${purchaseTitle(p)} (ID ${p.id}): ${p.file_name}`);
     return redirectWith(c, p.status === 'draft' ? `/purchases/${p.id}/edit` : `/purchases/${p.id}`, 'ok',
       r === 'saved' ? 'Beleg zugeschnitten – das Original bleibt unverändert erhalten.' : 'Zuschnitt verworfen – es gilt wieder das Original.');
+  });
+
+  /** Weitere Belege hochladen bzw. aus dem Belegeingang übernehmen. Ohne Rechnungsdatei wird der erste zur Rechnungsdatei. */
+  app.post('/purchases/:id/files', async (c) => {
+    const t = tenantOf(c);
+    const p = (await getPurchase(t.id, idParam(c))) ?? notFound();
+    assertNotArchived(p);
+    const form = await readForm(c);
+    const files = filesFrom(await c.req.parseBody({ all: true }));
+    const inboxId = Number(str(form, 'inbox_id')) || 0;
+    if (!files.length && !inboxId) return redirectWith(c, `/purchases/${p.id}`, 'error', 'Bitte ein PDF oder Foto auswählen.');
+    const prepared: { name: string; data: Uint8Array; mime: string }[] = [];
+    for (const f of files) {
+      if (f.size > MAX_ENTRY_FILE) return redirectWith(c, `/purchases/${p.id}`, 'error', `„${f.name}“ ist größer als 10 MB.`);
+      const data = new Uint8Array(await f.arrayBuffer());
+      const mime = mimeOf(data);
+      if (!mime) return redirectWith(c, `/purchases/${p.id}`, 'error', `„${f.name}“: bitte ein PDF oder ein Foto (JPEG/PNG) hochladen.`);
+      const ext = mime === 'application/pdf' ? '.pdf' : mime === 'image/png' ? '.png' : '.jpg';
+      prepared.push({ name: `${(f.name || 'beleg').replace(/\.(pdf|jpe?g|png|heic)$/i, '')}${ext}`.slice(-120), data, mime });
+    }
+    let n = 0;
+    // aus dem Belegeingang (setzt ggf. die Rechnungsdatei)
+    if (inboxId) {
+      await assignToPurchase(t, await openInbox(t.id, inboxId), p.id, userOf(c).id);
+      n++;
+    }
+    for (const f of prepared) {
+      const fresh = (await getPurchase(t.id, p.id))!;
+      if (!fresh.file_path) {
+        const stored = await saveFile('verbindlichkeiten', t.id, f.name, f.data);
+        await run(
+          `UPDATE purchase_invoices SET file_name = ?, file_path = ?, file_mime = ?, file_size = ?, file_sha256 = ?, updated_at = ? WHERE id = ? AND file_path = ''`,
+          f.name, stored.path, f.mime, stored.size, stored.sha256, nowIso(), p.id,
+        );
+      } else {
+        await attachPurchaseData(t, p.id, f, userOf(c).id);
+      }
+      n++;
+    }
+    await audit(c, 'purchase.file.add', `${purchaseTitle(p)} (ID ${p.id}): ${n} Beleg(e)`);
+    return redirectWith(c, `/purchases/${p.id}`, 'ok', `${n} Beleg(e) angehängt.`);
+  });
+
+  app.get('/purchases/files/:id', async (c) => {
+    const t = tenantOf(c);
+    const f = (await getPurchaseFile(t.id, idParam(c))) ?? notFound();
+    const v = await viewPurchaseFile(f, c.req.query('original') === '1');
+    return c.body(new Uint8Array(v.data), 200, {
+      'Content-Type': v.mime,
+      'Content-Disposition': attachment(v.name, c.req.query('inline') === '1'),
+      'Cache-Control': 'private, no-store',
+      'X-Content-Type-Options': 'nosniff',
+    });
+  });
+
+  app.post('/purchases/files/:id/crop', async (c) => {
+    const t = tenantOf(c);
+    const f = (await getPurchaseFile(t.id, idParam(c))) ?? notFound();
+    if (f.archived_at) return redirectWith(c, `/purchases/${f.purchase_id}`, 'error', 'Der Beleg ist archiviert – zum Zuschneiden zuerst wiederherstellen.');
+    const r = await handleCrop(c, 'purchase_files', 'verbindlichkeiten', t.id, f.id, f);
+    await audit(c, r === 'saved' ? 'purchase.file.crop' : 'purchase.file.uncrop', `ID ${f.purchase_id}: ${f.file_name}`);
+    return redirectWith(c, `/purchases/${f.purchase_id}`, 'ok', r === 'saved' ? 'Beleg zugeschnitten – das Original bleibt unverändert erhalten.' : 'Zuschnitt verworfen – es gilt wieder das Original.');
+  });
+
+  /** Archivieren bzw. wiederherstellen – gelöscht wird nie (Aufbewahrungspflicht) */
+  app.post('/purchases/files/:id/archive', async (c) => {
+    const t = tenantOf(c);
+    const f = (await getPurchaseFile(t.id, idParam(c))) ?? notFound();
+    const p = (await getPurchase(t.id, f.purchase_id))!;
+    assertNotArchived(p);
+    await setPurchaseFileArchived(f, !f.archived_at);
+    await audit(c, f.archived_at ? 'purchase.file.restore' : 'purchase.file.archive', `${purchaseTitle(p)} (ID ${p.id}): ${f.file_name}`);
+    return redirectWith(c, `/purchases/${p.id}`, 'ok', f.archived_at ? 'Beleg wiederhergestellt.' : 'Beleg archiviert – er bleibt unverändert aufbewahrt.');
   });
 
   app.get('/purchases/:id/file', async (c) => {

@@ -70,18 +70,21 @@ function rangeOf(year: number) {
 async function attachmentsOf(rows: EntryRow[]): Promise<Map<number, { n: number; title: string }>> {
   const own = await fileCounts(rows.map((x) => x.id));
   const purchaseIds = [...new Set(rows.map((r) => r.purchase_id).filter((x): x is number => !!x))];
-  const withFile = new Set(purchaseIds.length
-    ? (await all<{ id: number }>(
-        `SELECT id FROM purchase_invoices WHERE file_path <> '' AND id IN (${purchaseIds.map(() => '?').join(',')})`, ...purchaseIds,
-      )).map((x) => x.id)
+  // Rechnungsdatei plus weitere Belege der Eingangsrechnung
+  const pFiles = new Map(purchaseIds.length
+    ? (await all<{ id: number; n: number }>(
+        `SELECT p.id, (p.file_path <> '') + (SELECT COUNT(*) FROM purchase_files f WHERE f.purchase_id = p.id AND f.archived_at IS NULL) n
+         FROM purchase_invoices p WHERE p.id IN (${purchaseIds.map(() => '?').join(',')})`, ...purchaseIds,
+      )).map((x) => [x.id, Number(x.n)] as const)
     : []);
   const out = new Map<number, { n: number; title: string }>();
   for (const r of rows) {
     const n = own.get(r.id) ?? 0;
+    const pn = r.purchase_id ? pFiles.get(r.purchase_id) ?? 0 : 0;
     const parts = n ? [`${n} ${n === 1 ? 'Beleg' : 'Belege'}`] : [];
-    if (r.purchase_id && withFile.has(r.purchase_id)) parts.push('Beleg der Eingangsrechnung');
+    if (pn) parts.push(pn === 1 ? 'Beleg der Eingangsrechnung' : `${pn} Belege der Eingangsrechnung`);
     if (r.document_id) parts.push('Rechnungs-PDF');
-    const total = n + (r.purchase_id && withFile.has(r.purchase_id) ? 1 : 0) + (r.document_id ? 1 : 0);
+    const total = n + pn + (r.document_id ? 1 : 0);
     if (total) out.set(r.id, { n: total, title: parts.join(' + ') });
   }
   return out;

@@ -6,6 +6,7 @@ import { appendPdfs, imagesToPdf } from '../../lib/pdfmerge.ts';
 import { attachData, MAX_ENTRY_FILE, mimeOf } from '../cashbook/files.ts';
 import { liveSql } from '../cashbook/repo.ts';
 import { adoptInternalRef } from '../purchases/repo.ts';
+import { attachPurchaseData } from '../purchases/files.ts';
 import type { Tenant } from '../../types.ts';
 
 /**
@@ -134,7 +135,7 @@ export const readInbox = (f: Pick<InboxFile, 'file_path'>) => readStoredFile(ARE
 export const viewInbox = (f: InboxFile, original = false) => viewOf(AREA, f, original);
 
 /** Zuschnitt aus dem Belegeingang an die Eingangsrechnung bzw. den Buchungsbeleg weitergeben */
-export const carryCrop = (f: InboxFile, table: 'purchase_invoices' | 'cash_entry_files', tenantId: number, id: number) =>
+export const carryCrop = (f: InboxFile, table: 'purchase_invoices' | 'purchase_files' | 'cash_entry_files', tenantId: number, id: number) =>
   copyCrop(AREA, f, table, 'verbindlichkeiten', tenantId, id);
 
 /** Noch offener Beleg (zum Zuordnen) – sonst Fehler */
@@ -178,21 +179,22 @@ export async function setInboxArchived(f: InboxFile, archived: boolean): Promise
 
 /** Ziel „vorhanden“: Eingangsrechnung ohne Datei (p:<id>) oder Kassenbuch-Buchung (e:<id>) */
 export interface AttachTargets {
-  purchases: { id: number; number: string; issue_date: string | null; supplier: string | null; gross_total: number; is_credit: number }[];
+  purchases: { id: number; number: string; issue_date: string | null; supplier: string | null; gross_total: number; is_credit: number; files: number }[];
   entries: { id: number; entry_date: string; text: string; amount: number; account: string; files: number }[];
 }
 
 /**
- * Mögliche Ziele für einen Beleg: erfasste Eingangsrechnungen ohne Datei (z. B. manuell
- * eingetragen, Quittung kommt nach) und Kassenbuch-Buchungen, an denen Belege hängen können
+ * Mögliche Ziele für einen Beleg: erfasste Eingangsrechnungen (ohne Datei wird er ihre
+ * Rechnungsdatei, sonst ein weiterer Beleg, z. B. zweite Seite) und Kassenbuch-Buchungen, an denen Belege hängen können
  * (freie Buchungen, Umbuchungen, Zählungen – bei verknüpften ist die Rechnung bzw. Spende der Beleg).
  */
 export async function attachTargets(t: Tenant, withEntries: boolean): Promise<AttachTargets> {
   const purchases = await all<AttachTargets['purchases'][number]>(
-    `SELECT p.id, p.number, p.issue_date, p.gross_total, p.is_credit, COALESCE(NULLIF(c.company, ''), c.name) supplier
+    `SELECT p.id, p.number, p.issue_date, p.gross_total, p.is_credit, COALESCE(NULLIF(c.company, ''), c.name) supplier,
+            (p.file_path <> '') + (SELECT COUNT(*) FROM purchase_files f WHERE f.purchase_id = p.id AND f.archived_at IS NULL) files
      FROM purchase_invoices p LEFT JOIN contacts c ON c.id = p.contact_id
-     WHERE p.tenant_id = ? AND p.status NOT IN ('draft', 'archived') AND (p.file_path IS NULL OR p.file_path = '')
-     ORDER BY COALESCE(p.issue_date, DATE(p.created_at)) DESC, p.id DESC LIMIT 100`, t.id,
+     WHERE p.tenant_id = ? AND p.status NOT IN ('draft', 'archived')
+     ORDER BY COALESCE(p.issue_date, DATE(p.created_at)) DESC, p.id DESC LIMIT 150`, t.id,
   );
   const entries = withEntries
     ? await all<AttachTargets['entries'][number]>(
@@ -203,7 +205,7 @@ export async function attachTargets(t: Tenant, withEntries: boolean): Promise<At
        ORDER BY e.entry_date DESC, e.id DESC LIMIT 150`, t.id,
     )
     : [];
-  return { purchases, entries: entries.map((e) => ({ ...e, files: Number(e.files) })) };
+  return { purchases: purchases.map((p) => ({ ...p, files: Number(p.files) })), entries: entries.map((e) => ({ ...e, files: Number(e.files) })) };
 }
 
 /**
@@ -219,28 +221,8 @@ export async function assignInbox(t: Tenant, inboxId: number, target: string, us
   const data = new Uint8Array(await readInbox(f));
   let result: { label: string; href: string };
   if (m[1] === 'p') {
-    const p = await one<{ id: number; number: string; status: string; file_path: string | null }>(
-      'SELECT id, number, status, file_path FROM purchase_invoices WHERE tenant_id = ? AND id = ?', t.id, id,
-    );
-    if (!p || p.status === 'draft') throw new UserError('Eingangsrechnung nicht gefunden.');
-    if (p.file_path) throw new UserError('Die Eingangsrechnung hat schon eine Datei.');
-    const stored = await saveFile('verbindlichkeiten', t.id, f.file_name, data);
-    try {
-      await tx(async () => {
-        await run(
-          `UPDATE purchase_invoices SET file_name = ?, file_path = ?, file_mime = ?, file_size = ?, file_sha256 = ?, updated_at = ?
-           WHERE id = ? AND (file_path IS NULL OR file_path = '')`,
-          f.file_name, stored.path, f.file_mime, stored.size, stored.sha256, nowIso(), p.id,
-        );
-        await markAssigned(f, `Eingangsrechnung ${p.number || `ID ${p.id}`}`);
-        await carryCrop(f, 'purchase_invoices', t.id, p.id);
-        await adoptInternalRef(t.id, p.id, f.internal_ref);
-      });
-    } catch (err) {
-      await discardUnreferenced('verbindlichkeiten', stored.path);
-      throw err;
-    }
-    result = { label: `Eingangsrechnung ${p.number || `ID ${p.id}`}`, href: `/purchases/${p.id}` };
+    const r = await assignToPurchase(t, f, id, userId, data);
+    result = { label: `Eingangsrechnung ${r.label}${r.extra ? ' (weiterer Beleg)' : ''}`, href: `/purchases/${id}` };
   } else {
     if (!cashbook) throw new UserError('Das Kassenbuch gibt es nur für Vereine.');
     const e = await one<{ id: number; source: string; text: string; entry_date: string }>(
@@ -257,6 +239,46 @@ export async function assignInbox(t: Tenant, inboxId: number, target: string, us
     });
   }
   return result;
+}
+
+/**
+ * Beleg aus dem Belegeingang einer erfassten Eingangsrechnung zuordnen: Hat sie noch keine
+ * Datei, wird er ihre Rechnungsdatei – sonst ein weiterer Beleg (z. B. zweite Seite).
+ */
+export async function assignToPurchase(t: Tenant, f: InboxFile, purchaseId: number, userId: number, data?: Uint8Array): Promise<{ label: string; extra: boolean }> {
+  const p = await one<{ id: number; number: string; status: string; file_path: string | null }>(
+    'SELECT id, number, status, file_path FROM purchase_invoices WHERE tenant_id = ? AND id = ?', t.id, purchaseId,
+  );
+  if (!p || p.status === 'draft') throw new UserError('Eingangsrechnung nicht gefunden.');
+  if (p.status === 'archived') throw new UserError('Die Eingangsrechnung ist archiviert – zuerst wiederherstellen.');
+  const label = p.number || `ID ${p.id}`;
+  const bytes = data ?? new Uint8Array(await readInbox(f));
+  if (p.file_path) {
+    await tx(async () => {
+      const fileId = await attachPurchaseData(t, p.id, { name: f.file_name, data: bytes, mime: f.file_mime }, userId);
+      await carryCrop(f, 'purchase_files', t.id, fileId);
+      await adoptInternalRef(t.id, p.id, f.internal_ref);
+      await markAssigned(f, `Eingangsrechnung ${label} (weiterer Beleg)`);
+    });
+    return { label, extra: true };
+  }
+  const stored = await saveFile('verbindlichkeiten', t.id, f.file_name, bytes);
+  try {
+    await tx(async () => {
+      await run(
+        `UPDATE purchase_invoices SET file_name = ?, file_path = ?, file_mime = ?, file_size = ?, file_sha256 = ?, updated_at = ?
+         WHERE id = ? AND (file_path IS NULL OR file_path = '')`,
+        f.file_name, stored.path, f.file_mime, stored.size, stored.sha256, nowIso(), p.id,
+      );
+      await markAssigned(f, `Eingangsrechnung ${label}`);
+      await carryCrop(f, 'purchase_invoices', t.id, p.id);
+      await adoptInternalRef(t.id, p.id, f.internal_ref);
+    });
+  } catch (err) {
+    await discardUnreferenced('verbindlichkeiten', stored.path);
+    throw err;
+  }
+  return { label, extra: false };
 }
 
 /**
