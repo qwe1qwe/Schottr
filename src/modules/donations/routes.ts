@@ -1,18 +1,27 @@
 import { all, one, tx } from '../../db/index.ts';
 import { accountsOf, assertOpen, bookLinked, cashbookEnabled, linkedEntry, unlink, type CashAccount } from '../cashbook/repo.ts';
-import { accountSelect } from '../cashbook/routes.ts';
+import { accountSelect, fileUploader } from '../cashbook/routes.ts';
+import { filesFrom } from '../cashbook/files.ts';
+import { inboxOf, type InboxFile } from '../inbox/repo.ts';
 import { audit } from '../../lib/audit.ts';
+import { handleCrop } from '../../lib/crop.ts';
+import { cropControls } from '../../views/crop.ts';
+import { clip } from '../../views/clip.ts';
 import { formatDate, today } from '../../lib/dates.ts';
 import { checked, html, selected, type SafeHtml } from '../../lib/html.ts';
-import { attachment, idParam, notFound, readForm, redirectWith, str, tenantOf, userOf, UserError } from '../../lib/http.ts';
+import { attachment, idParam, notFound, readForm, redirectWith, str, tenantOf, userOf, UserError, type Form } from '../../lib/http.ts';
 import { formatAmount, formatMoney } from '../../lib/money.ts';
 import { csrfField, empty, page } from '../../views/layout.ts';
 import type { App, Ctx, Module, Tenant } from '../../types.ts';
 import { contactLabel, getContact, type Contact } from '../contacts.ts';
 import {
-  cancelReceipt, confirmable, createDonation, deleteDonation, getDonation, getReceipt, issueCollective, issueSingle,
+  bookingDateOf, cancelReceipt, confirmable, createDonation, deleteDonation, getDonation, getReceipt, issueCollective, issueSingle,
   openMoneyDonations, parseDonation, RECEIPT_COLUMNS, updateDonation, type Donation, type DonationInput, type Receipt,
 } from './repo.ts';
+import {
+  assignInboxToDonation, attachDonationFiles, donationFileCounts, donationFilesOf, donationHasFiles, getDonationFile,
+  setDonationFileArchived, viewDonationFile, type DonationFile,
+} from './files.ts';
 import { DONATION_KINDS, noticeValidUntil, receiptProblems, TEXT, type ReceiptData } from './receipt.ts';
 
 /**
@@ -37,11 +46,12 @@ function donationStatus(t: Tenant, d: Pick<Donation, 'receipt_id' | 'kind'> & { 
   return html`<span class="badge badge-todo">Unbestätigt</span>`;
 }
 
-export function donationTable(t: Tenant, rows: (Donation & { contact_label?: string; receipt_number?: string | null })[], showContact = true): SafeHtml {
+export function donationTable(t: Tenant, rows: (Donation & { contact_label?: string; receipt_number?: string | null })[], showContact = true, files = new Map<number, number>()): SafeHtml {
   return html`<div class="card flush"><table class="table">
     <thead><tr><th>Datum</th>${showContact ? html`<th>Zuwendender</th>` : ''}<th>Art</th><th>Bestätigung</th><th class="right">Betrag</th></tr></thead>
     <tbody>${rows.map((d) => html`<tr class="rowlink" data-href="/donations/${d.id}">
-      <td><a href="/donations/${d.id}">${formatDate(d.donation_date)}</a></td>
+      <td><a href="/donations/${d.id}">${formatDate(d.donation_date)}</a>${files.get(d.id) ? html` ${clip(files.get(d.id) === 1 ? 'Beleg' : `${files.get(d.id)} Belege`, files.get(d.id))}` : ''}
+        ${d.booking_date && d.booking_date !== d.donation_date ? html`<div class="muted small" title="Buchungsdatum (Geldeingang)">gebucht ${formatDate(d.booking_date)}</div>` : ''}</td>
       ${showContact ? html`<td>${d.contact_label ?? ''}</td>` : ''}
       <td>${DONATION_KINDS[d.kind]}${d.waiver ? html` <span class="tag info">Aufwandsverzicht</span>` : ''}${d.note ? html`<div class="muted small truncate">${d.note}</div>` : ''}</td>
       <td>${donationStatus(t, d)}</td>
@@ -76,9 +86,13 @@ async function donorOptions(tenantId: number, includeId = 0): Promise<Contact[]>
   );
 }
 
-function donationForm(c: Ctx, t: Tenant, action: string, d: Partial<DonationInput>, contacts: Contact[], cash: { accounts: CashAccount[]; selected?: number | null } = { accounts: [] }): SafeHtml {
+function donationForm(
+  c: Ctx, t: Tenant, action: string, d: Partial<DonationInput> & { id?: number }, contacts: Contact[],
+  cash: { accounts: CashAccount[]; selected?: number | null } = { accounts: [] }, inbox: InboxFile[] = [],
+): SafeHtml {
   const kind = d.kind ?? 'money';
-  return html`<form method="post" action="${action}" class="card stack" data-donation-form data-count-check data-count-date="donation_date">
+  return html`<form method="post" action="${action}" class="card stack" enctype="multipart/form-data" data-donation-form
+    data-count-check data-count-date="booking_date,donation_date" ${d.id && cash.selected ? html`data-count-orig="${cash.selected}:${bookingDateOf({ donation_date: d.donation_date ?? '', booking_date: d.booking_date ?? null })}"` : ''}>
     ${csrfField(c)}
     <div class="grid-2">
       <label class="span-2">Zuwendender
@@ -92,13 +106,17 @@ function donationForm(c: Ctx, t: Tenant, action: string, d: Partial<DonationInpu
         <legend>Art</legend>
         ${(['money', 'membership', 'goods'] as const).map((k) => html`<label class="check"><input type="radio" name="kind" value="${k}"${checked(kind === k)}> ${DONATION_KINDS[k]}</label>`)}
       </fieldset>
-      <label>Datum der Zuwendung <input type="date" name="donation_date" value="${d.donation_date ?? today()}" max="${today()}" required></label>
+      <label>Datum der Zuwendung <input type="date" name="donation_date" value="${d.donation_date ?? today()}" max="${today()}" required>
+        <small class="muted">steht so auf der Zuwendungsbestätigung</small></label>
+      <label data-kind-show="money membership">Buchungsdatum (Geldeingang) <input type="date" name="booking_date" value="${d.booking_date ?? ''}" max="${today()}">
+        <small class="muted">Tag der Gutschrift auf dem Konto – leer = wie Datum der Zuwendung</small></label>
+      <span data-kind-show="goods"></span>
       <label><span data-kind-show="money membership">Betrag (€)</span><span data-kind-show="goods">Wert der Sachzuwendung (€)</span>
         <input name="amount" class="num" inputmode="decimal" required value="${d.amount ? formatAmount(d.amount).replace(/\./g, '') : ''}" placeholder="0,00"></label>
       ${cash.accounts.length
         ? html`<label data-kind-show="money membership">Eingegangen auf
             ${accountSelect(cash.accounts, cash.selected, 'account_id', { optional: '– noch keinem Konto zuordnen –' })}
-            <small class="muted">bucht den Eingang im Kassenbuch</small></label><span data-kind-show="money membership"></span>`
+            <small class="muted">bucht den Eingang zum Buchungsdatum im Kassenbuch</small></label>`
         : ''}
       <label class="check span-2" data-kind-show="money membership"><input type="checkbox" name="waiver" value="1"${checked(d.waiver)}>
         Verzicht auf Erstattung von Aufwendungen (Aufwandsspende) – nur bei einem vorher vereinbarten Erstattungsanspruch</label>
@@ -114,6 +132,8 @@ function donationForm(c: Ctx, t: Tenant, action: string, d: Partial<DonationInpu
         <label class="check"><input type="checkbox" name="goods_documents" value="1"${checked(d.goods_documents)}> Unterlagen zur Wertermittlung (Rechnung, Gutachten) liegen vor</label>
       </div>
       <label class="span-2">Notiz (intern) <input name="note" maxlength="300" value="${d.note ?? ''}" placeholder="z. B. Verwendungszweck der Überweisung"></label>
+      ${fileUploader(d.id ? 'Weitere Belege anhängen (PDF oder Foto)' : 'Beleg (PDF oder Foto, optional)', inbox, undefined,
+        'z. B. Kontoauszug, Überweisungsbeleg oder Spendenschreiben. PDF, JPEG oder PNG, je höchstens 10 MB.')}
     </div>
     ${!t.npo_membership_deductible
       ? html`<p class="muted small" data-kind-show="membership">Mitgliedsbeiträge sind bei diesem Verein nicht abziehbar (§ 10b Abs. 1 Satz 8 EStG) – sie werden erfasst, aber nicht bestätigt.</p>`
@@ -146,10 +166,44 @@ async function cashOptions(t: Tenant, donationId?: number) {
 async function syncCash(t: Tenant, donationId: number, d: DonationInput, accountId: number, userId: number) {
   if (!cashbookEnabled(t)) return;
   if (accountId && d.kind !== 'goods') {
-    await bookLinked(t, 'donation', donationId, { account_id: accountId, entry_date: d.donation_date, amount: d.amount, text: d.note }, userId);
+    await bookLinked(t, 'donation', donationId, { account_id: accountId, entry_date: bookingDateOf(d), amount: d.amount, text: d.note }, userId);
   } else {
     await unlink(t, 'donation', donationId, userId);
   }
+}
+
+/** Hochgeladene Dateien und ggf. einen Beleg aus dem Belegeingang an die Zuwendung hängen; liefert die Anzahl */
+async function storeFiles(c: Ctx, t: Tenant, form: Form, donationId: number): Promise<number> {
+  const files = filesFrom(await c.req.parseBody({ all: true }));
+  let n = await attachDonationFiles(t, donationId, files, userOf(c).id);
+  const inboxId = Number(str(form, 'inbox_id'));
+  if (inboxId) {
+    await assignInboxToDonation(t, inboxId, donationId, userOf(c).id);
+    n++;
+  }
+  return n;
+}
+
+/** Belege mit Vorschau (Bilder) bzw. PDF-Kennzeichen; archivieren statt löschen, Archivierte nur eingeklappt */
+function donationFilesList(c: Ctx, files: DonationFile[]): SafeHtml {
+  const item = (f: DonationFile) => html`<li class="${f.archived_at ? 'archived' : ''}">
+    <a href="/donations/files/${f.id}?inline=1" target="_blank" rel="noopener" class="entry-file">
+      ${f.file_mime.startsWith('image/') ? html`<img src="/donations/files/${f.id}?inline=1${f.cropped_at ? `&v=${encodeURIComponent(f.cropped_at)}` : ''}" alt="Beleg ${f.file_name}" loading="lazy">` : html`<span class="pdf-badge">PDF</span>`}
+      <span>${f.file_name}<span class="muted small"> · ${Math.max(1, Math.round(f.file_size / 1024))} KB${f.crop_path ? ' · zugeschnitten' : ''}${f.archived_at ? ' · archiviert' : ''}</span></span>
+    </a>
+    <span class="entry-file-actions">
+      ${f.archived_at ? '' : cropControls(c, f, `/donations/files/${f.id}/crop`, `/donations/files/${f.id}`, { small: true })}
+      ${postButton(c, `/donations/files/${f.id}/archive`, f.archived_at ? 'Wiederherstellen' : 'Archivieren', f.archived_at ? 'link' : 'link danger',
+        f.archived_at ? undefined : `Beleg „${f.file_name}“ archivieren? Er bleibt unverändert aufbewahrt (Aufbewahrungspflicht), wird aber nicht mehr angezeigt und nicht mehr exportiert.`)}
+    </span>
+  </li>`;
+  const active = files.filter((f) => !f.archived_at);
+  const archived = files.filter((f) => f.archived_at);
+  return html`${active.length ? html`<ul class="plain entry-file-list">${active.map(item)}</ul>` : html`<p class="muted small">Noch kein Beleg angehängt.</p>`}
+    ${archived.length
+      ? html`<details class="archived-files"><summary class="muted small">${archived.length} archivierte(r) Beleg(e) anzeigen</summary>
+          <ul class="plain entry-file-list">${archived.map(item)}</ul></details>`
+      : ''}`;
 }
 
 const yearOf = (q: string | undefined, fallback: number) => (q && /^\d{4}$/.test(q) ? Number(q) : fallback);
@@ -202,7 +256,7 @@ function register(app: App) {
               `Für ${openDonors} Zuwendende Bestätigungen über ${year} ausstellen? Sie erhalten fortlaufende Nummern und werden als Doppel archiviert.`)}
           </section>`
         : ''}
-      ${rows.length ? donationTable(t, rows) : empty(`Keine Zuwendungen in ${year}.`, html`<a class="btn primary" href="/donations/new">Zuwendung erfassen</a>`)}
+      ${rows.length ? donationTable(t, rows, true, await donationFileCounts(rows.map((r) => r.id))) : empty(`Keine Zuwendungen in ${year}.`, html`<a class="btn primary" href="/donations/new">Zuwendung erfassen</a>`)}
       <p class="muted small">Bis 300 € genügt dem Zuwendenden als Nachweis auch der Kontoauszug zusammen mit einem vereinfachten Beleg (§ 50 Abs. 4 EStDV).</p>`,
     });
   });
@@ -213,7 +267,7 @@ function register(app: App) {
     return page(c, {
       title: 'Zuwendung erfassen',
       back: { href: '/donations', label: 'Spenden' },
-      body: donationForm(c, t, '/donations', { contact_id: contactId || undefined }, await donorOptions(t.id), await cashOptions(t)),
+      body: donationForm(c, t, '/donations', { contact_id: contactId || undefined }, await donorOptions(t.id), await cashOptions(t), await inboxOf(t.id)),
     });
   });
 
@@ -222,13 +276,13 @@ function register(app: App) {
     const form = await readForm(c);
     const input = await parseDonation(form, t.id);
     const accountId = Number(str(form, 'account_id')) || 0;
-    if (accountId) assertOpen(t, input.donation_date);
-    const id = await tx(async () => {
+    if (accountId) assertOpen(t, bookingDateOf(input));
+    const { id, n } = await tx(async () => {
       const newId = await createDonation(t, input, userOf(c).id);
       await syncCash(t, newId, input, accountId, userOf(c).id);
-      return newId;
+      return { id: newId, n: await storeFiles(c, t, form, newId) };
     });
-    return redirectWith(c, `/donations/${id}`, 'ok', 'Zuwendung gespeichert.');
+    return redirectWith(c, `/donations/${id}`, 'ok', `Zuwendung gespeichert${n ? ` (${n} Beleg${n > 1 ? 'e' : ''})` : ''}.`);
   });
 
   app.get('/donations/receipts', async (c) => {
@@ -322,6 +376,8 @@ function register(app: App) {
     const year = Number(d.donation_date.slice(0, 4));
     const canConfirm = !d.receipt_id && confirmable(t, d);
     const payment = cashbookEnabled(t) ? await linkedEntry('donation', d.id) : undefined;
+    const files = await donationFilesOf(d.id);
+    const hasFiles = files.length > 0;
     return page(c, {
       title: `${DONATION_KINDS[d.kind]} vom ${formatDate(d.donation_date)}`,
       back: { href: `/donations?year=${year}`, label: 'Spenden' },
@@ -333,7 +389,8 @@ function register(app: App) {
       ${canConfirm ? settingsNotice(t) : ''}
       <section class="card"><dl class="dl cols">
         <dt>Zuwendender</dt><dd>${contact ? html`<a href="/contacts/${contact.id}">${contactLabel(contact)}</a>` : ''}</dd>
-        <dt>Datum</dt><dd>${formatDate(d.donation_date)}</dd>
+        <dt>Datum der Zuwendung</dt><dd>${formatDate(d.donation_date)}</dd>
+        ${d.kind !== 'goods' ? html`<dt>Buchungsdatum</dt><dd>${formatDate(bookingDateOf(d))}${d.booking_date ? '' : html` <span class="muted small">(wie Zuwendung)</span>`}</dd>` : ''}
         <dt>Art</dt><dd>${DONATION_KINDS[d.kind]}</dd>
         <dt>${d.kind === 'goods' ? 'Wert' : 'Betrag'}</dt><dd><strong>${formatMoney(d.amount)}</strong></dd>
         ${d.kind !== 'goods' ? html`<dt>Aufwandsverzicht</dt><dd>${d.waiver ? 'ja' : 'nein'}</dd>` : ''}
@@ -345,10 +402,16 @@ function register(app: App) {
           ? html`<a href="/donations/receipts/${receipt.id}">${RECEIPT_KIND_LABEL[receipt.kind]} ${receipt.number}</a> vom ${formatDate(receipt.issue_date)}`
           : donationStatus(t, d)}</dd>
       </dl></section>
+      <section class="card"><h2>Belege <span class="count">${files.filter((f) => !f.archived_at).length}</span></h2>
+        ${donationFilesList(c, files)}
+        <form method="post" action="/donations/${d.id}/files" enctype="multipart/form-data" class="stack">
+          ${csrfField(c)}${fileUploader('Beleg anhängen (PDF oder Foto)', await inboxOf(t.id), undefined, 'z. B. Kontoauszug, Überweisungsbeleg oder Spendenschreiben – auch nach der Bestätigung möglich.')}
+          <div><button class="btn primary">Hochladen</button></div></form>
+      </section>
       ${canConfirm && d.kind !== 'goods'
         ? html`<p class="muted small">Weitere Zuwendungen desselben Zuwendenden lassen sich am Jahresende gesammelt bestätigen – siehe <a href="/donations?year=${year}">Spenden ${year}</a>.</p>`
         : ''}
-      ${!d.receipt_id && !d.receipted_at
+      ${!d.receipt_id && !d.receipted_at && !hasFiles
         ? html`<div class="danger-zone">${postButton(c, `/donations/${d.id}/delete`, 'Löschen', 'btn danger', 'Zuwendung löschen? Eine Buchung im Kassenbuch bleibt stehen und wird storniert.')}</div>`
         : ''}`,
     });
@@ -361,7 +424,7 @@ function register(app: App) {
     return page(c, {
       title: 'Zuwendung bearbeiten',
       back: { href: `/donations/${d.id}`, label: 'Zuwendung' },
-      body: donationForm(c, t, `/donations/${d.id}`, d, await donorOptions(t.id, d.contact_id), await cashOptions(t, d.id)),
+      body: donationForm(c, t, `/donations/${d.id}`, d, await donorOptions(t.id, d.contact_id), await cashOptions(t, d.id), await inboxOf(t.id)),
     });
   });
 
@@ -370,17 +433,19 @@ function register(app: App) {
     const d = await getDonation(t.id, idParam(c)) ?? notFound();
     const form = await readForm(c);
     const input = await parseDonation(form, t.id);
-    await tx(async () => {
+    const n = await tx(async () => {
       await updateDonation(d, input);
       await syncCash(t, d.id, input, Number(str(form, 'account_id')) || 0, userOf(c).id);
+      return storeFiles(c, t, form, d.id);
     });
-    return redirectWith(c, `/donations/${d.id}`, 'ok', 'Zuwendung gespeichert.');
+    return redirectWith(c, `/donations/${d.id}`, 'ok', `Zuwendung gespeichert${n ? ` (${n} Beleg${n > 1 ? 'e' : ''} angehängt)` : ''}.`);
   });
 
   app.post('/donations/:id/delete', async (c) => {
     const t = npoTenant(c);
     const d = await getDonation(t.id, idParam(c)) ?? notFound();
     if (d.receipt_id || d.receipted_at) throw new UserError('Für diese Zuwendung wurde eine Zuwendungsbestätigung erstellt – sie lässt sich deshalb nicht löschen (auch nicht nach dem Storno der Bestätigung).');
+    if (await donationHasFiles(d.id)) throw new UserError('An dieser Zuwendung hängen Belege – sie sind aufbewahrungspflichtig, die Zuwendung lässt sich deshalb nicht löschen.');
     await tx(async () => {
       await unlink(t, 'donation', d.id, userOf(c).id);
       await deleteDonation(d);
@@ -395,6 +460,50 @@ function register(app: App) {
     const r = (await getReceipt(t.id, id))!;
     await audit(c, 'donation.receipt', r.number);
     return redirectWith(c, `/donations/receipts/${id}`, 'ok', `Zuwendungsbestätigung ${r.number} erstellt.`);
+  });
+
+  /* ---------------- Belege ---------------- */
+
+  /** Belege anhängen – jederzeit, auch an bestätigte Zuwendungen */
+  app.post('/donations/:id/files', async (c) => {
+    const t = npoTenant(c);
+    const d = await getDonation(t.id, idParam(c)) ?? notFound();
+    const form = await readForm(c);
+    const n = await tx(() => storeFiles(c, t, form, d.id));
+    if (!n) throw new UserError('Bitte ein PDF oder Foto auswählen.');
+    await audit(c, 'donation.file.add', `${DONATION_KINDS[d.kind]} vom ${formatDate(d.donation_date)}: ${n} Beleg(e)`);
+    return redirectWith(c, `/donations/${d.id}`, 'ok', `${n} Beleg(e) angehängt.`);
+  });
+
+  app.get('/donations/files/:id', async (c) => {
+    const t = npoTenant(c);
+    const f = await getDonationFile(t.id, idParam(c)) ?? notFound();
+    const v = await viewDonationFile(f, c.req.query('original') === '1');
+    return c.body(new Uint8Array(v.data), 200, {
+      'Content-Type': v.mime,
+      'Content-Disposition': attachment(v.name, c.req.query('inline') === '1'),
+      'Cache-Control': 'private, no-store',
+      'X-Content-Type-Options': 'nosniff',
+    });
+  });
+
+  /** Foto-Beleg zuschneiden – das Original bleibt unverändert erhalten */
+  app.post('/donations/files/:id/crop', async (c) => {
+    const t = npoTenant(c);
+    const f = await getDonationFile(t.id, idParam(c)) ?? notFound();
+    if (f.archived_at) throw new UserError('Der Beleg ist archiviert – zum Zuschneiden zuerst wiederherstellen.');
+    const r = await handleCrop(c, 'donation_files', 'verbindlichkeiten', t.id, f.id, f);
+    await audit(c, r === 'saved' ? 'donation.file.crop' : 'donation.file.uncrop', `Zuwendung ${f.donation_id}: ${f.file_name}`);
+    return redirectWith(c, `/donations/${f.donation_id}`, 'ok', r === 'saved' ? 'Beleg zugeschnitten – das Original bleibt unverändert erhalten.' : 'Zuschnitt verworfen – es gilt wieder das Original.');
+  });
+
+  /** Archivieren bzw. wiederherstellen – gelöscht wird nie (Aufbewahrungspflicht) */
+  app.post('/donations/files/:id/archive', async (c) => {
+    const t = npoTenant(c);
+    const f = await getDonationFile(t.id, idParam(c)) ?? notFound();
+    await setDonationFileArchived(f, !f.archived_at);
+    await audit(c, f.archived_at ? 'donation.file.restore' : 'donation.file.archive', `Zuwendung ${f.donation_id}: ${f.file_name}`);
+    return redirectWith(c, `/donations/${f.donation_id}`, 'ok', f.archived_at ? 'Beleg wiederhergestellt.' : 'Beleg archiviert – er bleibt unverändert aufbewahrt.');
   });
 }
 

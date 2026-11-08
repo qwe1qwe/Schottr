@@ -111,10 +111,11 @@ export async function countsCsv(t: Tenant, from: string, to: string): Promise<st
 
 export async function donationsCsv(t: Tenant, from: string, to: string): Promise<string | null> {
   const rows = await all<{
-    donation_date: string; kind: string; amount: number; waiver: number; description: string; name: string; street: string; zip: string; city: string;
+    donation_date: string; booking_date: string | null; files: number; kind: string; amount: number; waiver: number; description: string; name: string; street: string; zip: string; city: string;
     number: string | null; issue_date: string | null;
   }>(
-    `SELECT d.donation_date, d.kind, d.amount, d.waiver, d.description,
+    `SELECT d.donation_date, d.booking_date, d.kind, d.amount, d.waiver, d.description,
+       (SELECT COUNT(*) FROM donation_files f WHERE f.donation_id = d.id AND f.archived_at IS NULL) files,
        TRIM(CONCAT(c.company, IF(c.company <> '' AND c.name <> '', ', ', ''), c.name)) name, c.street, c.zip, c.city, r.number, r.issue_date
      FROM donations d JOIN contacts c ON c.id = d.contact_id LEFT JOIN donation_receipts r ON r.id = d.receipt_id
      WHERE d.tenant_id = ? AND d.donation_date BETWEEN ? AND ? ORDER BY d.donation_date, d.id`,
@@ -123,10 +124,10 @@ export async function donationsCsv(t: Tenant, from: string, to: string): Promise
   if (!rows.length) return null;
   const kinds: Record<string, string> = { money: 'Geldzuwendung', membership: 'Mitgliedsbeitrag', goods: 'Sachzuwendung' };
   return csv(
-    ['Datum', 'Zuwendender', 'Anschrift', 'Art', 'Betrag/Wert', 'Aufwandsverzicht', 'Bezeichnung (Sachzuwendung)', 'Bestätigung Nr.', 'Bestätigt am'],
+    ['Datum', 'Buchungsdatum', 'Zuwendender', 'Anschrift', 'Art', 'Betrag/Wert', 'Aufwandsverzicht', 'Bezeichnung (Sachzuwendung)', 'Bestätigung Nr.', 'Bestätigt am', 'Belege'],
     rows.map((r) => [
-      formatDate(r.donation_date), r.name, [r.street, `${r.zip} ${r.city}`.trim()].filter(Boolean).join(', '), kinds[r.kind] ?? r.kind, num(r.amount),
-      r.kind === 'goods' ? '' : r.waiver ? 'ja' : 'nein', r.description, r.number ?? '', r.issue_date ? formatDate(r.issue_date) : '',
+      formatDate(r.donation_date), r.kind === 'goods' ? '' : formatDate(r.booking_date || r.donation_date), r.name, [r.street, `${r.zip} ${r.city}`.trim()].filter(Boolean).join(', '), kinds[r.kind] ?? r.kind, num(r.amount),
+      r.kind === 'goods' ? '' : r.waiver ? 'ja' : 'nein', r.description, r.number ?? '', r.issue_date ? formatDate(r.issue_date) : '', Number(r.files) || '',
     ]),
   );
 }

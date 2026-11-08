@@ -951,4 +951,42 @@ export const migrations: { version: number; statements: string[] }[] = [
        THEN ${forbid('Belege sind unveraenderbar - nur archivieren ist moeglich')}; END IF`,
     ],
   },
+  {
+    version: 23,
+    statements: [
+      // Zuwendungen: Buchungsdatum = Tag der Gutschrift auf dem Konto (für Kassenbuch), getrennt vom
+      // Datum der Zuwendung, das auf die Bestätigung kommt. NULL = wie das Datum der Zuwendung.
+      `ALTER TABLE donations ADD COLUMN booking_date DATE NULL AFTER donation_date`,
+      // Belege zu Zuwendungen (Kontoauszug, Spendenschreiben, Foto) – Datei in der Belegablage
+      // (data/verbindlichkeiten/<Mandant>/spende_…). Wie alle Belege unveränderbar: nur archivieren.
+      `CREATE TABLE donation_files (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        tenant_id INT NOT NULL,
+        donation_id INT NOT NULL,
+        file_name VARCHAR(200) NOT NULL,
+        file_path VARCHAR(300) NOT NULL,
+        file_mime VARCHAR(60) NOT NULL,
+        file_size INT NOT NULL,
+        file_sha256 CHAR(64) NOT NULL,
+        crop_path VARCHAR(300) NULL,
+        crop_mime VARCHAR(60) NULL,
+        crop_size INT NULL,
+        crop_sha256 CHAR(64) NULL,
+        cropped_at DATETIME(3) NULL,
+        archived_at DATETIME(3) NULL,
+        created_by INT NULL,
+        created_at DATETIME(3) NOT NULL,
+        KEY donation_files_donation (donation_id),
+        CONSTRAINT donation_files_tenant FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
+        CONSTRAINT donation_files_donation FOREIGN KEY (donation_id) REFERENCES donations(id),
+        CONSTRAINT donation_files_user FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
+      ) ${TABLE}`,
+      `CREATE TRIGGER donation_files_keep BEFORE DELETE ON donation_files FOR EACH ROW
+       ${forbid('Belege sind aufbewahrungspflichtig und koennen nur archiviert werden')}`,
+      `CREATE TRIGGER donation_files_lock BEFORE UPDATE ON donation_files FOR EACH ROW
+       IF NEW.donation_id <> OLD.donation_id OR NEW.tenant_id <> OLD.tenant_id OR NEW.file_path <> OLD.file_path OR NEW.file_sha256 <> OLD.file_sha256
+          OR NEW.file_mime <> OLD.file_mime OR NEW.file_size <> OLD.file_size OR NEW.file_name <> OLD.file_name
+       THEN ${forbid('Belege sind unveraenderbar - nur archivieren ist moeglich')}; END IF`,
+    ],
+  },
 ];

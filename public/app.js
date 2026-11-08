@@ -49,7 +49,7 @@
 
   /* ---------- Nachträgliche Buchung vor einer Kassenzählung: Hinweis vorher ---------- */
   // Formulare mit data-count-check: Konto-Feld(er) in data-count-accounts (Standard account_id),
-  // Datumsfeld in data-count-date (Standard entry_date), bisheriger Stand beim Bearbeiten in
+  // Datumsfeld(er) in data-count-date (Standard entry_date), bisheriger Stand beim Bearbeiten in
   // data-count-orig („Konto:Datum“). Liegt eine Zählung dieser Kasse am oder nach dem Tag,
   // wird vor dem Speichern gefragt – die Zählungen werden danach neu berechnet.
   let countDates = null;
@@ -65,8 +65,12 @@
   document.addEventListener('submit', (e) => {
     const form = e.target;
     if (!(form instanceof HTMLFormElement) || !form.hasAttribute('data-count-check') || !countDates || e.defaultPrevented) return;
-    const dateField = form.elements.namedItem(form.dataset.countDate || 'entry_date');
-    const date = dateField && 'value' in dateField ? dateField.value : '';
+    // mehrere Felder (durch Komma getrennt): das erste ausgefüllte gilt, z. B. Buchungsdatum vor Datum der Zuwendung
+    let date = '';
+    for (const n of (form.dataset.countDate || 'entry_date').split(',')) {
+      const el = form.elements.namedItem(n);
+      if (el && 'value' in el && el.value && !(el.closest('[hidden]'))) { date = el.value; break; }
+    }
     const checks = [];
     if (date) {
       for (const n of (form.dataset.countAccounts || 'account_id').split(',')) {

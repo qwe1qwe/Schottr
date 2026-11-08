@@ -7,6 +7,7 @@ import { getLogo } from '../../lib/logo.ts';
 import type { Tenant } from '../../types.ts';
 import { getContact } from '../contacts.ts';
 import { renderReceiptPdf } from './pdf.ts';
+import { donationHasFiles } from './files.ts';
 import {
   donorLines, receiptBase, receiptProblems, yearRange,
   type DonationKind, type GoodsOrigin, type ReceiptData, type ReceiptItem, type ReceiptKind,
@@ -18,6 +19,8 @@ export interface Donation {
   contact_id: number;
   kind: DonationKind;
   donation_date: string;
+  /** Tag der Gutschrift auf dem Konto (Kassenbuch); NULL = wie donation_date */
+  booking_date: string | null;
   amount: number;
   waiver: number;
   description: string;
@@ -65,6 +68,7 @@ export interface DonationInput {
   contact_id: number;
   kind: DonationKind;
   donation_date: string;
+  booking_date: string | null;
   amount: number;
   waiver: number;
   description: string;
@@ -72,6 +76,9 @@ export interface DonationInput {
   goods_documents: number;
   note: string;
 }
+
+/** Buchungsdatum (Geldeingang) – ohne eigene Angabe das Datum der Zuwendung */
+export const bookingDateOf = (d: Pick<Donation, 'donation_date' | 'booking_date'>) => d.booking_date || d.donation_date;
 
 export async function parseDonation(form: Form, tenantId: number): Promise<DonationInput> {
   const errors: string[] = [];
@@ -82,6 +89,7 @@ export async function parseDonation(form: Form, tenantId: number): Promise<Donat
     contact_id: Number(str(form, 'contact_id')),
     kind,
     donation_date: str(form, 'donation_date'),
+    booking_date: kind !== 'goods' ? str(form, 'booking_date') || null : null,
     amount: parseDecimal(str(form, 'amount'), 2) ?? -1,
     waiver: kind !== 'goods' && str(form, 'waiver') === '1' ? 1 : 0,
     description: kind === 'goods' ? str(form, 'description', 1000) : '',
@@ -92,6 +100,11 @@ export async function parseDonation(form: Form, tenantId: number): Promise<Donat
   if (!await getContact(tenantId, d.contact_id)) errors.push('Bitte den Zuwendenden auswählen.');
   if (!isIsoDate(d.donation_date)) errors.push('Bitte ein gültiges Datum angeben.');
   else if (d.donation_date > today()) errors.push('Das Datum der Zuwendung liegt in der Zukunft.');
+  if (d.booking_date !== null) {
+    if (!isIsoDate(d.booking_date)) errors.push('Bitte ein gültiges Buchungsdatum angeben.');
+    else if (d.booking_date > today()) errors.push('Das Buchungsdatum liegt in der Zukunft.');
+    else if (d.booking_date === d.donation_date) d.booking_date = null;
+  }
   if (d.amount <= 0 || d.amount > 1e12) errors.push(kind === 'goods' ? 'Bitte den Wert der Sachzuwendung angeben.' : 'Bitte einen Betrag größer 0 angeben.');
   if (kind === 'goods' && !d.description) errors.push('Bitte die Sachzuwendung genau bezeichnen (Alter, Zustand, Kaufpreis usw.).');
   if (kind === 'goods' && !d.goods_origin) errors.push('Bitte angeben, ob die Sachzuwendung aus dem Betriebs- oder Privatvermögen stammt.');
@@ -99,7 +112,7 @@ export async function parseDonation(form: Form, tenantId: number): Promise<Donat
   return d;
 }
 
-const COLS = ['contact_id', 'kind', 'donation_date', 'amount', 'waiver', 'description', 'goods_origin', 'goods_documents', 'note'] as const;
+const COLS = ['contact_id', 'kind', 'donation_date', 'booking_date', 'amount', 'waiver', 'description', 'goods_origin', 'goods_documents', 'note'] as const;
 
 export async function createDonation(t: Tenant, d: DonationInput, userId: number): Promise<number> {
   const now = nowIso();
@@ -118,6 +131,9 @@ export async function updateDonation(existing: Donation, d: DonationInput) {
 export async function deleteDonation(existing: Donation) {
   if (existing.receipt_id || existing.receipted_at) {
     throw new UserError('Für diese Zuwendung wurde eine Zuwendungsbestätigung erstellt – sie bleibt deshalb dauerhaft gespeichert und lässt sich nicht löschen (auch nicht nach dem Storno der Bestätigung).');
+  }
+  if (await donationHasFiles(existing.id)) {
+    throw new UserError('An dieser Zuwendung hängen Belege – sie sind aufbewahrungspflichtig, die Zuwendung lässt sich deshalb nicht löschen.');
   }
   await run('DELETE FROM donations WHERE id = ?', existing.id);
 }

@@ -856,11 +856,11 @@ export async function unassigned(t: Tenant): Promise<Unassigned[]> {
     t.id, since,
   );
   const don = await all<{ id: number; donation_date: string; amount: number; kind: string; label: string }>(
-    `SELECT d.id, d.donation_date, d.amount, d.kind, COALESCE(NULLIF(c.company, ''), c.name) label
+    `SELECT d.id, COALESCE(d.booking_date, d.donation_date) donation_date, d.amount, d.kind, COALESCE(NULLIF(c.company, ''), c.name) label
      FROM donations d JOIN contacts c ON c.id = d.contact_id
-     WHERE d.tenant_id = ? AND d.kind IN ('money', 'membership') AND d.donation_date >= ?
+     WHERE d.tenant_id = ? AND d.kind IN ('money', 'membership') AND COALESCE(d.booking_date, d.donation_date) >= ?
        AND NOT EXISTS (SELECT 1 FROM cash_entries e WHERE e.donation_id = d.id)
-     ORDER BY d.donation_date`,
+     ORDER BY COALESCE(d.booking_date, d.donation_date)`,
     t.id, since,
   );
   return [

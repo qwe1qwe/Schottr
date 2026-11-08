@@ -2,6 +2,7 @@ import { all, one, run, tx, nowIso } from '../../db/index.ts';
 import { clip } from '../../views/clip.ts';
 import { vatOptions } from '../../views/vat.ts';
 import { isRate } from '../../lib/vat.ts';
+import { donationFileCounts } from '../donations/files.ts';
 import { attachFiles, fileCounts, filesFrom, filesOf, getFile, hasFiles, setFileArchived, viewEntryFile, type EntryFile } from './files.ts';
 import { handleCrop } from '../../lib/crop.ts';
 import { cropControls } from '../../views/crop.ts';
@@ -77,14 +78,18 @@ async function attachmentsOf(rows: EntryRow[]): Promise<Map<number, { n: number;
          FROM purchase_invoices p WHERE p.id IN (${purchaseIds.map(() => '?').join(',')})`, ...purchaseIds,
       )).map((x) => [x.id, Number(x.n)] as const)
     : []);
+  // Belege der Zuwendung (Kontoauszug, Spendenschreiben …)
+  const dFiles = await donationFileCounts([...new Set(rows.map((r) => r.donation_id).filter((x): x is number => !!x))]);
   const out = new Map<number, { n: number; title: string }>();
   for (const r of rows) {
     const n = own.get(r.id) ?? 0;
     const pn = r.purchase_id ? pFiles.get(r.purchase_id) ?? 0 : 0;
+    const dn = r.donation_id ? dFiles.get(r.donation_id) ?? 0 : 0;
     const parts = n ? [`${n} ${n === 1 ? 'Beleg' : 'Belege'}`] : [];
     if (pn) parts.push(pn === 1 ? 'Beleg der Eingangsrechnung' : `${pn} Belege der Eingangsrechnung`);
+    if (dn) parts.push(dn === 1 ? 'Beleg der Zuwendung' : `${dn} Belege der Zuwendung`);
     if (r.document_id) parts.push('Rechnungs-PDF');
-    const total = n + pn + (r.document_id ? 1 : 0);
+    const total = n + pn + dn + (r.document_id ? 1 : 0);
     if (total) out.set(r.id, { n: total, title: parts.join(' + ') });
   }
   return out;

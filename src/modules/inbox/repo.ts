@@ -135,7 +135,7 @@ export const readInbox = (f: Pick<InboxFile, 'file_path'>) => readStoredFile(ARE
 export const viewInbox = (f: InboxFile, original = false) => viewOf(AREA, f, original);
 
 /** Zuschnitt aus dem Belegeingang an die Eingangsrechnung bzw. den Buchungsbeleg weitergeben */
-export const carryCrop = (f: InboxFile, table: 'purchase_invoices' | 'purchase_files' | 'cash_entry_files', tenantId: number, id: number) =>
+export const carryCrop = (f: InboxFile, table: 'purchase_invoices' | 'purchase_files' | 'cash_entry_files' | 'donation_files', tenantId: number, id: number) =>
   copyCrop(AREA, f, table, 'verbindlichkeiten', tenantId, id);
 
 /** Noch offener Beleg (zum Zuordnen) – sonst Fehler */

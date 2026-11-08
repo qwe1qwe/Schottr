@@ -1,6 +1,7 @@
 import { all, one } from '../db/index.ts';
 import { cashbookEnabled, unassigned } from './cashbook/repo.ts';
 import { viewEntryFile, type EntryFile } from './cashbook/files.ts';
+import { viewDonationFile, type DonationFile } from './donations/files.ts';
 import { viewName, viewOf } from '../lib/crop.ts';
 import { accountReports, cashbookCsv, cashbookPdf, countsCsv, donationsCsv, sphereCsv, sphereSummary, summaryPdf } from './cashbook/report.ts';
 import { audit } from '../lib/audit.ts';
@@ -417,6 +418,16 @@ function register(app: App) {
     const receipts = await all<{ number: string; pdf: Buffer; status: string }>(
       'SELECT number, pdf, status FROM donation_receipts WHERE tenant_id = ? AND issue_date BETWEEN ? AND ? ORDER BY number', t.id, from, to,
     );
+    // Belege zu den Zuwendungen (Kontoauszug, Spendenschreiben …) – archivierte nicht
+    const donationFiles = await all<DonationFile & { donation_date: string }>(
+      `SELECT f.*, d.donation_date FROM donation_files f JOIN donations d ON d.id = f.donation_id
+       WHERE f.tenant_id = ? AND f.archived_at IS NULL AND d.donation_date BETWEEN ? AND ? ORDER BY d.donation_date, f.id`,
+      t.id, from, to,
+    );
+    for (const f of donationFiles) {
+      const v = await viewDonationFile(f);
+      files.push({ name: `05_Spenden/Belege/${f.donation_date}_Z${f.donation_id}_${safeName(v.name)}`, data: v.data });
+    }
     for (const r of receipts) {
       files.push({ name: `05_Spenden/Zuwendungsbestaetigungen/${safeName(r.number)}${r.status === 'cancelled' ? '_STORNIERT' : ''}.pdf`, data: Buffer.from(r.pdf) });
     }
