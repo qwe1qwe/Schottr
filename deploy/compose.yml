@@ -52,4 +52,8 @@ services:
       SCHOTTR_ALLOW_REGISTRATION: ${SCHOTTR_ALLOW_REGISTRATION:-false}
       SCHOTTR_SECURE_COOKIES: "auto"
       SCHOTTR_TRUST_PROXY: "true"
+      # Anmeldung mit Google (leer = aus)
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      SCHOTTR_PUBLIC_URL: ${SCHOTTR_PUBLIC_URL:-}
       TZ: Europe/Berlin

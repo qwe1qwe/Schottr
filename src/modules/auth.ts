@@ -12,7 +12,8 @@ import { barePage, csrfField, page } from '../views/layout.ts';
 import { config } from '../config.ts';
 import { audit, getSetting } from '../lib/audit.ts';
 import { orgFromForm, orgFields, type OrgType } from '../lib/nonprofit.ts';
-import type { App, Module } from '../types.ts';
+import { googleEnabled, googleIcon, googleAccountSection, hasPassword } from '../lib/google.ts';
+import type { App, Ctx, Module } from '../types.ts';
 
 /** Angaben zur Organisationsform aus den Anlegeformularen */
 export const tenantOptions = (form: Form) => ({ smallBusiness: str(form, 'small_business') === '1', ...orgFromForm(form) });
@@ -39,6 +40,28 @@ export async function createTenant(
   return tenantId;
 }
 
+/**
+ * Anmeldung abschließen (Passwort oder Google): Zeitpunkt merken, protokollieren,
+ * Sitzung mit dem ersten aktiven Mandanten anlegen.
+ */
+export async function completeLogin(c: Ctx, user: { id: number; email: string }, method = 'Passwort') {
+  await run('UPDATE users SET last_login_at = ? WHERE id = ?', nowIso(), user.id);
+  await audit(c, 'login.success', method === 'Passwort' ? '' : method, { userId: user.id, email: user.email, tenantId: null });
+  const membership = await one(
+    'SELECT m.tenant_id FROM memberships m JOIN tenants t ON t.id = m.tenant_id WHERE m.user_id = ? AND t.disabled = 0 ORDER BY m.tenant_id LIMIT 1',
+    user.id,
+  );
+  const { token } = await createSession(user.id, membership?.tenant_id ?? null);
+  setSessionCookie(c, token);
+  return c.redirect('/', 303);
+}
+
+const googleButton = (label: string) =>
+  googleEnabled()
+    ? html`<div class="auth-sep"><span>oder</span></div>
+      <a class="btn google" href="/auth/google">${googleIcon()} ${label}</a>`
+    : '';
+
 const passwordSchema = z.string().min(10, 'Das Passwort muss mindestens 10 Zeichen lang sein.').max(200);
 const emailSchema = z.email('Bitte eine gültige E-Mail-Adresse angeben.').max(200);
 
@@ -49,6 +72,7 @@ async function loginForm(c: Parameters<typeof barePage>[0], email = '') {
     <label>Passwort <input type="password" name="password" autocomplete="current-password" required></label>
     <button class="btn primary">Anmelden</button>
   </form>
+  ${googleButton('Mit Google anmelden')}
   ${await registrationOpen() ? html`<p class="muted center">Noch kein Zugang? <a href="/register">Registrieren</a></p>` : ''}`;
 }
 
@@ -66,6 +90,7 @@ async function registerForm(values: Record<string, string> = {}) {
     <label class="check"><input type="checkbox" name="small_business" value="1"> Kleinunternehmer nach § 19 UStG</label>
     <button class="btn primary">Konto anlegen</button>
   </form>
+  ${googleButton('Mit Google registrieren')}
   <p class="muted center"><a href="/login">Zur Anmeldung</a></p>`;
 }
 
@@ -92,15 +117,7 @@ function register(app: App) {
       await audit(c, 'login.disabled', '', { userId: user.id, email, tenantId: null });
       return barePage(c, 'Anmelden', await loginForm(c, email), 403, { type: 'error', message: 'Dieses Konto ist gesperrt. Bitte wende dich an den Administrator.' });
     }
-    await run('UPDATE users SET last_login_at = ? WHERE id = ?', nowIso(), user.id);
-    await audit(c, 'login.success', '', { userId: user.id, email, tenantId: null });
-    const membership = await one(
-      'SELECT m.tenant_id FROM memberships m JOIN tenants t ON t.id = m.tenant_id WHERE m.user_id = ? AND t.disabled = 0 ORDER BY m.tenant_id LIMIT 1',
-      user.id,
-    );
-    const { token } = await createSession(user.id, membership?.tenant_id ?? null);
-    setSessionCookie(c, token);
-    return c.redirect('/', 303);
+    return completeLogin(c, { id: user.id, email: user.email });
   });
 
   app.post('/logout', async (c) => {
@@ -172,6 +189,7 @@ function register(app: App) {
       'SELECT t.name, m.role FROM memberships m JOIN tenants t ON t.id = m.tenant_id WHERE m.user_id = ? ORDER BY t.name',
       user.id,
     );
+    const withPassword = hasPassword((await one('SELECT password_hash FROM users WHERE id = ?', user.id))?.password_hash);
     return page(c, {
       title: 'Mein Konto',
       body: html`
@@ -185,14 +203,16 @@ function register(app: App) {
         </form>
       </section>
       <section class="card narrow">
-        <h2>Passwort ändern</h2>
+        <h2>${withPassword ? 'Passwort ändern' : 'Passwort festlegen'}</h2>
+        ${withPassword ? '' : html`<p class="muted">Du meldest dich bisher nur mit Google an. Mit einem Passwort geht es auch ohne.</p>`}
         <form method="post" action="/account/password" class="stack">
           ${csrfField(c)}
-          <label>Aktuelles Passwort <input type="password" name="current" required autocomplete="current-password"></label>
+          ${withPassword ? html`<label>Aktuelles Passwort <input type="password" name="current" required autocomplete="current-password"></label>` : ''}
           <label>Neues Passwort <input type="password" name="password" required minlength="10" autocomplete="new-password"></label>
-          <button class="btn">Passwort ändern</button>
+          <button class="btn">${withPassword ? 'Passwort ändern' : 'Passwort festlegen'}</button>
         </form>
       </section>
+      ${await googleAccountSection(c, user.id, csrfField(c))}
       <section class="card narrow">
         <h2>Meine Mandanten</h2>
         <ul class="plain">${memberships.map((m) => html`<li>${m.name} <span class="muted">· ${m.role === 'owner' ? 'Inhaber' : 'Mitglied'}</span></li>`)}</ul>
@@ -210,7 +230,8 @@ function register(app: App) {
   app.post('/account/password', async (c) => {
     const form = await readForm(c);
     const user = (await one('SELECT * FROM users WHERE id = ?', userOf(c).id))!;
-    if (!(await verifyPassword(str(form, 'current', 200), user.password_hash))) {
+    // Konten ohne Passwort (über Google angelegt) dürfen eines festlegen
+    if (hasPassword(user.password_hash) && !(await verifyPassword(str(form, 'current', 200), user.password_hash))) {
       return redirectWith(c, '/account', 'error', 'Das aktuelle Passwort ist falsch.');
     }
     const parsed = passwordSchema.safeParse(str(form, 'password', 200));

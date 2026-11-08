@@ -44,4 +44,15 @@ export const config = {
   get allowEphemeralFiles(): boolean {
     return bool(env.SCHOTTR_ALLOW_EPHEMERAL_FILES, false);
   },
+  /** Anmeldung mit Google: OAuth-Client (Typ „Webanwendung“) aus der Google Cloud Console */
+  get googleClientId(): string {
+    return env.GOOGLE_CLIENT_ID ?? '';
+  },
+  get googleClientSecret(): string {
+    return env.GOOGLE_CLIENT_SECRET ?? '';
+  },
+  /** Öffentliche Adresse, z. B. https://schottr.example.de – für die Rücksprung-URL zu Google */
+  get publicUrl(): string {
+    return (env.SCHOTTR_PUBLIC_URL ?? '').replace(/\/+$/, '');
+  },
 };

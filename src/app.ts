@@ -12,7 +12,7 @@ import { page, barePage, setNav } from './views/layout.ts';
 import { modules } from './modules/index.ts';
 import type { AppEnv, Tenant, User, Role } from './types.ts';
 
-const PUBLIC_PATHS = ['/login', '/register', '/health'];
+const PUBLIC_PATHS = ['/login', '/register', '/health', '/auth/google', '/auth/google/callback', '/auth/google/register'];
 
 export function createApp() {
   const app = new Hono<AppEnv>();
@@ -123,7 +123,7 @@ export function createApp() {
       return c.redirect('/login', 303);
     }
     // Ohne Mandant: Einladungen annehmen oder eigenen Mandanten anlegen
-    const allowedWithoutTenant = ['/account', '/account/password', '/logout', '/tenants', '/tenants/new', '/tenant/switch', '/invitations'];
+    const allowedWithoutTenant = ['/account', '/account/password', '/account/google/unlink', '/logout', '/tenants', '/tenants/new', '/tenant/switch', '/invitations'];
     if (path === '/admin' || path.startsWith('/admin/')) {
       // Übergreifende Administration – nur für Administratoren, auch ohne eigenen Mandanten
       if (!c.get('user')!.is_admin) throw new HTTPException(403, { message: 'Nur für Administratoren' });

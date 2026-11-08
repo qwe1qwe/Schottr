@@ -1844,6 +1844,154 @@ test('Kontoumsätze: Bankzugang, Abruf, Abgleich in beide Richtungen, mehrere Po
   await run("UPDATE tenants SET org_type = 'association' WHERE id = ?", t.id);
 });
 
+test('Anmeldung mit Google: Verknüpfen, Registrieren, Passwort festlegen, Trennen', opts, async () => {
+  const { setSetting } = await import('../src/lib/audit.ts');
+  process.env.GOOGLE_CLIENT_ID = 'test-client.apps.googleusercontent.com';
+  process.env.GOOGLE_CLIENT_SECRET = 'test-secret';
+  const realFetch = globalThis.fetch;
+  // Google-Token-Endpunkt nachstellen: liefert ein ID-Token mit den gewünschten Angaben
+  let claims: Record<string, unknown> = {};
+  let tokenRequest: URLSearchParams | null = null;
+  globalThis.fetch = (async (url: string | URL, init?: RequestInit) => {
+    assert.equal(String(url), 'https://oauth2.googleapis.com/token');
+    tokenRequest = new URLSearchParams(String(init?.body));
+    const idToken = `x.${Buffer.from(JSON.stringify(claims)).toString('base64url')}.y`;
+    return new Response(JSON.stringify({ id_token: idToken }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as typeof fetch;
+
+  // eigener Cookie-Speicher, damit die übrigen Tests unberührt bleiben
+  const jar = new Map<string, string>();
+  const send = async (path: string, init: { form?: Record<string, string>; csrf?: string } = {}) => {
+    const headers: Record<string, string> = { cookie: [...jar].map(([k, v]) => `${k}=${v}`).join('; ') };
+    let body: URLSearchParams | undefined;
+    if (init.form) {
+      body = new URLSearchParams(init.form);
+      if (init.csrf) body.append('_csrf', init.csrf);
+      headers['content-type'] = 'application/x-www-form-urlencoded';
+    }
+    const res = await app.request(`https://schottr.example.de${path}`, { method: body ? 'POST' : 'GET', headers, body });
+    for (const c of res.headers.getSetCookie()) {
+      const [pair] = c.split(';');
+      const i = pair.indexOf('=');
+      const [k, v] = [pair.slice(0, i), pair.slice(i + 1)];
+      if (v && !/Max-Age=0/i.test(c)) jar.set(k, v); else jar.delete(k);
+    }
+    return res;
+  };
+  const csrfOf = async () => /name="_csrf" value="([^"]+)"/.exec(await (await send('/account')).text())![1];
+  /** kompletter Durchlauf: /auth/google → (Google) → Callback */
+  const google = async (c: Record<string, unknown>, start = '/auth/google') => {
+    const res = await send(start);
+    assert.equal(res.status, 302);
+    const target = new URL(res.headers.get('location')!);
+    const flow = JSON.parse(Buffer.from(jar.get('schottr_oidc')!.split('.')[0], 'base64url').toString());
+    assert.equal(target.searchParams.get('state'), flow.state);
+    claims = {
+      iss: 'https://accounts.google.com', aud: process.env.GOOGLE_CLIENT_ID, nonce: flow.nonce,
+      exp: Math.floor(Date.now() / 1000) + 600, email_verified: true, ...c,
+    };
+    return send(`/auth/google/callback?code=code-1&state=${flow.state}`);
+  };
+
+  try {
+    let page = await (await send('/login')).text();
+    assert.match(page, /Mit Google anmelden/);
+
+    // bekannte, von Google bestätigte E-Mail → automatisch verknüpft und angemeldet
+    let res = await google({ sub: 'g-tina', email: 'Tina@example.com', name: 'Tina' });
+    assert.equal(res.status, 303);
+    assert.equal(location(res), '/');
+    assert.ok(jar.has('schottr_sid'));
+    assert.equal(tokenRequest!.get('code'), 'code-1');
+    assert.ok(tokenRequest!.get('code_verifier'));
+    assert.equal(tokenRequest!.get('redirect_uri'), 'https://schottr.example.de/auth/google/callback');
+    const tina = (await one("SELECT id FROM users WHERE email = 'tina@example.com'"))!;
+    assert.equal((await one("SELECT user_id FROM user_identities WHERE provider = 'google' AND subject = 'g-tina'"))!.user_id, tina.id);
+    page = await (await send('/account')).text();
+    assert.match(page, /Verknüpft mit <strong>tina@example.com<\/strong>/);
+    await send('/logout', { form: {}, csrf: await csrfOf() });
+    assert.ok(!jar.has('schottr_sid'));
+
+    // erneut – jetzt über die Verknüpfung, auch wenn sich die E-Mail bei Google geändert hat
+    res = await google({ sub: 'g-tina', email: 'tina.neu@example.com' });
+    assert.equal(location(res), '/');
+    jar.delete('schottr_sid');
+
+    // manipulierter State wird abgewiesen
+    await send('/auth/google');
+    res = await send('/auth/google/callback?code=x&state=falsch');
+    assert.equal(location(res), '/login');
+    assert.ok(!jar.has('schottr_sid'));
+
+    // unbestätigte E-Mail eines bestehenden Kontos wird nicht verknüpft
+    await setSetting('allow_registration', '0');
+    res = await google({ sub: 'g-fremd', email: 'tina@example.com', email_verified: false });
+    assert.equal(location(res), '/login');
+    assert.ok(!jar.has('schottr_sid'));
+    assert.equal(await one("SELECT 1 FROM user_identities WHERE subject = 'g-fremd'"), undefined);
+
+    // unbekannt bei geschlossener Registrierung → kein Zugang
+    res = await google({ sub: 'g-neu', email: 'neu@example.com' });
+    assert.equal(location(res), '/login');
+    assert.equal(await one("SELECT 1 FROM users WHERE email = 'neu@example.com'"), undefined);
+
+    // unbekannt bei offener Registrierung → Mandant anlegen, ohne Passwort
+    await setSetting('allow_registration', '1');
+    res = await google({ sub: 'g-neu', email: 'neu@example.com', name: 'Nina Neu' });
+    assert.equal(location(res), '/auth/google/register');
+    page = await (await send('/auth/google/register')).text();
+    assert.match(page, /neu@example.com/);
+    assert.match(page, /value="Nina Neu"/);
+    res = await send('/auth/google/register', { form: { company: 'Neu GmbH', name: 'Nina Neu', org_type: 'company' } });
+    assert.equal(res.status, 303);
+    assert.equal(location(res), '/settings');
+    const nina = (await one("SELECT id, password_hash, is_admin FROM users WHERE email = 'neu@example.com'"))!;
+    assert.equal(nina.password_hash, '');
+    assert.equal(nina.is_admin, 0);
+    assert.ok(await one("SELECT 1 FROM memberships m JOIN tenants t ON t.id = m.tenant_id WHERE m.user_id = ? AND t.name = 'Neu GmbH' AND m.role = 'owner'", nina.id));
+    // Passwort-Login ist für dieses Konto nicht möglich
+    const pwLogin = await app.request('/login', {
+      method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ email: 'neu@example.com', password: '' }),
+    });
+    assert.equal(pwLogin.status, 401);
+
+    // Trennen erst, wenn ein Passwort festgelegt ist
+    page = await (await send('/account')).text();
+    assert.match(page, /Passwort festlegen/);
+    assert.doesNotMatch(page, /name="current"/);
+    let csrfNina = await csrfOf();
+    await send('/account/google/unlink', { form: {}, csrf: csrfNina });
+    assert.ok(await one("SELECT 1 FROM user_identities WHERE user_id = ?", nina.id));
+    await send('/account/password', { form: { password: 'ninas-langes-passwort' }, csrf: csrfNina });
+    assert.match((await one('SELECT password_hash FROM users WHERE id = ?', nina.id))!.password_hash, /^scrypt\$/);
+    await send('/account/google/unlink', { form: {}, csrf: csrfNina });
+    assert.equal(await one("SELECT 1 FROM user_identities WHERE user_id = ?", nina.id), undefined);
+
+    // nachträglich aus „Mein Konto“ verknüpfen
+    res = await google({ sub: 'g-nina', email: 'nina.privat@gmail.com' }, '/auth/google?link=1');
+    assert.equal(location(res), '/account');
+    assert.equal((await one("SELECT user_id FROM user_identities WHERE subject = 'g-nina'"))!.user_id, nina.id);
+    // ein bereits fremd verknüpftes Google-Konto lässt sich nicht übernehmen
+    await send('/account/google/unlink', { form: {}, csrf: csrfNina });
+    res = await google({ sub: 'g-tina', email: 'tina@example.com' }, '/auth/google?link=1');
+    assert.equal(location(res), '/account');
+    assert.equal((await one("SELECT user_id FROM user_identities WHERE subject = 'g-tina'"))!.user_id, tina.id);
+
+    // gesperrtes Konto kommt auch über Google nicht hinein
+    jar.clear();
+    await run('UPDATE users SET disabled = 1 WHERE id = ?', tina.id);
+    res = await google({ sub: 'g-tina', email: 'tina@example.com' });
+    assert.equal(location(res), '/login');
+    assert.ok(!jar.has('schottr_sid'));
+    await run('UPDATE users SET disabled = 0 WHERE id = ?', tina.id);
+  } finally {
+    globalThis.fetch = realFetch;
+    delete process.env.GOOGLE_CLIENT_ID;
+    delete process.env.GOOGLE_CLIENT_SECRET;
+  }
+});
+
 function formatCents(c: number) {
   return (c / 100).toFixed(2).replace('.', ',');
 }

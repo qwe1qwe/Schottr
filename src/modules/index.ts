@@ -1,5 +1,6 @@
 import type { Module } from '../types.ts';
 import { authModule } from './auth.ts';
+import { googleModule } from './google.ts';
 import { dashboardModule } from './dashboard.ts';
 import { contactsModule } from './contacts.ts';
 import { quotesModule, invoicesModule } from './documents/routes.ts';
@@ -24,6 +25,7 @@ import { bankModule } from './bank/routes.ts';
  */
 export const modules: Module[] = [
   authModule,
+  googleModule,
   dashboardModule,
   contactsModule,
   articlesModule,

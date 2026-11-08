@@ -102,7 +102,35 @@ DB_PASSWORD=geheim npm start
 | `SCHOTTR_TRUST_PROXY` | `true` | `X-Forwarded-For` für die Login-Bremse auswerten |
 | `SCHOTTR_DATA_DIR` | `./data` (Docker: `/app/data`) | Dateiablage für Nachweise und Eingangsrechnungen |
 | `SCHOTTR_ALLOW_EPHEMERAL_FILES` | `false` | Nur zum Testen: im Container ohne Volume starten |
+| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | – | Anmeldung mit Google aktivieren (siehe unten) |
+| `SCHOTTR_PUBLIC_URL` | – | Öffentliche Adresse, z. B. `https://schottr.example.de` – für die Rücksprung-URL zu Google. Ohne Angabe aus `X-Forwarded-Proto`/`Host` ermittelt. |
 | `SCHOTTR_FINTS_PRODUCT_ID` | – | FinTS-Produkt-ID für den Umsatzabruf (Vorrang hat der Wert unter *Administration → System*) |
+
+### Anmeldung mit Google
+
+Optional können sich Benutzer zusätzlich mit ihrem Google-Konto anmelden (OpenID Connect,
+Authorization Code Flow mit PKCE – ohne weitere Abhängigkeit).
+
+1. In der [Google Cloud Console](https://console.cloud.google.com/apis/credentials) unter
+   *APIs & Dienste → Anmeldedaten* eine **OAuth-Client-ID** vom Typ **Webanwendung** anlegen
+   (vorher ggf. den OAuth-Zustimmungsbildschirm einrichten; Bereiche `openid`, `email`, `profile`).
+2. Als **autorisierte Weiterleitungs-URI** eintragen: `https://<deine-adresse>/auth/google/callback`
+3. Client-ID und -Secret in der `.env` setzen, dazu die öffentliche Adresse:
+   ```
+   GOOGLE_CLIENT_ID=1234567890-abc.apps.googleusercontent.com
+   GOOGLE_CLIENT_SECRET=GOCSPX-...
+   SCHOTTR_PUBLIC_URL=https://schottr.example.de
+   ```
+4. Container neu starten – auf der Anmeldeseite erscheint *Mit Google anmelden*.
+
+Verhalten:
+- Ist ein Google-Konto bereits verknüpft, wird direkt angemeldet.
+- Gibt es ein Schottr-Konto mit derselben (von Google bestätigten) E-Mail-Adresse, wird es beim
+  ersten Mal automatisch verknüpft.
+- Unbekannte Google-Konten können sich nur registrieren, wenn die Registrierung offen ist
+  (dann ohne Passwort; ein Passwort lässt sich unter *Mein Konto* nachträglich festlegen).
+- Unter *Mein Konto* lässt sich Google verknüpfen oder trennen (trennen nur mit Passwort).
+- Gesperrte Konten kommen auch über Google nicht hinein; Anmeldungen landen im Protokoll.
 
 ## Funktionen
 

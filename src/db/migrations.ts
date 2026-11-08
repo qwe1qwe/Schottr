@@ -1082,4 +1082,23 @@ export const migrations: { version: number; statements: string[] }[] = [
       ) ${TABLE}`,
     ],
   },
+  {
+    version: 26,
+    statements: [
+      // Externe Anmeldung (z. B. Google): je Anbieter höchstens eine Verknüpfung pro Benutzer.
+      // Benutzer, die über Google angelegt wurden, haben ein leeres password_hash (kein Passwort).
+      `CREATE TABLE user_identities (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_id INT NOT NULL,
+        provider VARCHAR(20) NOT NULL,
+        subject VARCHAR(255) NOT NULL,
+        email VARCHAR(200) NOT NULL DEFAULT '',
+        created_at DATETIME(3) NOT NULL,
+        last_login_at DATETIME(3) NULL,
+        UNIQUE KEY user_identities_subject (provider, subject),
+        UNIQUE KEY user_identities_user_provider (user_id, provider),
+        CONSTRAINT user_identities_fk_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      ) ${TABLE}`,
+    ],
+  },
 ];

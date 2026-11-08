@@ -404,6 +404,11 @@ a.stat:hover { border-color: var(--line-strong); }
 body.bare { display: grid; place-items: center; min-height: 100vh; padding: 1rem; }
 .auth-card { width: 100%; max-width: 400px; background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 2rem; box-shadow: var(--shadow); }
 .auth-card .btn.primary { justify-content: center; padding: .75rem; }
+.auth-sep { display: flex; align-items: center; gap: .75rem; margin: 1.1rem 0; color: var(--muted); font-size: .85rem; }
+.auth-sep::before, .auth-sep::after { content: ""; flex: 1; border-top: 1px solid var(--line); }
+.btn.google { justify-content: center; gap: .6rem; }
+.auth-card .btn.google { display: flex; padding: .75rem; }
+.google-g { flex: none; }
 
 /* ---------- Artikel im Positionseditor ---------- */
 .add-items { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; }
