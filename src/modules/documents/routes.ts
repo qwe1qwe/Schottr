@@ -3,6 +3,7 @@ import { nextNumber } from '../../lib/numbering.ts';
 import { html, nl2br, selected, type SafeHtml } from '../../lib/html.ts';
 import { isSphere, sphereLabel, sphereSelect, SPHERES } from '../../lib/nonprofit.ts';
 import { accountsOf, bookLinked, cashbookEnabled, getAccount, linkedEntry, unlink } from '../cashbook/repo.ts';
+import { payWithBankCard } from '../bank/views.ts';
 import { accountSelect } from '../cashbook/routes.ts';
 import { addDays, formatDate, isIsoDate, monthEnd, monthLabel, paidPeriod, today } from '../../lib/dates.ts';
 import { formatMoney, formatQuantity, formatRate, formatAmount, parseDecimal } from '../../lib/money.ts';
@@ -393,6 +394,7 @@ function register(app: App, kind: Kind) {
       <section class="card">
         <dl class="dl cols">${meta.map(([l, v]) => html`<dt>${l}</dt><dd>${v}</dd>`)}</dl>
       </section>
+      ${cashAccounts.length && ['open', 'paid'].includes(doc.status) ? await payWithBankCard(c, t, 'invoice', doc.id, dueAmount(data), false, doc.issue_date, `${base}/${doc.id}`) : ''}
       ${cashAccounts.length && doc.status === 'open'
         ? html`<section class="card">
             <h2>Zahlungseingang</h2>

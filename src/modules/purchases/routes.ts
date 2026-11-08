@@ -1,4 +1,5 @@
 import { sphereLabel } from '../../lib/nonprofit.ts';
+import { payWithBankCard } from '../bank/views.ts';
 import { accountsOf, bookLinked, cashbookEnabled, entryCandidates, entryForPurchase, getAccount, linkEntryToPurchase, linkedEntry, shareEntryFileWithPurchase, unlink } from '../cashbook/repo.ts';
 import { accountSelect, fileUploader } from '../cashbook/routes.ts';
 import { filesFrom, MAX_ENTRY_FILE, mimeOf } from '../cashbook/files.ts';
@@ -416,6 +417,7 @@ function register(app: App) {
               <button class="btn">Verbinden</button>
             </form>
           </section>` : ''}
+          ${archived ? '' : await payWithBankCard(c, t, 'purchase', p.id, payable(p), !!p.is_credit, p.issue_date, `/purchases/${p.id}`)}
           ${info ? einvoiceDetails(info) : ''}
         </div>
         ${p.file_path && p.file_mime !== 'application/xml' ? html`<aside>${previewFrame(p, c)}</aside>` : ''}

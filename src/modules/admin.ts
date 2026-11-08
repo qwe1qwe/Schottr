@@ -5,7 +5,7 @@ import { all, one, run, tx, nowIso, fromDbTime } from '../db/index.ts';
 import { hashPassword, setSessionTenant } from '../lib/auth.ts';
 import { audit, getSetting, recentAudit, setSetting } from '../lib/audit.ts';
 import { html, checked, selected, type SafeHtml } from '../lib/html.ts';
-import { idParam, notFound, readForm, redirectWith, str, userOf } from '../lib/http.ts';
+import { idParam, notFound, readForm, redirectWith, str, userOf, UserError } from '../lib/http.ts';
 import { formatMoney } from '../lib/money.ts';
 import { csrfField, page, empty } from '../views/layout.ts';
 import { config } from '../config.ts';
@@ -50,6 +50,14 @@ const ACTIONS: Record<string, string> = {
   'purchase.import': 'E-Rechnung übernommen',
   'purchase.update': 'Eingangsrechnung geändert',
   'purchase.delete': 'Eingangsrechnung gelöscht',
+  'bank.setup': 'Bankzugang eingerichtet',
+  'bank.disconnect': 'Bankzugang entfernt',
+  'bank.fetch': 'Kontoumsätze abgerufen',
+  'bank.fetch.failed': 'Kontoumsätze: Abruf fehlgeschlagen',
+  'bank.assign': 'Kontoumsatz zugeordnet',
+  'bank.unlink': 'Kontoumsatz: Zuordnung gelöst',
+  'bank.exempt': 'Buchung ohne Kontoumsatz (Ausnahme)',
+  'bank.reconcile': 'Abgleich-Zeitraum geändert',
 };
 const actionLabel = (a: string) => ACTIONS[a] ?? a.replace(/^admin\./, 'Admin: ');
 
@@ -535,6 +543,7 @@ function register(app: App) {
   /* ---------------- System ---------------- */
   app.get('/admin/system', async (c) => {
     const reg = await getSetting('allow_registration');
+    const fintsId = await getSetting('fints_product_id');
     const regOpen = reg === null ? config.allowRegistration : reg === '1';
     const db = await one<{ v: string }>('SELECT VERSION() AS v');
     const schema = await one<{ v: number }>('SELECT MAX(version) AS v FROM schema_migrations');
@@ -556,6 +565,17 @@ function register(app: App) {
           </form>
         </section>
         <section class="card">
+          <h2>Bankanbindung (FinTS)</h2>
+          <form method="post" action="/admin/system/fints" class="stack">
+            ${csrfField(c)}
+            <label>FinTS-Produkt-ID <input name="fints_product_id" maxlength="30" autocomplete="off" value="${fintsId ?? ''}" placeholder="${process.env.SCHOTTR_FINTS_PRODUCT_ID ? 'aus SCHOTTR_FINTS_PRODUCT_ID' : ''}"></label>
+            <small class="muted">Banken lassen nur registrierte Software zu. Die Registrierung bei der Deutschen Kreditwirtschaft ist kostenlos:
+              <a href="https://www.fints.org/de/hersteller/produktregistrierung" target="_blank" rel="noopener">fints.org → Produktregistrierung</a>.
+              ${fintsId === null && process.env.SCHOTTR_FINTS_PRODUCT_ID ? ' Aktuell gilt der Wert aus SCHOTTR_FINTS_PRODUCT_ID.' : ''}</small>
+            <button class="btn">Speichern</button>
+          </form>
+        </section>
+        <section class="card">
           <h2>Informationen</h2>
           <dl class="dl">
             <dt>Schottr</dt><dd>${pkg.version}</dd>
@@ -568,6 +588,14 @@ function register(app: App) {
         </section>
       </div>`,
     });
+  });
+
+  app.post('/admin/system/fints', async (c) => {
+    const id = str(await readForm(c), 'fints_product_id', 30).replace(/\s/g, '');
+    if (id && !/^[A-Za-z0-9]{1,30}$/.test(id)) throw new UserError('Die Produkt-ID besteht nur aus Buchstaben und Ziffern.');
+    await setSetting('fints_product_id', id);
+    await audit(c, 'admin.system.fints', id ? 'Produkt-ID gesetzt' : 'Produkt-ID entfernt', { tenantId: null });
+    return redirectWith(c, '/admin/system', 'ok', 'Gespeichert.');
   });
 
   app.post('/admin/system', async (c) => {

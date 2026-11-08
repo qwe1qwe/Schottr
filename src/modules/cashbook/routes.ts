@@ -20,6 +20,8 @@ import { balanceChart } from '../../views/chart.ts';
 import { csrfField, empty, page } from '../../views/layout.ts';
 import type { App, Ctx, Module, Tenant } from '../../types.ts';
 import { assignToEntry, getInbox, inboxOf, type InboxFile } from '../inbox/repo.ts';
+import { openCounts, unmatchedCounts } from '../bank/repo.ts';
+import { entryBankCard } from '../bank/views.ts';
 import {
   bookDue, getRecurring, nextDue, pendingDues, recurringOf, RHYTHMS, skipDue, type PendingDue, type Recurring, type Rhythm,
   accountsOf, assertOpen, balanceAt, balances, bookLinked, cashbookEnabled, changeCountDate, createManual, linkEntryToPurchase, purchaseCandidates, recalcCounts, reversalOf, reverseEntry, createTransfer, DENOMINATIONS,
@@ -415,6 +417,10 @@ function register(app: App) {
     const { opening, rows, closing } = await entriesOf(shown, r.from, r.to);
     const points = await history(shown, r.chartFrom, r.chartTo);
     const open = await unassigned(t);
+    const bankOpenBy = await openCounts(t.id);
+    const missingBy = await unmatchedCounts(t.id);
+    const missing = selectedAcc ? (missingBy.get(selectedAcc.id) ?? 0) : [...missingBy.values()].reduce((s, n) => s + n, 0);
+    const bankOpen = selectedAcc ? (bankOpenBy.get(selectedAcc.id) ?? 0) : [...bankOpenBy.values()].reduce((s, n) => s + n, 0);
     const allAccounts = await accountsOf(t.id);
     const years = (await all<{ y: string }>('SELECT DISTINCT substr(entry_date, 1, 4) y FROM cash_entries WHERE tenant_id = ?', t.id)).map((x) => Number(x.y));
     const yearList = [...new Set([Number(today().slice(0, 4)), r.year, ...years])].sort((a, b) => b - a);
@@ -430,6 +436,7 @@ function register(app: App) {
       actions: html`
         <a class="btn" href="/cashbook/accounts">Konten</a>
         <a class="btn" href="/cashbook/recurring">Daueraufträge</a>
+        ${list.some((a) => a.kind === 'bank') ? html`<a class="btn" href="/cashbook/bank${selectedAcc?.kind === 'bank' ? `/${selectedAcc.id}` : ''}">Kontoumsätze${bankOpen ? html` <span class="count">${bankOpen}</span>` : ''}</a>` : ''}
         ${list.some((a) => a.kind === 'cash') ? html`<a class="btn" href="/cashbook/count${selectedAcc?.kind === 'cash' ? `?account=${selectedAcc.id}` : ''}">Kasse zählen</a>` : ''}
         ${list.length > 1 ? html`<a class="btn" href="/cashbook/transfer">Umbuchung</a>` : ''}
         <a class="btn primary" href="/cashbook/new${selectedAcc ? `?account=${selectedAcc.id}` : ''}">Buchung erfassen</a>`,
@@ -440,6 +447,8 @@ function register(app: App) {
         ${list.map((a) => html`<a class="cash-balance ${selectedAcc?.id === a.id || list.length === 1 ? 'active' : ''}" href="${q(a.id)}">
           <span>${a.name} <small class="muted">${KIND_LABEL[a.kind]}</small></span>${money(a.balance)}</a>`)}
       </div>
+      ${missing ? html`<div class="notice soft">${missing} Buchung${missing === 1 ? '' : 'en'} auf ${selectedAcc ? `„${selectedAcc.name}“` : 'Bankkonten'} ohne Kontoumsatz –
+        <a href="/cashbook/bank${selectedAcc ? `/${selectedAcc.id}` : ''}">abgleichen</a>.</div>` : ''}
       ${pendingCard(c, await pendingDues(t), c.req.path + (c.req.url.includes('?') ? `?${c.req.url.split('?')[1]}` : ''))}
       ${minus ? html`<div class="notice">Die Kasse steht am ${formatDate(minus.date)} im Minus (${formatMoney(minus.balance)}) – eine Bargeldkasse kann nicht negativ sein. Fehlt eine Einnahme oder eine Zählung?</div>` : ''}
       ${balanceChart(points, {
@@ -560,6 +569,7 @@ function register(app: App) {
       title: a.name,
       back: { href: '/cashbook/accounts', label: 'Konten' },
       body: html`<section class="card narrow">${accountForm(c, `/cashbook/accounts/${a.id}`, a)}</section>
+      ${a.kind === 'bank' ? html`<p><a class="btn" href="/cashbook/bank/${a.id}">Kontoumsätze und Bankzugang (FinTS)</a></p>` : ''}
       <div class="danger-zone">
         ${postButton(c, `/cashbook/accounts/${a.id}/archive`, a.archived ? 'Aus Archiv holen' : 'Archivieren', 'btn ghost')}
         ${used ? '' : postButton(c, `/cashbook/accounts/${a.id}/delete`, 'Löschen', 'btn danger', 'Konto löschen?')}
@@ -793,6 +803,7 @@ function register(app: App) {
               : ''}
           </section>`
         : ''}
+      ${e.reversal_of || reversed ? '' : await entryBankCard(c, t, e, `/cashbook/entries/${e.id}/edit`)}
       ${e.source === 'manual' && !locked && !e.reversal_of && !reversed ? await linkPurchaseCard(c, t, e) : ''}
       ${e.reversal_of && reversalOrig && !locked
         ? html`<section class="card"><h2>Storno-Datum</h2>

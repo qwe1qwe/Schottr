@@ -23,6 +23,8 @@ export interface CashAccount {
   iban: string;
   opening_date: string;
   opening_balance: number;
+  /** Bankkonten: ab diesem Tag braucht jede Buchung einen Kontoumsatz (NULL = kein Abgleich) */
+  reconcile_from?: string | null;
   archived: number;
 }
 

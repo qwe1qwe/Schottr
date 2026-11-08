@@ -103,3 +103,30 @@ test('Eigene USt.-Sätze (z. B. 16 % im 2. Halbjahr 2020)', () => {
   const totals = calculate([{ title: 'x', description: '', quantity: 1000, unit: 'C62', unitPrice: 10000, vatRate: 1600 }], 'standard');
   assert.equal(totals.tax, 1600);
 });
+
+test('Kontoumsätze: Vereinheitlichen, Fingerabdruck, Nummer im Verwendungszweck', async () => {
+  const { normalizeTransactions, mentions } = await import('../src/lib/banktx.ts');
+  const d = new Date(2026, 9, 5, 12);
+  const raw = [
+    { entryDate: d, valueDate: d, amount: 24, purpose: ['Mitgliedsbeitrag', '2026'], remoteName: 'Max', remoteAccountNumber: 'DE02 1203 0000 0000 2020 51' },
+    { entryDate: d, valueDate: d, amount: 24, purpose: ['Mitgliedsbeitrag', '2026'], remoteName: 'Max', remoteAccountNumber: 'DE02 1203 0000 0000 2020 51' },
+    { entryDate: d, amount: -119.99, purpose: 'NOTPROVIDED', remoteName: 'Getränke Huber', remoteAccountNumber: '12345' },
+  ];
+  const list = normalizeTransactions(raw);
+  assert.equal(list.length, 3);
+  assert.equal(list[0].booking_date, '2026-10-05');
+  assert.equal(list[0].amount, 2400);
+  assert.equal(list[2].amount, -11999);
+  assert.equal(list[0].purpose, 'Mitgliedsbeitrag 2026');
+  assert.equal(list[0].remote_iban, 'DE02120300000000202051');
+  assert.equal(list[2].remote_iban, '', 'keine IBAN');
+  assert.equal(list[2].purpose, '');
+  // gleiche Umsätze am selben Tag werden unterschieden, ein zweiter Abruf ergibt dieselben Abdrücke
+  assert.notEqual(list[0].fingerprint, list[1].fingerprint);
+  assert.deepEqual(normalizeTransactions(raw).map((x) => x.fingerprint), list.map((x) => x.fingerprint));
+
+  assert.ok(mentions('Zahlung zu RE-2026-0012 danke', 'RE-2026-0012'));
+  assert.ok(mentions('re 2026 0012', 'RE-2026-0012'), 'Schreibweise egal');
+  assert.ok(!mentions('RE-2026-00123', 'RE-2026-0012'), 'nur ganze Nummern');
+  assert.ok(!mentions('Rechnung 12', '12'), 'zu kurz');
+});

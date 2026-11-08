@@ -989,4 +989,97 @@ export const migrations: { version: number; statements: string[] }[] = [
        THEN ${forbid('Belege sind unveraenderbar - nur archivieren ist moeglich')}; END IF`,
     ],
   },
+  {
+    version: 24,
+    statements: [
+      // Bankanbindung per FinTS (PIN/TAN) je Bankkonto des Kassenbuchs. Die PIN wird nie gespeichert,
+      // nur Zugang (BLZ, URL, Anmeldename) und die Bankparameter (BPD/UPD, System-ID) als JSON.
+      `CREATE TABLE bank_connections (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        tenant_id INT NOT NULL,
+        account_id INT NOT NULL,
+        blz CHAR(8) NOT NULL,
+        url VARCHAR(300) NOT NULL,
+        login VARCHAR(100) NOT NULL,
+        customer_id VARCHAR(100) NOT NULL DEFAULT '',
+        tan_method_id INT NULL,
+        tan_media VARCHAR(100) NOT NULL DEFAULT '',
+        banking_info MEDIUMTEXT NULL,
+        bank_balance BIGINT NULL,
+        bank_balance_date DATE NULL,
+        fetched_until DATE NULL,
+        last_fetch_at DATETIME(3) NULL,
+        created_at DATETIME(3) NOT NULL,
+        updated_at DATETIME(3) NOT NULL,
+        UNIQUE KEY bank_connections_account (account_id),
+        CONSTRAINT bank_connections_tenant FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
+        CONSTRAINT bank_connections_account FOREIGN KEY (account_id) REFERENCES cash_accounts(id) ON DELETE CASCADE
+      ) ${TABLE}`,
+      // Abgerufene Kontoumsätze. Jeder Umsatz wird genau einmal einer Buchung zugeordnet (entry_id)
+      // oder ignoriert; der Fingerabdruck verhindert Doppelte bei überlappenden Abrufen.
+      `CREATE TABLE bank_transactions (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        tenant_id INT NOT NULL,
+        account_id INT NOT NULL,
+        fingerprint CHAR(64) NOT NULL,
+        booking_date DATE NOT NULL,
+        value_date DATE NULL,
+        amount BIGINT NOT NULL,
+        remote_name VARCHAR(200) NOT NULL DEFAULT '',
+        remote_iban VARCHAR(40) NOT NULL DEFAULT '',
+        purpose VARCHAR(1000) NOT NULL DEFAULT '',
+        booking_text VARCHAR(200) NOT NULL DEFAULT '',
+        e2e_ref VARCHAR(100) NOT NULL DEFAULT '',
+        mandate_ref VARCHAR(100) NOT NULL DEFAULT '',
+        bank_ref VARCHAR(100) NOT NULL DEFAULT '',
+        entry_id INT NULL,
+        ignored_at DATETIME(3) NULL,
+        done_by INT NULL,
+        created_at DATETIME(3) NOT NULL,
+        UNIQUE KEY bank_tx_fingerprint (account_id, fingerprint),
+        UNIQUE KEY bank_tx_entry (entry_id),
+        KEY bank_tx_account (account_id, booking_date),
+        CONSTRAINT bank_tx_tenant FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
+        CONSTRAINT bank_tx_account FOREIGN KEY (account_id) REFERENCES cash_accounts(id) ON DELETE CASCADE,
+        CONSTRAINT bank_tx_entry FOREIGN KEY (entry_id) REFERENCES cash_entries(id) ON DELETE SET NULL,
+        CONSTRAINT bank_tx_user FOREIGN KEY (done_by) REFERENCES users(id) ON DELETE SET NULL
+      ) ${TABLE}`,
+    ],
+  },
+  {
+    version: 25,
+    statements: [
+      // Ein Kontoumsatz kann mehrere Buchungen umfassen (z. B. eine Überweisung für zwei Rechnungen,
+      // Auszahlung abzüglich Gebühr). Jede Buchung gehört höchstens zu einem Kontoumsatz.
+      `CREATE TABLE bank_tx_entries (
+        tx_id INT NOT NULL,
+        entry_id INT NOT NULL,
+        created_by INT NULL,
+        created_at DATETIME(3) NOT NULL,
+        PRIMARY KEY (tx_id, entry_id),
+        UNIQUE KEY bank_tx_entries_entry (entry_id),
+        CONSTRAINT bank_tx_entries_tx FOREIGN KEY (tx_id) REFERENCES bank_transactions(id) ON DELETE CASCADE,
+        CONSTRAINT bank_tx_entries_entry FOREIGN KEY (entry_id) REFERENCES cash_entries(id) ON DELETE CASCADE,
+        CONSTRAINT bank_tx_entries_user FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
+      ) ${TABLE}`,
+      `INSERT INTO bank_tx_entries (tx_id, entry_id, created_by, created_at)
+       SELECT id, entry_id, done_by, created_at FROM bank_transactions WHERE entry_id IS NOT NULL`,
+      `ALTER TABLE bank_transactions DROP FOREIGN KEY bank_tx_entry`,
+      `ALTER TABLE bank_transactions DROP INDEX bank_tx_entry, DROP COLUMN entry_id`,
+      // Bankkonten: ab diesem Tag braucht jede Buchung einen Kontoumsatz (davor kein Abgleich)
+      `ALTER TABLE cash_accounts ADD COLUMN reconcile_from DATE NULL AFTER opening_balance`,
+      `UPDATE cash_accounts a SET reconcile_from = (SELECT MIN(b.booking_date) FROM bank_transactions b WHERE b.account_id = a.id) WHERE a.kind = 'bank'`,
+      // Ausnahmen: Buchungen auf einem Bankkonto, zu denen es bewusst keinen Kontoumsatz gibt
+      `CREATE TABLE bank_exemptions (
+        entry_id INT NOT NULL PRIMARY KEY,
+        tenant_id INT NOT NULL,
+        reason VARCHAR(200) NOT NULL DEFAULT '',
+        created_by INT NULL,
+        created_at DATETIME(3) NOT NULL,
+        CONSTRAINT bank_exemptions_tenant FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
+        CONSTRAINT bank_exemptions_entry FOREIGN KEY (entry_id) REFERENCES cash_entries(id) ON DELETE CASCADE,
+        CONSTRAINT bank_exemptions_user FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
+      ) ${TABLE}`,
+    ],
+  },
 ];

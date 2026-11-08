@@ -104,6 +104,36 @@
     if (el instanceof HTMLElement && el.hasAttribute('data-autosubmit')) el.closest('form')?.requestSubmit();
   });
 
+  // Seiten, die auf etwas warten (z. B. Freigabe in der Banking-App), laden sich selbst neu
+  const refresh = document.querySelector('[data-refresh]');
+  if (refresh instanceof HTMLElement) {
+    const secs = Math.max(2, Number(refresh.dataset.refresh) || 3);
+    setTimeout(() => window.location.replace(window.location.href), secs * 1000);
+  }
+
+  // Kontoumsatz zuordnen: Summe der ausgewählten Posten anzeigen
+  document.querySelectorAll('[data-assign-form]').forEach((form) => {
+    const out = form.querySelector('[data-assign-sum]');
+    const remaining = Number(form.getAttribute('data-remaining')) || 0;
+    const euro = (cents) => (cents / 100).toLocaleString('de-DE', { style: 'currency', currency: 'EUR' });
+    const update = () => {
+      let sum = 0;
+      form.querySelectorAll('input[name="pick"]:checked').forEach((box) => {
+        const field = form.querySelector(`[name="amount_${box.value.replace(':', '_')}"]`);
+        const raw = field ? String(field.value).trim() : '';
+        const value = raw.includes(',') ? raw.replace(/\./g, '').replace(',', '.') : raw;
+        sum += (Number(box.getAttribute('data-sign')) || 1) * Math.round((parseFloat(value) || 0) * 100);
+      });
+      if (!out) return;
+      out.textContent = euro(sum);
+      out.classList.toggle('ok-text', sum === remaining && sum !== 0);
+      out.classList.toggle('danger-text', remaining > 0 ? sum > remaining : sum < remaining);
+    };
+    form.addEventListener('change', update);
+    form.addEventListener('input', update);
+    update();
+  });
+
   // Bestätigungscodes müssen abgetippt werden – Einfügen unterbinden
   for (const type of ['paste', 'drop']) {
     document.addEventListener(type, (e) => {

@@ -895,3 +895,22 @@ ul.tight { margin: .35rem 0 0; padding-left: 1.2rem; }
 tr.voided td { color: var(--muted); }
 tr.voided td a, tr.voided td.num { text-decoration: line-through; text-decoration-color: color-mix(in srgb, var(--muted) 70%, transparent); }
 tr.voided .tag { text-decoration: none; }
+
+/* ---------- Kontoumsätze (Bankanbindung) ---------- */
+.bank-table td { vertical-align: top; }
+.bank-suggestion { display: flex; flex-wrap: wrap; gap: .4rem .6rem; align-items: center; justify-content: space-between; padding: .35rem .5rem; border: 1px dashed var(--line-strong); border-radius: 8px; margin-bottom: .35rem; }
+.bank-suggestion.sure { border-style: solid; border-color: var(--accent); background: var(--ok-soft); }
+.bank-actions { display: flex; flex-wrap: wrap; gap: .35rem; }
+details.bank-more { margin-top: .35rem; }
+details.bank-more summary { cursor: pointer; color: var(--muted); font-size: .82rem; }
+details.bank-more .inline-form { margin-top: .35rem; }
+details.bank-more select { max-width: 22rem; }
+.tan-photo { max-width: 240px; image-rendering: pixelated; }
+.bank-links { margin: .3rem 0 0; }
+.bank-links li { display: flex; gap: .5rem; justify-content: space-between; max-width: 28rem; }
+.bank-pick td:first-child { width: 2rem; }
+.bank-pick input[type="checkbox"] { width: auto; }
+.bank-pick tr.hl td { background: var(--ok-soft); }
+.bank-pick .amount-input { max-width: 8rem; text-align: right; }
+.bank-card select { max-width: 100%; flex: 1 1 18rem; }
+.ok-text { color: var(--accent); }

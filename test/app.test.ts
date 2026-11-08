@@ -1653,6 +1653,197 @@ test('Kassenbuch: Konten, Zuordnung, Umbuchung, Kassenzählung, Abschluss, Steue
   await run("UPDATE tenants SET org_type = 'association' WHERE id = ?", t.id);
 });
 
+test('Kontoumsätze: Bankzugang, Abruf, Abgleich in beide Richtungen, mehrere Posten je Umsatz', opts, async () => {
+  const { importTransactions } = await import('../src/modules/bank/repo.ts');
+  const { normalizeTransactions } = await import('../src/lib/banktx.ts');
+  const t = (await one("SELECT * FROM tenants WHERE name = 'Musikverein Teststadt e. V.'"))!;
+  await req('/tenant/switch', { form: { tenant_id: String(t.id) } });
+  await run('UPDATE tenants SET cashbook_locked_until = NULL WHERE id = ?', t.id);
+  const today = new Date().toISOString().slice(0, 10);
+  const year = Number(today.slice(0, 4));
+
+  let r = await req('/cashbook/accounts', { form: { name: 'VR Giro', kind: 'bank', iban: 'DE02120300000000202051', opening_date: `${year}-01-01`, opening_balance: '0' } });
+  const acc = Number(new URLSearchParams(location(r).split('?')[1]).get('account'));
+  let page = await (await req('/cashbook')).text();
+  assert.match(page, /Kontoumsätze/);
+
+  // ohne Produkt-ID: Hinweis; ohne Zugang: Einrichten
+  page = await (await req(`/cashbook/bank/${acc}`)).text();
+  assert.match(page, /FinTS-Produkt-ID/);
+  assert.match(page, /Bankzugang einrichten/);
+  page = await (await req(`/cashbook/bank/${acc}/setup`)).text();
+  assert.match(page, /value="12030000"/, 'BLZ aus der IBAN');
+  assert.match(page, /fints1\.atruvia\.de/);
+  await req(`/cashbook/bank/${acc}/setup`, { form: { blz: '1234', url: 'http://x', login: '' } });
+  assert.equal(await one('SELECT 1 FROM bank_connections WHERE account_id = ?', acc), undefined, 'ungültige Angaben');
+  r = await req(`/cashbook/bank/${acc}/setup`, { form: { blz: '12030000', url: 'https://127.0.0.1:9/fints', login: 'netkey123', customer_id: '' } });
+  assert.equal(location(r), `/cashbook/bank/${acc}`);
+
+  // Abruf gegen eine nicht erreichbare Bank: verständlicher Fehler, PIN nirgends gespeichert
+  await req('/admin/system/fints', { form: { fints_product_id: 'ABC123DEF' } });
+  r = await req(`/cashbook/bank/${acc}/fetch`, { form: { pin: 'geheim-1234', from: `${year}-01-01` } });
+  const jobUrl = location(r);
+  assert.match(jobUrl, /^\/cashbook\/bank\/job\//);
+  assert.equal(location(await req(jobUrl)), `/cashbook/bank/${acc}`);
+  assert.match((await one("SELECT details FROM audit_log WHERE action = 'bank.fetch.failed' ORDER BY id DESC LIMIT 1"))!.details, /Fehler bei der Verbindung zur Bank/);
+  assert.equal(location(await req(jobUrl)), '/cashbook/bank', 'Job ist beendet');
+  assert.equal(await one("SELECT 1 FROM bank_connections WHERE banking_info LIKE '%geheim-1234%'"), undefined);
+  assert.equal(await one("SELECT 1 FROM audit_log WHERE details LIKE '%geheim-1234%'"), undefined);
+
+  // Abgleich ab Jahresbeginn
+  await req(`/cashbook/bank/${acc}/reconcile`, { form: { from: `${year}-01-01` } });
+  assert.equal((await one('SELECT reconcile_from FROM cash_accounts WHERE id = ?', acc))!.reconcile_from, `${year}-01-01`);
+
+  // Ausgangslage: offene Rechnung, Eingangsrechnungen, von Hand erfasste Buchungen
+  await run("UPDATE documents SET status = 'open', paid_at = NULL WHERE tenant_id = ? AND kind = 'invoice' AND status = 'paid' AND NOT EXISTS (SELECT 1 FROM cash_entries e WHERE e.document_id = documents.id)", t.id);
+  const inv = (await one(`SELECT d.id, d.number, d.gross_total - d.prepaid_total due FROM documents d WHERE d.tenant_id = ? AND d.kind = 'invoice' AND d.status = 'open'
+    AND d.type_code <> '381' AND d.finalized_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM cash_entries e WHERE e.document_id = d.id) ORDER BY d.id LIMIT 1`, t.id))!;
+  assert.ok(inv, 'offene Rechnung');
+  const purchase = async (number: string, gross: string) => {
+    const res = await req('/purchases', { form: { new_supplier: 'Notenverlag Moll', number, issue_date: today, category: 'sonstiges', 'tax_rate[]': '1900', 'tax_net[]': '', 'tax_tax[]': '', 'tax_gross[]': gross } });
+    return Number(location(res).split('/').pop());
+  };
+  const pid = await purchase('NV-77881', '59,50');
+  const p1 = await purchase('NV-1001', '20,00');
+  const p2 = await purchase('NV-1002', '30,00');
+  const p3 = await purchase('NV-5555', '45,00');
+  const entry = async (dir: 'in' | 'out', amount: string, text: string) => {
+    await req('/cashbook/entries', { form: { account_id: String(acc), entry_date: today, direction: dir, amount, text } });
+    return (await one('SELECT id FROM cash_entries WHERE account_id = ? AND text = ? ORDER BY id DESC LIMIT 1', acc, text))!.id as number;
+  };
+  const kontofuehrung = await entry('out', '7,90', 'Kontoführung');
+  const sumup = await entry('in', '100', 'Kartenzahlungen Fest');
+  const sumupFee = await entry('out', '2,50', 'Gebühr Kartenterminal');
+  const porto = await entry('out', '15', 'Porto Rundbrief');
+  const kuchen = await entry('in', '20', 'Kuchenverkauf');
+
+  // ohne Umsatz: alle Bank-Buchungen ab „Abgleich ab“
+  page = await (await req(`/cashbook/bank/${acc}`)).text();
+  assert.match(page, /Buchungen ohne Kontoumsatz <span class="count">5<\/span>/);
+  page = await (await req(`/cashbook?account=${acc}`)).text();
+  assert.match(page, /5 Buchungen auf „VR Giro“ ohne Kontoumsatz/);
+
+  const d = new Date(`${today}T12:00:00`);
+  const a = (await one<any>('SELECT * FROM cash_accounts WHERE id = ?', acc))!;
+  const list = normalizeTransactions([
+    { entryDate: d, amount: Number(inv.due) / 100, purpose: `Zahlung ${inv.number}`, remoteName: 'Kunde' },
+    { entryDate: d, amount: -59.5, purpose: 'Rechnung NV-77881', remoteName: 'Notenverlag Moll' },
+    { entryDate: d, amount: -7.9, purpose: 'Abschluss', remoteName: 'VR Bank' },
+    { entryDate: d, amount: -50, purpose: 'Sammelueberweisung NV-1001 NV-1002', remoteName: 'Notenverlag Moll' },
+    { entryDate: d, amount: 97.5, purpose: 'Auszahlung', remoteName: 'SumUp' },
+    { entryDate: d, amount: 12, purpose: 'Spende Kuchenbasar', remoteName: 'Oma Else' },
+    { entryDate: d, amount: -3, purpose: 'Gebühr', remoteName: 'VR Bank' },
+    { entryDate: d, amount: -15, purpose: 'Briefmarken', remoteName: 'Deutsche Post' },
+    { entryDate: d, amount: 30, purpose: 'Bareinzahlung', remoteName: 'Kasse' },
+    { entryDate: d, amount: -40, purpose: 'Abschlag NV-5555', remoteName: 'Notenverlag Moll' },
+    { entryDate: new Date(year - 1, 11, 30, 12), amount: 5, purpose: 'vor Eröffnung' },
+  ]);
+  assert.deepEqual(await importTransactions(t as any, a, list), { added: 10, total: 10 });
+  assert.deepEqual(await importTransactions(t as any, a, list), { added: 0, total: 10 }, 'keine Doppelten');
+  const txId = async (cents: number) => (await one('SELECT id FROM bank_transactions WHERE account_id = ? AND amount = ?', acc, cents))!.id as number;
+
+  page = await (await req(`/cashbook/bank/${acc}`)).text();
+  assert.match(page, /Offene Umsätze <span class="count">10<\/span>/);
+  assert.match(page, /Nummer und Betrag passen/);
+  assert.match(page, /2 Nummern im Verwendungszweck, die Summe passt/);
+  assert.match(page, /schon gebucht, gleicher Tag/);
+  assert.match(page, /2 Buchungen ergeben zusammen den Betrag/);
+  assert.match(page, /Alle 5 sicheren Vorschläge übernehmen/);
+
+  // zu viel: Rechnung über mehr als den Umsatz
+  r = await req(`/cashbook/bank/tx/${await txId(-4000)}/assign`, { form: { pick: `purchase:${p3}`, [`amount_purchase_${p3}`]: '45,00' } });
+  assert.equal(await one('SELECT 1 FROM cash_entries WHERE purchase_id = ?', p3), undefined, 'nichts gebucht');
+
+  r = await req(`/cashbook/bank/${acc}/apply-sure`, { form: {} });
+  assert.equal((await one('SELECT status FROM documents WHERE id = ?', inv.id))!.status, 'paid');
+  assert.equal(Number((await one('SELECT amount FROM cash_entries WHERE document_id = ?', inv.id))!.amount), Number(inv.due));
+  assert.equal((await one('SELECT status FROM purchase_invoices WHERE id = ?', pid))!.status, 'paid');
+  assert.equal(Number((await one('SELECT amount FROM cash_entries WHERE purchase_id = ?', pid))!.amount), -5950);
+  const linksOfTx = async (cents: number) => (await all('SELECT entry_id FROM bank_tx_entries WHERE tx_id = ? ORDER BY entry_id', await txId(cents))).map((x) => x.entry_id);
+  assert.deepEqual(await linksOfTx(-790), [kontofuehrung], 'vorhandene Buchung, keine zweite');
+  assert.equal(Number((await one("SELECT COUNT(*) n FROM cash_entries WHERE account_id = ? AND text = 'Kontoführung'", acc))!.n), 1);
+  // eine Überweisung für zwei Eingangsrechnungen
+  assert.equal((await linksOfTx(-5000)).length, 2);
+  assert.equal((await one('SELECT status FROM purchase_invoices WHERE id = ?', p1))!.status, 'paid');
+  assert.equal((await one('SELECT status FROM purchase_invoices WHERE id = ?', p2))!.status, 'paid');
+  assert.deepEqual(await linksOfTx(-1500), [porto]);
+
+  // zwei Buchungen ergeben einen Umsatz (Auszahlung abzüglich Gebühr)
+  r = await req(`/cashbook/bank/tx/${await txId(9750)}/assign`, { form: { item: [`entry:${sumup}:0`, `entry:${sumupFee}:0`] } });
+  assert.deepEqual(await linksOfTx(9750), [sumup, sumupFee].sort((x, y) => x - y));
+
+  // Teilzuordnung über die Seite des Umsatzes, Rest als Buchung
+  const bar = await txId(3000);
+  page = await (await req(`/cashbook/bank/tx/${bar}`)).text();
+  assert.match(page, /data-assign-form/);
+  assert.match(page, /Kuchenverkauf/);
+  r = await req(`/cashbook/bank/tx/${bar}/assign`, { form: { pick: `entry:${kuchen}` } });
+  page = await (await req(`/cashbook/bank/tx/${bar}`)).text();
+  assert.match(page, /Rest/);
+  assert.match(page, /10,00/);
+  r = await req(`/cashbook/bank/tx/${bar}/book`, { form: { text: 'Bareinzahlung Rest' } });
+  assert.equal((await linksOfTx(3000)).length, 2);
+  assert.equal(Number((await one("SELECT amount FROM cash_entries WHERE text = 'Bareinzahlung Rest'"))!.amount), 1000);
+
+  // Eingangsrechnung von ihrer Seite aus mit einem Umsatz bezahlen (Abschlag: Teilbetrag)
+  page = await (await req(`/purchases/${p3}`)).text();
+  assert.match(page, /Mit Kontoumsatz bezahlen/);
+  r = await req('/cashbook/bank/pay', { form: { kind: 'purchase', id: String(p3), tx_id: String(await txId(-4000)), amount: '40,00', back: `/purchases/${p3}` } });
+  assert.equal(location(r), `/purchases/${p3}`);
+  assert.equal(Number((await one('SELECT amount FROM cash_entries WHERE purchase_id = ?', p3))!.amount), -4000);
+  page = await (await req(`/purchases/${p3}`)).text();
+  assert.match(page, /<h2>Kontoumsatz<\/h2>/);
+
+  // Rest: Spende als Buchung, Gebühr ignorieren und wieder öffnen
+  await req(`/cashbook/bank/tx/${await txId(1200)}/book`, { form: {} });
+  assert.equal((await one('SELECT e.text FROM cash_entries e JOIN bank_tx_entries l ON l.entry_id = e.id WHERE l.tx_id = ?', await txId(1200)))!.text, 'Oma Else: Spende Kuchenbasar');
+  const fee = await txId(-300);
+  await req(`/cashbook/bank/tx/${fee}/ignore`, { form: {} });
+  page = await (await req(`/cashbook/bank/${acc}`)).text();
+  assert.match(page, /Alle abgerufenen Umsätze sind zugeordnet/);
+  assert.match(page, /Ignorierte Umsätze \(1\)/);
+  assert.match(page, /Alle Buchungen haben einen Kontoumsatz/);
+  await req(`/cashbook/bank/tx/${fee}/restore`, { form: {} });
+
+  // Buchung ohne Umsatz: Ausnahme, wieder aufheben, von der Buchung aus zuordnen
+  const spesen = await entry('out', '3', 'Spesen bar vorgestreckt');
+  page = await (await req(`/cashbook/entries/${spesen}/edit`)).text();
+  assert.match(page, /hat noch keinen Kontoumsatz/);
+  await req(`/cashbook/bank/entries/${spesen}/exempt`, { form: { reason: 'Verrechnung' } });
+  page = await (await req(`/cashbook/bank/${acc}`)).text();
+  assert.match(page, /Ausnahmen ohne Kontoumsatz \(1\)/);
+  assert.match(page, /Verrechnung/);
+  await req(`/cashbook/bank/entries/${spesen}/exempt`, { form: { remove: '1' } });
+  r = await req(`/cashbook/bank/entries/${spesen}/link`, { form: { tx_id: String(fee) } });
+  assert.equal(location(r), `/cashbook/entries/${spesen}/edit`);
+  assert.deepEqual(await linksOfTx(-300), [spesen]);
+  page = await (await req(`/cashbook/entries/${spesen}/edit`)).text();
+  assert.match(page, /<h2>Kontoumsatz<\/h2>/);
+  assert.match(page, /Zuordnung lösen/);
+  // eine zugeordnete Buchung kann nicht zur Ausnahme werden
+  await req(`/cashbook/bank/entries/${spesen}/exempt`, { form: { reason: 'x' } });
+  assert.equal(await one('SELECT 1 FROM bank_exemptions WHERE entry_id = ?', spesen), undefined);
+
+  // Storno einer zugeordneten Buchung öffnet den Umsatz wieder
+  await req(`/cashbook/entries/${spesen}/reverse`, { form: { date: today } });
+  page = await (await req(`/cashbook/bank/${acc}`)).text();
+  assert.match(page, /Offene Umsätze <span class="count">1<\/span>/);
+  // Zuordnung lösen lässt die Buchung stehen
+  await req(`/cashbook/bank/tx/${await txId(1200)}/unlink`, { form: {} });
+  assert.equal(Number((await one("SELECT COUNT(*) n FROM cash_entries WHERE text = 'Oma Else: Spende Kuchenbasar'"))!.n), 1);
+  page = await (await req(`/cashbook/bank/${acc}`)).text();
+  assert.match(page, /Offene Umsätze <span class="count">2<\/span>/);
+
+  // Abgleich aus → keine Pflicht mehr; Unternehmen haben keinen Zugriff
+  await req(`/cashbook/bank/${acc}/reconcile`, { form: { from: '' } });
+  page = await (await req(`/cashbook/bank/${acc}`)).text();
+  assert.doesNotMatch(page, /Buchungen ohne Kontoumsatz/);
+  await run("UPDATE tenants SET org_type = 'company' WHERE id = ?", t.id);
+  r = await req(`/cashbook/bank/${acc}`);
+  assert.notEqual(r.status, 200);
+  await run("UPDATE tenants SET org_type = 'association' WHERE id = ?", t.id);
+});
+
 function formatCents(c: number) {
   return (c / 100).toFixed(2).replace('.', ',');
 }
