@@ -1,15 +1,20 @@
 import { all, one, tx } from '../../db/index.ts';
 import { accountsOf, assertOpen, bookLinked, cashbookEnabled, linkedEntry, unlink, type CashAccount } from '../cashbook/repo.ts';
-import { accountSelect, fileUploader } from '../cashbook/routes.ts';
+import { accountSelect, fileUploader, purgeConfirmPage } from '../cashbook/routes.ts';
+import { donationPurgePlan, purgeDonation } from '../cashbook/repo.ts';
+import { checkCode, currentCode, issueCode } from '../../lib/confirmcode.ts';
 import { filesFrom } from '../cashbook/files.ts';
 import { inboxOf, type InboxFile } from '../inbox/repo.ts';
 import { audit } from '../../lib/audit.ts';
+import { compact } from '../../lib/banktx.ts';
+import { formatIban } from '../../lib/validate.ts';
+import { assignItems, getTx, type BankTxRow } from '../bank/repo.ts';
 import { handleCrop } from '../../lib/crop.ts';
 import { cropControls } from '../../views/crop.ts';
 import { clip } from '../../views/clip.ts';
 import { formatDate, today } from '../../lib/dates.ts';
 import { checked, html, selected, type SafeHtml } from '../../lib/html.ts';
-import { attachment, idParam, notFound, readForm, redirectWith, str, tenantOf, userOf, UserError, type Form } from '../../lib/http.ts';
+import { attachment, clientIp, idParam, notFound, readForm, redirectWith, str, tenantOf, userOf, UserError, type Form } from '../../lib/http.ts';
 import { formatAmount, formatMoney } from '../../lib/money.ts';
 import { csrfField, empty, page } from '../../views/layout.ts';
 import type { App, Ctx, Module, Tenant } from '../../types.ts';
@@ -208,6 +213,45 @@ function donationFilesList(c: Ctx, files: DonationFile[]): SafeHtml {
 
 const yearOf = (q: string | undefined, fallback: number) => (q && /^\d{4}$/.test(q) ? Number(q) : fallback);
 
+/* ---------------- Aus einem Kontoumsatz ---------------- */
+
+async function txForDonation(c: Ctx, t: Tenant): Promise<BankTxRow> {
+  if (!cashbookEnabled(t)) throw new UserError('Die Bankanbindung gehört zum Kassenbuch (für Vereine).');
+  const x = await getTx(t.id, idParam(c)) ?? notFound();
+  if (x.ignored_at) throw new UserError('Der Umsatz ist ignoriert – zuerst wieder öffnen.');
+  if (x.remaining <= 0) throw new UserError('Eine Zuwendung gibt es nur zu einer Gutschrift, die noch nicht (ganz) zugeordnet ist.');
+  return x;
+}
+
+/** Zuwendenden aus dem Namen des Absenders erraten – nur bei genau einem Treffer */
+function donorGuess(contacts: Contact[], name: string): number | undefined {
+  const n = compact(name);
+  if (n.length < 4) return undefined;
+  const hits = contacts.filter((ct) => [ct.company, ct.name].some((v) => {
+    const k = compact(v ?? '');
+    return k.length >= 4 && (n.includes(k) || k.includes(n));
+  }));
+  return hits.length === 1 ? hits[0].id : undefined;
+}
+
+async function fromBankPage(c: Ctx, t: Tenant, x: BankTxRow, d: Partial<DonationInput>) {
+  const account = (await accountsOf(t.id, true)).filter((a) => a.id === x.account_id);
+  return page(c, {
+    title: 'Zuwendung aus Kontoumsatz',
+    back: { href: `/cashbook/bank/${x.account_id}`, label: 'Kontoumsätze' },
+    body: html`
+      <section class="card"><dl class="dl">
+        <dt>Buchungstag</dt><dd>${formatDate(x.booking_date)}</dd>
+        <dt>Absender</dt><dd>${x.remote_name || x.booking_text || '–'}${x.remote_iban ? html` <span class="muted small mono">${formatIban(x.remote_iban)}</span>` : ''}</dd>
+        <dt>Verwendungszweck</dt><dd>${x.purpose || '–'}</dd>
+        <dt>Betrag</dt><dd>${formatMoney(x.amount)}${x.remaining !== x.amount ? ` (noch offen ${formatMoney(x.remaining)})` : ''}</dd></dl>
+        <p class="muted small">Die Zuwendung wird am Tag der Gutschrift im Kassenbuch gebucht und diesem Kontoumsatz zugeordnet.
+          Zuschüsse der öffentlichen Hand (z. B. Jugendförderung einer Gemeinde) sind meist keine Spenden – dafür besser „Als Buchung übernehmen“ wählen.</p>
+      </section>
+      ${donationForm(c, t, `/donations/from-bank/${x.id}`, d, await donorOptions(t.id), { accounts: account, selected: x.account_id }, await inboxOf(t.id))}`,
+  });
+}
+
 function register(app: App) {
   app.get('/donations', async (c) => {
     const t = npoTenant(c);
@@ -283,6 +327,40 @@ function register(app: App) {
       return { id: newId, n: await storeFiles(c, t, form, newId) };
     });
     return redirectWith(c, `/donations/${id}`, 'ok', `Zuwendung gespeichert${n ? ` (${n} Beleg${n > 1 ? 'e' : ''})` : ''}.`);
+  });
+
+  app.get('/donations/from-bank/:id', async (c) => {
+    const t = npoTenant(c);
+    const x = await txForDonation(c, t);
+    return fromBankPage(c, t, x, {
+      kind: 'money',
+      contact_id: donorGuess(await donorOptions(t.id), x.remote_name),
+      donation_date: x.booking_date > today() ? today() : x.booking_date,
+      amount: x.remaining,
+      note: x.purpose.slice(0, 300),
+    });
+  });
+
+  app.post('/donations/from-bank/:id', async (c) => {
+    const t = npoTenant(c);
+    const x = await txForDonation(c, t);
+    const form = await readForm(c);
+    const input = await parseDonation(form, t.id);
+    if (input.kind === 'goods') throw new UserError('Zu einer Sachzuwendung gibt es keinen Kontoumsatz.');
+    if (input.amount > x.remaining) throw new UserError(`Der Betrag ist größer als der offene Betrag des Umsatzes (${formatMoney(x.remaining)}).`);
+    // gebucht wird immer am Tag der Gutschrift, auf dem Konto des Umsatzes
+    input.booking_date = x.booking_date === input.donation_date ? null : x.booking_date;
+    assertOpen(t, x.booking_date);
+    const { id, n } = await tx(async () => {
+      const newId = await createDonation(t, input, userOf(c).id);
+      await syncCash(t, newId, input, x.account_id, userOf(c).id);
+      const entry = await linkedEntry('donation', newId);
+      if (!entry) throw new UserError('Die Buchung im Kassenbuch konnte nicht angelegt werden.');
+      await assignItems(t, x, [{ kind: 'entry', id: entry.id }], userOf(c).id);
+      return { id: newId, n: await storeFiles(c, t, form, newId) };
+    });
+    await audit(c, 'donation.from-bank', `${formatDate(x.booking_date)} ${formatMoney(input.amount)} ${x.remote_name}: Zuwendung ${id} aus Kontoumsatz`);
+    return redirectWith(c, `/cashbook/bank/${x.account_id}`, 'ok', `Zuwendung über ${formatMoney(input.amount)} gespeichert und dem Kontoumsatz zugeordnet${n ? ` (${n} Beleg${n > 1 ? 'e' : ''})` : ''}.`);
   });
 
   app.get('/donations/receipts', async (c) => {
@@ -413,8 +491,48 @@ function register(app: App) {
         : ''}
       ${!d.receipt_id && !d.receipted_at && !hasFiles
         ? html`<div class="danger-zone">${postButton(c, `/donations/${d.id}/delete`, 'Löschen', 'btn danger', 'Zuwendung löschen? Eine Buchung im Kassenbuch bleibt stehen und wird storniert.')}</div>`
-        : ''}`,
+        : ''}
+      ${userOf(c).is_admin ? html`<div class="danger-zone">
+        <a class="btn danger" href="/donations/${d.id}/purge">Endgültig löschen …</a>
+        <p class="muted small">Für Testzuwendungen – samt Kassenbuchung und Belegen, auch wenn sie nicht mehr normal löschbar ist. Nur Administratoren, mit Grund und Code; protokolliert.</p></div>` : ''}`,
     });
+  });
+
+  const purgeView = async (c: Ctx, code: string, reason = '', error?: string) => {
+    const t = npoTenant(c);
+    if (!userOf(c).is_admin) throw new UserError('Endgültig löschen dürfen nur Administratoren.');
+    const id = idParam(c);
+    const d = await getDonation(t.id, id) ?? notFound();
+    const contact = await getContact(t.id, d.contact_id);
+    const plan = await donationPurgePlan(t, id);
+    return purgeConfirmPage(c, {
+      title: 'Zuwendung endgültig löschen',
+      back: { href: `/donations/${id}`, label: 'Zuwendung' },
+      action: `/donations/${id}/purge`, plan, accounts: await accountsOf(t.id, true), code, reason, error,
+      subject: html`<section class="card"><dl class="dl cols"><dt>Zuwendender</dt><dd>${contact ? contactLabel(contact) : ''}</dd>
+        <dt>Datum</dt><dd>${formatDate(d.donation_date)}</dd><dt>${d.kind === 'goods' ? 'Wert' : 'Betrag'}</dt><dd>${formatMoney(d.amount)}</dd></dl></section>`,
+    });
+  };
+
+  app.get('/donations/:id/purge', async (c) => purgeView(c, issueCode(`${c.get('session')!.id}:dpurge:${idParam(c)}`)));
+
+  app.post('/donations/:id/purge', async (c) => {
+    const t = npoTenant(c);
+    if (!userOf(c).is_admin) throw new UserError('Endgültig löschen dürfen nur Administratoren.');
+    const id = idParam(c);
+    const key = `${c.get('session')!.id}:dpurge:${id}`;
+    const plan = await donationPurgePlan(t, id);
+    if (plan.blockers.length) return purgeView(c, currentCode(key));
+    const form = await readForm(c);
+    const reason = str(form, 'reason', 500);
+    if (reason.length < 10) return purgeView(c, currentCode(key), reason, 'Bitte einen Grund angeben (mind. 10 Zeichen).');
+    if (str(form, 'confirm') !== '1') return purgeView(c, currentCode(key), reason, 'Bitte bestätigen, dass es sich um einen Test bzw. um einen Vorgang handelt, der nie stattgefunden hat.');
+    const check = checkCode(key, str(form, 'code', 20));
+    if (!check.ok) return purgeView(c, check.code, reason, check.error);
+    const done = await purgeDonation(t, id, { id: userOf(c).id, email: userOf(c).email }, reason, clientIp(c));
+    await audit(c, 'donation.purge',
+      `Zuwendung ${formatDate(done.donation!.donation_date)} ${formatMoney(Number(done.donation!.amount))} endgültig gelöscht (${done.entries.length} Buchungen, ${done.files.length} Belege) – Grund: ${reason}`);
+    return redirectWith(c, '/donations', 'ok', 'Zuwendung endgültig gelöscht – der Vorgang steht im Löschprotokoll des Kassenbuchs.');
   });
 
   app.get('/donations/:id/edit', async (c) => {

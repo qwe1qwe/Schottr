@@ -1101,4 +1101,57 @@ export const migrations: { version: number; statements: string[] }[] = [
       ) ${TABLE}`,
     ],
   },
+  {
+    version: 27,
+    statements: [
+      // Fehlbuchungen (Tests im Produktivsystem) lassen sich ausnahmsweise endgültig entfernen – nur über die
+      // geschützte Funktion im Kassenbuch (Administrator, Grund, Code). Der Trigger lässt das Löschen nur zu,
+      // wenn die Sitzung @schottr_purge = 1 setzt; jeder Vorgang landet mit allen Werten in einem
+      // unveränderlichen Löschprotokoll (ohne Fremdschlüssel, damit es auch Mandanten überdauert).
+      `CREATE TABLE deleted_entries (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        tenant_id INT NOT NULL,
+        deleted_at DATETIME(3) NOT NULL,
+        deleted_by INT NULL,
+        deleted_by_email VARCHAR(200) NOT NULL DEFAULT '',
+        reason VARCHAR(500) NOT NULL,
+        ip VARCHAR(64) NOT NULL DEFAULT '',
+        entry_count INT NOT NULL,
+        snapshot MEDIUMTEXT NOT NULL,
+        KEY deleted_entries_tenant (tenant_id, deleted_at)
+      ) ${TABLE}`,
+      `CREATE TRIGGER deleted_entries_no_update BEFORE UPDATE ON deleted_entries FOR EACH ROW
+       ${forbid('Das Loeschprotokoll ist unveraenderbar')}`,
+      `CREATE TRIGGER deleted_entries_no_delete BEFORE DELETE ON deleted_entries FOR EACH ROW
+       ${forbid('Das Loeschprotokoll ist unveraenderbar')}`,
+      `DROP TRIGGER cash_entries_storno_only`,
+      `CREATE TRIGGER cash_entries_storno_only BEFORE DELETE ON cash_entries FOR EACH ROW
+       IF OLD.source <> 'count' AND COALESCE(@schottr_purge, 0) <> 1 THEN ${forbid('Buchungen koennen nicht geloescht werden - nur stornieren')}; END IF`,
+    ],
+  },
+  {
+    version: 28,
+    statements: [
+      // Das Löschen (nur Administrator, siehe Version 27) soll für alles gehen – auch für Belege und abgeschlossene
+      // Zeiträume. Die Sperren bleiben im Normalbetrieb voll aktiv; nur mit @schottr_purge = 1 sind sie offen.
+      `DROP TRIGGER cash_entries_lock_ins`,
+      `DROP TRIGGER cash_entries_lock_upd`,
+      `DROP TRIGGER cash_entries_lock_del`,
+      `DROP TRIGGER cash_counts_lock_upd`,
+      `DROP TRIGGER cash_entry_files_keep`,
+      `DROP TRIGGER donation_files_keep`,
+      `CREATE TRIGGER cash_entries_lock_ins BEFORE INSERT ON cash_entries FOR EACH ROW
+       IF COALESCE(@schottr_purge, 0) <> 1 AND NEW.entry_date <= COALESCE((SELECT cashbook_locked_until FROM tenants WHERE id = NEW.tenant_id), '0000-01-01') THEN ${forbid('Das Kassenbuch ist fuer diesen Zeitraum abgeschlossen')}; END IF`,
+      `CREATE TRIGGER cash_entries_lock_upd BEFORE UPDATE ON cash_entries FOR EACH ROW
+       IF COALESCE(@schottr_purge, 0) <> 1 AND (OLD.entry_date <= COALESCE((SELECT cashbook_locked_until FROM tenants WHERE id = OLD.tenant_id), '0000-01-01') OR NEW.entry_date <= COALESCE((SELECT cashbook_locked_until FROM tenants WHERE id = NEW.tenant_id), '0000-01-01')) THEN ${forbid('Das Kassenbuch ist fuer diesen Zeitraum abgeschlossen')}; END IF`,
+      `CREATE TRIGGER cash_entries_lock_del BEFORE DELETE ON cash_entries FOR EACH ROW
+       IF COALESCE(@schottr_purge, 0) <> 1 AND OLD.entry_date <= COALESCE((SELECT cashbook_locked_until FROM tenants WHERE id = OLD.tenant_id), '0000-01-01') THEN ${forbid('Das Kassenbuch ist fuer diesen Zeitraum abgeschlossen')}; END IF`,
+      `CREATE TRIGGER cash_counts_lock_upd BEFORE UPDATE ON cash_counts FOR EACH ROW
+       IF COALESCE(@schottr_purge, 0) <> 1 AND (OLD.count_date <= COALESCE((SELECT cashbook_locked_until FROM tenants WHERE id = OLD.tenant_id), '0000-01-01') OR NEW.count_date <= COALESCE((SELECT cashbook_locked_until FROM tenants WHERE id = NEW.tenant_id), '0000-01-01')) THEN ${forbid('Das Kassenbuch ist fuer diesen Zeitraum abgeschlossen')}; END IF`,
+      `CREATE TRIGGER cash_entry_files_keep BEFORE DELETE ON cash_entry_files FOR EACH ROW
+       IF COALESCE(@schottr_purge, 0) <> 1 THEN ${forbid('Belege sind aufbewahrungspflichtig und koennen nur archiviert werden')}; END IF`,
+      `CREATE TRIGGER donation_files_keep BEFORE DELETE ON donation_files FOR EACH ROW
+       IF COALESCE(@schottr_purge, 0) <> 1 THEN ${forbid('Belege sind aufbewahrungspflichtig und koennen nur archiviert werden')}; END IF`,
+    ],
+  },
 ];

@@ -10,7 +10,7 @@ import { checkCode, codeBox, codeInput, currentCode, issueCode } from '../../lib
 import { audit } from '../../lib/audit.ts';
 import { addDays, formatDate, isIsoDate, today } from '../../lib/dates.ts';
 import { checked, html, selected, type SafeHtml } from '../../lib/html.ts';
-import { attachment, idParam, notFound, readForm, redirectWith, requireOwner, str, tenantOf, userOf, UserError, type Form } from '../../lib/http.ts';
+import { attachment, clientIp, idParam, notFound, readForm, redirectWith, requireOwner, str, tenantOf, userOf, UserError, type Form } from '../../lib/http.ts';
 import { formatAmount, formatMoney, formatRate, parseDecimal } from '../../lib/money.ts';
 import { isSphere, SPHERES, sphereLabel, sphereSelect } from '../../lib/nonprofit.ts';
 import { formatIban, isValidIban, normalizeIban } from '../../lib/validate.ts';
@@ -26,7 +26,8 @@ import {
   bookDue, getRecurring, nextDue, pendingDues, recurringOf, RHYTHMS, skipDue, type PendingDue, type Recurring, type Rhythm,
   accountsOf, assertOpen, balanceAt, balances, bookLinked, cashbookEnabled, changeCountDate, createManual, linkEntryToPurchase, purchaseCandidates, recalcCounts, reversalOf, reverseEntry, createTransfer, DENOMINATIONS,
   entriesOf, entrySphere, getAccount, isVoided, voidedPairs, history, lastCount, saveCount, SOURCE_LABELS, unassigned, updateManual, checkContact, entryContactOptions, countDeleteBlocker, deleteCount, changeCounted, changeReversalDate,
-  type CashAccount, type CashCount, type CashEntry, type EntryInput, type EntryRow, type LinkSource,
+  purgeEntries, purgeLog, purgePlan, recentPurges,
+  type CashAccount, type CashCount, type CashEntry, type EntryInput, type EntryRow, type LinkSource, type PurgePlan,
 } from './repo.ts';
 
 function cbTenant(c: Ctx): Tenant {
@@ -50,6 +51,55 @@ export function accountSelect(accounts: CashAccount[], value?: number | null, na
 }
 
 const money = (v: number) => html`<span class="num ${v < 0 ? 'neg-amount' : ''}">${formatMoney(v)}</span>`;
+
+/** Gemeinsame Bestätigungsseite für das endgültige Löschen (Buchungen und Zuwendungen) */
+export function purgeConfirmPage(c: Ctx, o: {
+  title: string; back: { href: string; label: string }; action: string; plan: PurgePlan; accounts: CashAccount[];
+  code: string; reason?: string; error?: string; subject?: SafeHtml;
+}) {
+  const { plan } = o;
+  const n = plan.entries.length;
+  return page(c, {
+    title: o.title,
+    back: o.back,
+    status: o.error ? 400 : 200,
+    body: html`
+    ${o.error ? html`<div class="flash flash-error" role="alert">${o.error}</div>` : ''}
+    <div class="notice danger-notice">
+      <strong>Ein Eingriff in die Buchführung (GoBD) – nur für Testdaten und Vorgänge, die nie stattgefunden haben.</strong>
+      <ul>
+        <li>Sonst wird nie gelöscht, sondern storniert. Hier verschwindet alles unten Aufgeführte endgültig${n ? ` (${n} Buchung${n === 1 ? '' : 'en'}, samt Storno-Partner bzw. Umbuchungs-Gegenseite)` : ''}.</li>
+        <li>Was schon ans Steuerbüro oder Finanzamt gegangen ist (Export, Jahrespaket), darf nicht gelöscht werden – dann bleibt nur das Storno.</li>
+        ${plan.locked ? html`<li><strong>Ein Teil liegt in einem abgeschlossenen Zeitraum</strong> – auch dort wird gelöscht, die Abschlüsse der Kassen werden neu berechnet.</li>` : ''}
+        ${plan.files.length ? html`<li><strong>${plan.files.length} angehängte${plan.files.length === 1 ? 'r Beleg' : ' Belege'}</strong> (${plan.files.join(', ')}) werden aus der Datenbank entfernt; die Dateien selbst bleiben nur noch im Speicherordner liegen.</li>` : ''}
+        <li>Kassenstände und Zählungen der betroffenen Konten werden neu berechnet; zugeordnete Kontoumsätze werden wieder offen.</li>
+        <li>Wer, wann, warum und alle Werte kommen in ein unveränderliches Löschprotokoll; im Kassenbuch erscheint für alle Benutzer ein roter Hinweis.</li>
+      </ul>
+    </div>
+    ${o.subject ?? ''}
+    ${n ? html`<section class="card flush-mobile"><table class="table stack-mobile">
+      <thead><tr><th>Datum</th><th>Konto</th><th>Text</th><th>Art</th><th class="right">Betrag</th></tr></thead>
+      <tbody>${plan.entries.map((x) => html`<tr>
+        <td data-label="Datum" class="nowrap">${formatDate(x.entry_date)}</td>
+        <td data-label="Konto">${o.accounts.find((a) => a.id === x.account_id)?.name ?? ''}</td>
+        <td data-label="Text">${x.text}</td>
+        <td data-label="Art">${x.reversal_of ? 'Storno' : x.source === 'transfer' ? 'Umbuchung' : x.source === 'donation' ? 'Zuwendung' : 'Buchung'}</td>
+        <td data-label="Betrag" class="right">${money(x.amount)}</td></tr>`)}</tbody></table></section>` : ''}
+    ${plan.blockers.length
+      ? html`<div class="notice"><strong>Nicht möglich:</strong><ul>${plan.blockers.map((b) => html`<li>${b}</li>`)}</ul></div>`
+      : html`<form method="post" action="${o.action}" class="card stack narrow" autocomplete="off">
+          ${csrfField(c)}
+          <label>Grund <span class="muted small">(Pflicht, steht im Löschprotokoll)</span>
+            <textarea name="reason" rows="2" required minlength="10" maxlength="500" placeholder="z. B. Testbuchung beim Einrichten, nie echt">${o.reason ?? ''}</textarea></label>
+          <label class="check"><input type="checkbox" name="confirm" value="1" required> Das war nur ein Test bzw. hat nie stattgefunden und ist nicht an das Steuerbüro oder Finanzamt gegangen.</label>
+          <div><p class="small">Zur Bestätigung bitte diesen Code abschreiben:</p>${codeBox(o.code)}</div>
+          ${codeInput()}
+          <div class="form-actions"><button class="btn danger">Endgültig löschen</button>
+            <a class="btn ghost" href="${o.back.href}">Abbrechen</a></div>
+        </form>`}`,
+  });
+}
+
 
 /** Zeitraum: laufendes Jahr = rollierende 12 Monate im Diagramm, Tabelle ab 1.1.; frühere Jahre komplett */
 function rangeOf(year: number) {
@@ -417,6 +467,7 @@ function register(app: App) {
     const { opening, rows, closing } = await entriesOf(shown, r.from, r.to);
     const points = await history(shown, r.chartFrom, r.chartTo);
     const open = await unassigned(t);
+    const purges = await recentPurges(t.id, 30);
     const bankOpenBy = await openCounts(t.id);
     const missingBy = await unmatchedCounts(t.id);
     const missing = selectedAcc ? (missingBy.get(selectedAcc.id) ?? 0) : [...missingBy.values()].reduce((s, n) => s + n, 0);
@@ -436,11 +487,13 @@ function register(app: App) {
       actions: html`
         <a class="btn" href="/cashbook/accounts">Konten</a>
         <a class="btn" href="/cashbook/recurring">Daueraufträge</a>
+        ${purges.total ? html`<a class="btn ghost" href="/cashbook/purged">Löschprotokoll</a>` : ''}
         ${list.some((a) => a.kind === 'bank') ? html`<a class="btn" href="/cashbook/bank${selectedAcc?.kind === 'bank' ? `/${selectedAcc.id}` : ''}">Kontoumsätze${bankOpen ? html` <span class="count">${bankOpen}</span>` : ''}</a>` : ''}
         ${list.some((a) => a.kind === 'cash') ? html`<a class="btn" href="/cashbook/count${selectedAcc?.kind === 'cash' ? `?account=${selectedAcc.id}` : ''}">Kasse zählen</a>` : ''}
         ${list.length > 1 ? html`<a class="btn" href="/cashbook/transfer">Umbuchung</a>` : ''}
         <a class="btn primary" href="/cashbook/new${selectedAcc ? `?account=${selectedAcc.id}` : ''}">Buchung erfassen</a>`,
       body: html`
+      ${purges.n ? html`<div class="notice danger-notice"><strong>Daten endgültig gelöscht:</strong> In den letzten 30 Tagen wurde${purges.n === 1 ? '' : 'n'} in ${purges.n} Vorgang${purges.n === 1 ? '' : 'en'} ${purges.entries} Buchung${purges.entries === 1 ? '' : 'en'} (ggf. samt Zuwendung und Belegen) entfernt. <a href="/cashbook/purged">Löschprotokoll ansehen</a></div>` : ''}
       ${t.cashbook_locked_until ? html`<p class="muted small">Abgeschlossen bis ${formatDate(t.cashbook_locked_until)}.</p>` : ''}
       <div class="cash-balances tabs-like">
         ${list.length > 1 ? html`<a class="cash-balance total ${selectedAcc ? '' : 'active'}" href="${q(undefined)}"><span>Alle Konten</span>${money(total)}</a>` : ''}
@@ -831,6 +884,12 @@ function register(app: App) {
             <p class="muted small">Buchungen lassen sich nicht löschen (GoBD) – ein Storno hebt sie nachvollziehbar auf${withFiles ? '; Original und Belege bleiben unverändert stehen' : ''}.
               Hat die Buchung nie stattgefunden, das Storno auf ihren Tag legen (vorgeschlagen) – ein späteres Datum nur, wenn sie wirklich später rückgängig gemacht wurde; sonst stimmt der Kassenstand dazwischen nicht.${locked ? ' Der Zeitraum ist abgeschlossen – das Storno muss in einem offenen Zeitraum liegen.' : ''}</p>
           </div>`
+        : ''}
+      ${e.source !== 'count' && userOf(c).is_admin
+        ? html`<div class="danger-zone">
+            <a class="btn danger" href="/cashbook/entries/${e.id}/purge">Fehlbuchung endgültig löschen …</a>
+            <p class="muted small">Für Testbuchungen oder Buchungen, die nie stattgefunden haben – samt Storno-Partner, auch mit Belegen und im abgeschlossenen Zeitraum. Nur Administratoren, mit Grund und Code; der Vorgang wird protokolliert und im Kassenbuch angezeigt.</p>
+          </div>`
         : ''}`,
     });
   });
@@ -928,6 +987,66 @@ function register(app: App) {
     const [id] = await reverseEntry(t, e, date, userOf(c).id);
     await audit(c, 'cashbook.entry.reverse', `${formatDate(e.entry_date)} ${formatMoney(e.amount)}: ${e.text} – Storno am ${formatDate(date)}`);
     return redirectWith(c, `/cashbook/entries/${id}/edit`, 'ok', 'Buchung storniert – die Gegenbuchung ist angelegt, Original und Belege bleiben erhalten.');
+  });
+
+  /* ---------------- Fehlbuchungen endgültig löschen (Ausnahme, nur Administrator) ---------------- */
+
+  const loadPurge = async (c: Ctx) => {
+    const t = cbTenant(c);
+    if (!userOf(c).is_admin) throw new UserError('Endgültig löschen dürfen nur Administratoren.');
+    const e = await one<CashEntry>('SELECT * FROM cash_entries WHERE tenant_id = ? AND id = ?', t.id, idParam(c)) ?? notFound();
+    return { t, e, plan: await purgePlan(t, e), accounts: await accountsOf(t.id, true), key: `${c.get('session')!.id}:purge:${e.id}` };
+  };
+
+  const purgePage = (c: Ctx, e: CashEntry, plan: PurgePlan, accounts: CashAccount[], code: string, reason = '', error?: string) => purgeConfirmPage(c, {
+    title: 'Buchung endgültig löschen',
+    back: { href: `/cashbook/entries/${e.id}/edit`, label: 'Buchung' },
+    action: `/cashbook/entries/${e.id}/purge`, plan, accounts, code, reason, error,
+  });
+
+  app.get('/cashbook/entries/:id/purge', async (c) => {
+    const { e, plan, accounts, key } = await loadPurge(c);
+    return purgePage(c, e, plan, accounts, issueCode(key));
+  });
+
+  app.post('/cashbook/entries/:id/purge', async (c) => {
+    const { t, e, plan, accounts, key } = await loadPurge(c);
+    if (plan.blockers.length) return purgePage(c, e, plan, accounts, currentCode(key));
+    const form = await readForm(c);
+    const reason = str(form, 'reason', 500);
+    if (reason.length < 10) return purgePage(c, e, plan, accounts, currentCode(key), reason, 'Bitte einen Grund angeben (mind. 10 Zeichen).');
+    if (str(form, 'confirm') !== '1') return purgePage(c, e, plan, accounts, currentCode(key), reason, 'Bitte bestätigen, dass es sich um Test- bzw. Fehlbuchungen handelt.');
+    const check = checkCode(key, str(form, 'code', 20));
+    if (!check.ok) return purgePage(c, e, plan, accounts, check.code, reason, check.error);
+    const removed = await purgeEntries(t, e, { id: userOf(c).id, email: userOf(c).email }, reason, clientIp(c));
+    await audit(c, 'cashbook.purge',
+      `${removed.length} Buchungen endgültig gelöscht: ${removed.map((x) => `${formatDate(x.entry_date)} ${formatMoney(x.amount)} ${x.text}`).join('; ')} – Grund: ${reason}`);
+    return redirectWith(c, '/cashbook', 'ok', `${removed.length} Buchung${removed.length === 1 ? '' : 'en'} endgültig gelöscht – der Vorgang steht im Löschprotokoll.`);
+  });
+
+  app.get('/cashbook/purged', async (c) => {
+    const t = cbTenant(c);
+    const log = await purgeLog(t.id);
+    type Snap = { entries: { entry_date: string; amount: number | string; text: string; account_id: number; reversal_of: number | null }[]; donation?: { kind: string; amount: number | string; donation_date: string } | null; entry_files?: { file_name: string }[]; donation_files?: { file_name: string }[] };
+    const accounts = await accountsOf(t.id, true);
+    return page(c, {
+      title: 'Löschprotokoll',
+      back: { href: '/cashbook', label: 'Kassenbuch' },
+      body: log.length
+        ? html`${log.map((r) => {
+            const snap = JSON.parse(r.snapshot) as Snap;
+            return html`<section class="card"><h2>${formatDate(String(r.deleted_at).slice(0, 10))} · ${snap.donation ? 'Zuwendung' + (r.entry_count ? ' + ' : '') : ''}${r.entry_count ? `${r.entry_count} Buchung${r.entry_count === 1 ? '' : 'en'}` : ''}</h2>
+              <p class="small">Von ${r.deleted_by_email || 'unbekannt'} – Grund: ${r.reason}</p>
+              ${snap.donation ? html`<p class="small">Zuwendung vom ${formatDate(snap.donation.donation_date)} über ${money(Number(snap.donation.amount))}</p>` : ''}
+              ${[...(snap.entry_files ?? []), ...(snap.donation_files ?? [])].length ? html`<p class="small muted">Belege: ${[...(snap.entry_files ?? []), ...(snap.donation_files ?? [])].map((f) => f.file_name).join(', ')}</p>` : ''}
+              <table class="table stack-mobile"><tbody>${snap.entries.map((x) => html`<tr>
+                <td data-label="Datum" class="nowrap">${formatDate(x.entry_date)}</td>
+                <td data-label="Konto">${accounts.find((a) => a.id === x.account_id)?.name ?? ''}</td>
+                <td data-label="Text">${x.text}${x.reversal_of ? ' (Storno)' : ''}</td>
+                <td data-label="Betrag" class="right">${money(Number(x.amount))}</td></tr>`)}</tbody></table></section>`;
+          })}`
+        : empty('Es wurden noch keine Buchungen endgültig gelöscht.'),
+    });
   });
 
   /* ---------------- Zuordnen ---------------- */

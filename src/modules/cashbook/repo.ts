@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { all, one, run, tx, nowIso } from '../../db/index.ts';
+import { all, one, run, tx, nowIso, toDbTime } from '../../db/index.ts';
 import { addDays, formatDate, isIsoDate, today } from '../../lib/dates.ts';
 import { addNote, UserError } from '../../lib/http.ts';
 import { formatMoney } from '../../lib/money.ts';
@@ -1063,4 +1063,158 @@ export async function bookDue(t: Tenant, r: Recurring, due: string, userId: numb
 export async function skipDue(r: Recurring, due: string) {
   if (!dueDates(r, today()).includes(due)) throw new UserError('Dieser Termin gehört nicht zum Dauerauftrag.');
   await run('INSERT IGNORE INTO cash_recurring_skips (recurring_id, due_date, created_at) VALUES (?, ?, ?)', r.id, due, nowIso());
+}
+
+
+/* ---------------- Fehlbuchungen endgültig entfernen ---------------- */
+
+export interface PurgePlan {
+  /** alles, was zusammen entfernt wird: die Buchung, beide Seiten einer Umbuchung, Storno-Partner */
+  entries: CashEntry[];
+  /** Gründe, warum es nicht geht (leer = möglich) */
+  blockers: string[];
+  /** Belege, deren Datenbankeinträge mitgelöscht werden (die Dateien selbst bleiben auf der Platte) */
+  files: string[];
+  /** liegt etwas im abgeschlossenen Zeitraum? */
+  locked: boolean;
+  /** bei Zuwendungen: die Zuwendung selbst */
+  donation?: { id: number; kind: string; amount: number | string; donation_date: string; contact_id: number };
+}
+
+/** Buchung samt Storno-Partnern und Umbuchungs-Gegenseiten einsammeln */
+async function collectEntries(t: Tenant, seeds: CashEntry[]): Promise<CashEntry[]> {
+  const byId = new Map<number, CashEntry>();
+  const queue: CashEntry[] = [...seeds];
+  while (queue.length) {
+    const e = queue.pop()!;
+    if (byId.has(e.id)) continue;
+    byId.set(e.id, e);
+    queue.push(...(await sidesOf(t, e)));
+    const rev = await reversalOf(e.id);
+    if (rev) queue.push(rev);
+    if (e.reversal_of) {
+      const orig = await one<CashEntry>('SELECT * FROM cash_entries WHERE tenant_id = ? AND id = ?', t.id, e.reversal_of);
+      if (orig) queue.push(orig);
+    }
+  }
+  return [...byId.values()].sort((a, b) => a.id - b.id);
+}
+
+async function filesOf(entries: CashEntry[], donationId?: number): Promise<string[]> {
+  const names: string[] = [];
+  if (entries.length) {
+    const ids = entries.map((e) => e.id);
+    names.push(...(await all<{ file_name: string }>(`SELECT file_name FROM cash_entry_files WHERE entry_id IN (${ids.map(() => '?').join(', ')})`, ...ids)).map((f) => f.file_name));
+  }
+  if (donationId) names.push(...(await all<{ file_name: string }>('SELECT file_name FROM donation_files WHERE donation_id = ?', donationId)).map((f) => f.file_name));
+  return names;
+}
+
+const isLocked = (t: Tenant, entries: CashEntry[]) => !!t.cashbook_locked_until && entries.some((e) => e.entry_date <= t.cashbook_locked_until!);
+
+/**
+ * Ausnahme von „Buchungen werden nie gelöscht“: Testbuchungen bzw. Buchungen, die nie stattgefunden haben.
+ * Entfernt werden die Buchung samt Storno-Partnern und Umbuchungs-Gegenseiten – auch mit Belegen und in
+ * abgeschlossenen Zeiträumen (nur Administrator, Code, Löschprotokoll). Zahlungen von Rechnungen,
+ * Zuwendungen und Zählungen werden an ihrer Stelle gelöscht bzw. zurückgenommen.
+ */
+export async function purgePlan(t: Tenant, entry: CashEntry): Promise<PurgePlan> {
+  const entries = await collectEntries(t, [entry]);
+  const blockers: string[] = [];
+  for (const e of entries) {
+    const what = `„${e.text}“ (${formatDate(e.entry_date)})`;
+    if (e.source === 'count') blockers.push(`${what} gehört zu einer Kassenzählung – die Zählung selbst löschen.`);
+    else if (e.source === 'invoice' || e.source === 'purchase') blockers.push(`${what} ist die Zahlung einer Rechnung bzw. Eingangsrechnung – zuerst dort „Zahlung zurücknehmen“, danach die entstandene Freie Buchung hier löschen.`);
+    else if (e.source === 'donation') blockers.push(`${what} gehört zu einer Zuwendung – die Zuwendung löschen (dabei verschwindet auch die Buchung).`);
+  }
+  return { entries, blockers, files: await filesOf(entries), locked: isLocked(t, entries) };
+}
+
+/** Plan zum Löschen einer Zuwendung samt Kassenbuchung(en) und Belegen */
+export async function donationPurgePlan(t: Tenant, donationId: number): Promise<PurgePlan> {
+  const d = await one<{ id: number; kind: string; amount: number | string; donation_date: string; contact_id: number; receipt_id: number | null; receipted_at: string | null }>(
+    'SELECT * FROM donations WHERE tenant_id = ? AND id = ?', t.id, donationId);
+  if (!d) throw new UserError('Zuwendung nicht gefunden.');
+  const seeds = await all<CashEntry>('SELECT * FROM cash_entries WHERE tenant_id = ? AND donation_id = ?', t.id, donationId);
+  const entries = await collectEntries(t, seeds);
+  const blockers: string[] = [];
+  if (d.receipt_id || d.receipted_at) {
+    blockers.push('Zu dieser Zuwendung wurde eine Zuwendungsbestätigung ausgestellt. Bestätigungen sind fortlaufend nummeriert und unveränderlich – das Löschen solcher Zuwendungen ist (noch) nicht vorgesehen.');
+  }
+  for (const e of entries) {
+    if (e.source === 'count') blockers.push(`„${e.text}“ gehört zu einer Kassenzählung.`);
+  }
+  return { entries, blockers, files: await filesOf(entries, donationId), locked: isLocked(t, entries), donation: d };
+}
+
+async function purgeRun(t: Tenant, plan: PurgePlan, who: { id: number; email: string }, reason: string, ip: string): Promise<void> {
+  if (plan.blockers.length) throw new UserError(plan.blockers[0]);
+  const ids = plan.entries.map((e) => e.id);
+  const marks = ids.map(() => '?').join(', ') || 'NULL';
+  await tx(async () => {
+    const links = ids.length ? await all(
+      `SELECT l.entry_id, b.booking_date, b.amount, b.remote_name, b.purpose FROM bank_tx_entries l JOIN bank_transactions b ON b.id = l.tx_id WHERE l.entry_id IN (${marks})`, ...ids) : [];
+    const exemptions = ids.length ? await all(`SELECT entry_id, reason FROM bank_exemptions WHERE entry_id IN (${marks})`, ...ids) : [];
+    const entryFiles = ids.length ? await all(`SELECT entry_id, file_name, file_path, file_sha256, file_size FROM cash_entry_files WHERE entry_id IN (${marks})`, ...ids) : [];
+    const donationFiles = plan.donation
+      ? await all('SELECT donation_id, file_name, file_path, file_sha256, file_size FROM donation_files WHERE donation_id = ?', plan.donation.id) : [];
+    const donation = plan.donation ? await one('SELECT * FROM donations WHERE id = ?', plan.donation.id) : null;
+    const snapshot = JSON.stringify(
+      { entries: plan.entries, bank_links: links, exemptions, entry_files: entryFiles, donation, donation_files: donationFiles },
+      (_k, v) => (typeof v === 'bigint' ? v.toString() : v));
+    await run(
+      'INSERT INTO deleted_entries (tenant_id, deleted_at, deleted_by, deleted_by_email, reason, ip, entry_count, snapshot) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      t.id, nowIso(), who.id, who.email.slice(0, 200), reason.slice(0, 500), ip.slice(0, 64), plan.entries.length, snapshot,
+    );
+    await run('SET @schottr_purge = 1');
+    try {
+      if (ids.length) await run(`DELETE FROM cash_entry_files WHERE tenant_id = ? AND entry_id IN (${marks})`, t.id, ...ids);
+      // Stornobuchungen zuerst (sie verweisen auf das Original)
+      for (const e of [...plan.entries].sort((a, b) => Number(!!b.reversal_of) - Number(!!a.reversal_of) || b.id - a.id)) {
+        await run('DELETE FROM cash_entries WHERE id = ? AND tenant_id = ?', e.id, t.id);
+      }
+      if (plan.donation) {
+        await run('DELETE FROM donation_files WHERE tenant_id = ? AND donation_id = ?', t.id, plan.donation.id);
+        await run('DELETE FROM donations WHERE tenant_id = ? AND id = ?', t.id, plan.donation.id);
+      }
+      await recalcAfter(t, ...plan.entries.map((e) => [e.account_id, e.entry_date] as [number, string]));
+    } finally {
+      await run('SET @schottr_purge = 0');
+    }
+  });
+}
+
+/** Endgültig löschen: Snapshot ins unveränderliche Löschprotokoll, dann die Buchungen; Kassen werden neu gerechnet */
+export async function purgeEntries(t: Tenant, entry: CashEntry, who: { id: number; email: string }, reason: string, ip: string): Promise<CashEntry[]> {
+  const plan = await purgePlan(t, entry);
+  await purgeRun(t, plan, who, reason, ip);
+  return plan.entries;
+}
+
+export async function purgeDonation(t: Tenant, donationId: number, who: { id: number; email: string }, reason: string, ip: string): Promise<PurgePlan> {
+  const plan = await donationPurgePlan(t, donationId);
+  await purgeRun(t, plan, who, reason, ip);
+  return plan;
+}
+
+export interface PurgeRecord {
+  id: number;
+  deleted_at: string;
+  deleted_by_email: string;
+  reason: string;
+  entry_count: number;
+  snapshot: string;
+}
+
+export const purgeLog = (tenantId: number) =>
+  all<PurgeRecord>('SELECT id, deleted_at, deleted_by_email, reason, entry_count, snapshot FROM deleted_entries WHERE tenant_id = ? ORDER BY id DESC LIMIT 200', tenantId);
+
+/** Vorgänge und Buchungen der letzten Tage (für den Hinweis im Kassenbuch) sowie ob es überhaupt ein Protokoll gibt */
+export async function recentPurges(tenantId: number, days: number) {
+  const since = toDbTime(new Date(Date.now() - days * 86_400_000));
+  const r = await one<{ total: number; n: number; entries: number | string }>(
+    'SELECT COUNT(*) total, COALESCE(SUM(deleted_at >= ?), 0) n, COALESCE(SUM(CASE WHEN deleted_at >= ? THEN entry_count ELSE 0 END), 0) entries FROM deleted_entries WHERE tenant_id = ?',
+    since, since, tenantId,
+  );
+  return { total: Number(r?.total ?? 0), n: Number(r?.n ?? 0), entries: Number(r?.entries ?? 0) };
 }

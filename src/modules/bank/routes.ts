@@ -211,6 +211,7 @@ function register(app: App) {
                   <div class="bank-actions">
                     <a class="btn small${s ? ' ghost' : ''}" href="/cashbook/bank/tx/${x.id}">Zuordnen …</a>
                     ${postButton(c, `/cashbook/bank/tx/${x.id}/book`, x.links ? 'Rest als Buchung' : 'Als Buchung übernehmen', 'btn small ghost', { back })}
+                    ${t.nonprofit && x.remaining > 0 ? html`<a class="btn small ghost" href="/donations/from-bank/${x.id}">Als Zuwendung übernehmen</a>` : ''}
                     ${x.links ? '' : postButton(c, `/cashbook/bank/tx/${x.id}/ignore`, 'Ignorieren', 'btn small ghost', { back })}
                   </div></td></tr>`;
               })}</tbody>
@@ -508,6 +509,8 @@ function register(app: App) {
           <input name="text" maxlength="300" value="${entryText(x)}" aria-label="Buchungstext">
           <button class="btn">${formatMoney(x.remaining)} buchen</button></form>
         <p class="muted small">z. B. Kontoführung, Gebühren, Beiträge ohne Rechnung – Kostenart, Bereich und Beleg lassen sich danach in der Buchung ergänzen.</p>
+        ${t.nonprofit && x.remaining > 0 ? html`<div class="toolbar"><a class="btn" href="/donations/from-bank/${x.id}">Als Zuwendung übernehmen</a>
+          <span class="muted small">Spende bzw. Mitgliedsbeitrag mit Zuwendendem, ggf. für die Bestätigung.</span></div>` : ''}
         ${x.links ? '' : html`<div class="toolbar">${postButton(c, `/cashbook/bank/tx/${x.id}/ignore`, 'Umsatz ignorieren', 'btn ghost', { back: `/cashbook/bank/${a.id}` })}</div>`}
       </section>` : ''}`,
     });
