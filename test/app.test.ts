@@ -1269,9 +1269,9 @@ test('Kassenbuch: Konten, Zuordnung, Umbuchung, Kassenzählung, Abschluss, Steue
   assert.equal(k1.book_balance, 13600);
   assert.equal(await balance(kasse), 20050);
   // Fehlbuchung endgültig löschen (Ausnahme): Administrator, Grund, Bestätigung und abgetippter Code – samt Storno-Partner
+  const bankVorher = await balance(bank);
   r = await req('/cashbook/entries', { form: { account_id: String(bank), entry_date: today, direction: 'out', amount: '5', text: 'Testbuchung zum Löschen', sphere: 'ideell', vat_rate: '0' } });
   const testbuch = (await one("SELECT id FROM cash_entries WHERE tenant_id = ? AND text = 'Testbuchung zum Löschen'", t.id))!;
-  const bankVorher = await balance(bank);
   await req(`/cashbook/entries/${testbuch.id}/reverse`, { form: { date: today } });
   page = await (await req(`/cashbook/entries/${testbuch.id}/edit`)).text();
   assert.match(page, new RegExp(`/cashbook/entries/${testbuch.id}/purge`));
